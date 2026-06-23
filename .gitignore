@@ -1,0 +1,13 @@
+cat <<EOT >> .gitignore
+# Ignora le cartelle dei dati e dei file pesanti
+data/
+*.tar
+*.tif
+*.tiff
+*.zip
+
+# Ignora i file di sistema Python
+__pycache__/
+*.pyc
+.env
+EOT
