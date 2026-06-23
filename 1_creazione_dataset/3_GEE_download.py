@@ -7,32 +7,37 @@ import io
 import json
 from datetime import datetime, timedelta, timezone
 
+# configurazione percorsi
+script_dir = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(script_dir) # /workspace/1_creazione_dataset
+
+
 # percorsi csv
-clean_s1_train = "/workspace/csv/train/clean/S1RTC_train.csv"
-clean_s2_train_1 = "/workspace/csv/train/clean/S2L2A_train_1.csv"
-clean_s2_train_2 = "/workspace/csv/train/clean/S2L2A_train_2.csv"
-clean_s2_train_3 = "/workspace/csv/train/clean/S2L2A_train_3.csv"
+clean_s1_train = os.path.join(PROJECT_ROOT, "csv", "train", "clean", "S1RTC_train.csv")
+clean_s2_train_1 = os.path.join(PROJECT_ROOT, "csv", "train", "clean", "S2L2A_train_1.csv")
+clean_s2_train_2 = os.path.join(PROJECT_ROOT, "csv", "train", "clean", "S2L2A_train_2.csv")
+clean_s2_train_3 = os.path.join(PROJECT_ROOT, "csv", "train", "clean", "S2L2A_train_3.csv")
 
-clean_s1_val = "/workspace/csv/val/clean/S1RTC_val.csv"
-clean_s2_val = "/workspace/csv/val/clean/S2L2A_val.csv"
+clean_s1_val = os.path.join(PROJECT_ROOT, "csv", "val", "clean", "S1RTC_val.csv")
+clean_s2_val = os.path.join(PROJECT_ROOT, "csv", "val", "clean", "S2L2A_val.csv")
 
-clean_s1_test = "/workspace/csv/test/clean/S1RTC_test.csv"
-clean_s2_test = "/workspace/csv/test/clean/S2L2A_test.csv"
+clean_s1_test = os.path.join(PROJECT_ROOT, "csv", "test", "clean", "S1RTC_test.csv")
+clean_s2_test = os.path.join(PROJECT_ROOT, "csv", "test", "clean", "S2L2A_test.csv")
 
 # output dataset
-train_S1_folder = "/workspace/data/GEE_download/train/S1"
-train_S2_folder = "/workspace/data/GEE_download/train/S2"
+train_S1_folder = os.path.join(PROJECT_ROOT, "data", "GEE_download", "train", "S1")
+train_S2_folder = os.path.join(PROJECT_ROOT, "data", "GEE_download", "train", "S2")
 
-val_S1_folder = "/workspace/data/GEE_download/val/S1"
-val_S2_folder = "/workspace/data/GEE_download/val/S2"
+val_S1_folder = os.path.join(PROJECT_ROOT, "data", "GEE_download", "val", "S1")
+val_S2_folder = os.path.join(PROJECT_ROOT, "data", "GEE_download", "val", "S2")
 
-test_S1_folder = "/workspace/data/GEE_download/test/S1"
-test_S2_folder = "/workspace/data/GEE_download/test/S2"
+test_S1_folder = os.path.join(PROJECT_ROOT, "data", "GEE_download", "test", "S1")
+test_S2_folder = os.path.join(PROJECT_ROOT, "data", "GEE_download", "test", "S2")
 
 # output csv
-csv_output = "/workspace/csv"
-
+csv_output = os.path.join(PROJECT_ROOT, "csv")
 os.makedirs(csv_output, exist_ok=True)
+
 csv_master_s1 = os.path.join(csv_output, "GEE_S1.csv")
 csv_master_s2 = os.path.join(csv_output, "GEE_S2.csv")
 
@@ -90,6 +95,19 @@ def scarica_geotiff(immagine_ee, bbox_ee, epsg, nome_file_out, cartella_dest):
         print(f"🔴 Errore durante il download: {e}")
 
 def elabora_dataset(lista_csv_destinazioni, tipo_sensore, csv_output):
+
+    serie_gia_fatte = set()
+    file_esiste = os.path.exists(csv_output)
+
+    if file_esiste:
+        print(f"🟡 Trovato file esistente {csv_output}, conto serie salvate")
+        with open(csv_output, mode='r', encoding='utf-8') as f_in:
+            reader = csv.reader(f_in)
+            next(reader, None)  # salta intestazione
+            for riga in reader:
+                if len(riga) > 0:
+                    serie_gia_fatte.add(riga[0]) 
+        print(f"🔵 Trovate {len(serie_gia_fatte)} serie già elaborate")
 
     with open(csv_output, mode='w', encoding='utf-8', newline='') as f_out:
         writer = csv.writer(f_out)

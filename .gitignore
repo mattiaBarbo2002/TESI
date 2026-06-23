@@ -11,3 +11,8 @@ __pycache__/
 *.pyc
 .env
 EOT
+
+# Escludi l'ambiente virtuale Python locale
+venv/
+.venv/
+env/
