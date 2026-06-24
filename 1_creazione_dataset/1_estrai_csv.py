@@ -91,12 +91,12 @@ def estrai_tar(percorso_tar, percorso_csv, tipo_sensore):
                                 writer.writerow(riga_csv)
                                 
                     except Exception as e:
-                        print(f"🔴 Errore nella lettura di {nome_serie}: {e}")
+                        print(f"❌ Errore nella lettura di {nome_serie}: {e}")
 
             print(f"🔵 File salvato in: {percorso_csv}")
 
         except Exception as e:
-            print(f"🔴 Errore apertura del TAR: {e}")
+            print(f"❌ Errore apertura del TAR: {e}")
 
 # main
 
@@ -113,10 +113,6 @@ estrai_tar(tar_s2_val, csv_s2_val, "OTTICO")
 print(f"\n---------- TEST SET ----------")
 estrai_tar(tar_s1_test, csv_s1_test, "SAR")
 estrai_tar(tar_s2_test, csv_s2_test, "OTTICO")
-print("\n🟢 Terminato")
+print("\n✔️ FINITO")
 
 
-# cerchio verde 🟢
-# cerchio rosso 🔴 
-# cerchio giallo 🟡
-# cerchio blu 🔵

@@ -29,7 +29,7 @@ clean_s2_test = "/workspace/csv/test/clean/S2L2A_test.csv"
 def pulisci_csv(percorso_input, percorso_output):
     
     if not os.path.exists(percorso_input):
-        print(f"🔴 Il file {percorso_input} non esiste.")
+        print(f"❌ Il file {percorso_input} non esiste.")
         return
 
     # caratteri non validi
@@ -93,13 +93,9 @@ pulisci_csv(org_s2_val, clean_s2_val)
 print(f"\n---------- TEST SET ----------")
 pulisci_csv(org_s1_test, clean_s1_test)
 pulisci_csv(org_s2_test, clean_s2_test)
-print("\n🟢 Terminato")
+print("\n✔️ FINITO")
 
 
 
 
 
-# cerchio verde 🟢
-# cerchio rosso 🔴 
-# cerchio giallo 🟡
-# cerchio blu 🔵
