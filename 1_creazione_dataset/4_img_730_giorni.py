@@ -168,12 +168,13 @@ def elabora_recupero():
                     
                 try:
                     migliore_s2 = ee.Image(s2_filtrata.first())
-                    id_img_s2 = migliore_s2.id().getInfo()
+                    id_img_s2 = migliore_s2.get('system:id').getInfo()
                     if not id_img_s2: raise Exception("No ID")
                     
                     timestamp_s2 = migliore_s2.get('system:time_start').getInfo()
                     data_eff_s2 = datetime.fromtimestamp(timestamp_s2 / 1000.0, tz=timezone.utc).strftime('%Y-%m-%d')
                     nuove_date_effettive[f'Data_{step}_OPT'] = data_eff_s2
+                    nuove_date_effettive[f'ID_{step}_OPT'] = id_img_s2
                     
                     print(f"🔵 Immagine OTTICO t{step} trovata | Data: {data_eff_s2} | ID: {id_img_s2[:15]}")
                 except Exception:
@@ -199,12 +200,13 @@ def elabora_recupero():
                 
                 try:
                     migliore_s1 = ee.Image(s1_filtrata.first())
-                    id_img_s1 = migliore_s1.id().getInfo()
+                    id_img_s1 = migliore_s1.get('system:id').getInfo()
                     if not id_img_s1: raise Exception("No ID")
                     
                     timestamp_s1 = migliore_s1.get('system:time_start').getInfo()
                     data_eff_s1 = datetime.fromtimestamp(timestamp_s1 / 1000.0, tz=timezone.utc).strftime('%Y-%m-%d')
                     nuove_date_effettive[f'Data_{step}_SAR'] = data_eff_s1
+                    nuove_date_effettive[f'ID_{step}_SAR'] = id_img_s1
                     
                     print(f"🔵 Immagine SAR t{step} trovata | Data: {data_eff_s1} | ID: {id_img_s1[:15]}")
                 except Exception:

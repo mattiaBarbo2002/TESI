@@ -1,8 +1,8 @@
 # prende incomplete_series.csv con nuova colonna 'target_month'
 # usa come data target (data_3_opt e sar) il 15 del mese target
-# cerca serie complete intorno a quel mese partendo dal 2025
-# se non la trova valida, prova 2024 e cosi via fino a 2018
-# controlla di non selezionare l'anno della serie originale con anomalia
+# cerca serie complete intorno a quel mese partendo dall'anno prima di data_3_org_opt
+# se non la trova valida, prova gli anni precedenti fino al 2015
+# se l'anno prima e < del 2015 salta tutta la serie
 # se trova serie completa, aggiunge riga a complete_series.csv
 #
 # NOTA:
@@ -110,18 +110,45 @@ def elabora_recupero():
             except:
                 return None
                 
-            try:
-                anno_da_saltare = int(str(riga.get('Data_3_org_OPT', '')).split('-')[0])
-            except:
-                anno_da_saltare = -1 # se data orginale manca non salto nessun anno
+            # Estrazione anno originale (prima da OPT, poi da SAR come fallback)
+            data_org_opt = str(riga.get('Data_3_org_OPT', '')).strip()
+            data_org_sar = str(riga.get('Data_3_org_SAR', '')).strip()
+            
+            anno_originale = None
+            
+            # Controllo OPT
+            if data_org_opt and data_org_opt.lower() != 'nan':
+                try:
+                    anno_originale = int(data_org_opt.split('-')[0])
+                except ValueError:
+                    pass
+                    
+            # Se OPT è fallito o assente, provo con SAR
+            if anno_originale is None and data_org_sar and data_org_sar.lower() != 'nan':
+                try:
+                    anno_originale = int(data_org_sar.split('-')[0])
+                    print(f"Riga {riga_num} | 🔴 Serie {nome_serie}: Data_3_org_OPT mancante, uso Data_3_org_SAR per anno.")
+                except ValueError:
+                    pass
 
-            print(f"Riga {riga_num} | Processo Serie: {nome_serie} (Mese Target: {mese_assegnato}, Anno Skip: {anno_da_saltare})")
+            # Se entrambi sono falliti o assenti, salto la serie
+            if anno_originale is None:
+                print(f"Riga {riga_num} | 🔴 Serie {nome_serie}: Data_3_org_OPT e Data_3_org_SAR mancanti. Impossibile calcolare anno.")
+                return None
+
+            # Calcoliamo l'anno di partenza (l'anno prima dell'evento)
+            anno_partenza = anno_originale - 1
+
+            if anno_partenza < 2015:
+                print(f"Riga {riga_num} | 🔴 Serie {nome_serie}: Anno di partenza ({anno_partenza}) < 2015. Serie saltata.")
+                return None
+
+            print(f"Riga {riga_num} | Processo Serie: {nome_serie} (Mese Target: {mese_assegnato}, Partenza: {anno_partenza})")
         
             try:
                 lat_sar, lon_sar = float(riga['Lat_Centro_SAR']), float(riga['Lon_Centro_SAR'])
                 lat_opt, lon_opt = float(riga['Lat_Centro_OPT']), float(riga['Lon_Centro_OPT'])
             except (ValueError, TypeError):
-                
                 return None
 
             punto_centro_sar = ee.Geometry.Point([lon_sar, lat_sar])
@@ -130,10 +157,8 @@ def elabora_recupero():
             punto_centro_opt = ee.Geometry.Point([lon_opt, lat_opt])
             bbox_esatto_opt = punto_centro_opt.buffer(RAGGIO_METRI).bounds()
             
-            # ricerca tra 2025 e 2018
-            for anno_test in range(2025, 2017, -1):
-                if anno_test == anno_da_saltare:
-                    continue # salta l'anno corrispondente alla data originale
+            # Ricerca dall'anno prima dell'evento fino al 2015 compreso
+            for anno_test in range(anno_partenza, 2014, -1):
                 
                 anno_valido = True
                 nuove_date_effettive = {}
@@ -171,12 +196,14 @@ def elabora_recupero():
                         
                     try:
                         migliore_s2 = ee.Image(s2_filtrata.first())
-                        id_img_s2 = migliore_s2.id().getInfo()
+                        id_img_s2 = migliore_s2.get('system:id').getInfo()
                         if not id_img_s2: raise Exception("No ID")
                         
                         timestamp_s2 = migliore_s2.get('system:time_start').getInfo()
                         data_eff_s2 = datetime.fromtimestamp(timestamp_s2 / 1000.0, tz=timezone.utc).strftime('%Y-%m-%d')
+                        
                         nuove_date_effettive[f'Data_{step}_OPT'] = data_eff_s2
+                        nuove_date_effettive[f'ID_{step}_OPT'] = id_img_s2 # SALVA ID
                         
                         print(f"🔵 OTTICO t{step} ({anno_test}) | Data: {data_eff_s2}")
                     except Exception:
@@ -201,12 +228,14 @@ def elabora_recupero():
                     
                     try:
                         migliore_s1 = ee.Image(s1_filtrata.first())
-                        id_img_s1 = migliore_s1.id().getInfo()
+                        id_img_s1 = migliore_s1.get('system:id').getInfo()
                         if not id_img_s1: raise Exception("No ID")
                         
                         timestamp_s1 = migliore_s1.get('system:time_start').getInfo()
                         data_eff_s1 = datetime.fromtimestamp(timestamp_s1 / 1000.0, tz=timezone.utc).strftime('%Y-%m-%d')
+                        
                         nuove_date_effettive[f'Data_{step}_SAR'] = data_eff_s1
+                        nuove_date_effettive[f'ID_{step}_SAR'] = id_img_s1 # SALVA ID
                         
                         print(f"🔵 SAR t{step} ({anno_test}) | Data: {data_eff_s1}")
                     except Exception:
@@ -214,11 +243,11 @@ def elabora_recupero():
                         anno_valido = False
                         break
 
-                # se anno è valido (4 img sar + 4 img opt trovate)
+                # se anno e valido (4 img sar + 4 img opt trovate)
                 if anno_valido:
                     print(f"🟢 Serie {nome_serie} completata con l'anno {anno_test}!")
 
-                    # update riga con nuove date 
+                    # update riga con nuove date e ID
                     for chiave, valore in nuove_date_effettive.items():
                         riga[chiave] = valore
                     
@@ -227,7 +256,7 @@ def elabora_recupero():
                     
                     return riga
 
-            print(f"🔴 Serie {nome_serie}: Impossibile completare (nessun anno valido trovato)")
+            print(f"🔴 Serie {nome_serie}: Impossibile completare (nessun anno valido trovato fino al 2015)")
             return None
 
         # esecuzione multithread

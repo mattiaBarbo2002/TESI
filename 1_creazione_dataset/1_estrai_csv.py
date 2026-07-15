@@ -56,10 +56,12 @@ def estrai_csv(lista_percorsi_tar, percorso_csv, tipo_sensore):
         
         # intestazione csv
         if tipo_sensore == "SAR":
-            writer.writerow(['Nome_Serie', 'Data_1_org_SAR', 'Data_2_org_SAR', 'Data_3_org_SAR', 'Data_4_org_SAR', 
+            writer.writerow(['Nome_Serie', 'Data_1_org_SAR', 'Data_2_org_SAR', 'Data_3_org_SAR', 'Data_4_org_SAR',
+                             'Bbox_1_SAR', 'Bbox_2_SAR', 'Bbox_3_SAR', 'Bbox_4_SAR', 
                              'Lat_Centro_SAR', 'Lon_Centro_SAR', 'EPSG_SAR'])
         elif tipo_sensore == "OTTICO":
             writer.writerow(['Nome_Serie', 'Data_1_org_OPT', 'Data_2_org_OPT', 'Data_3_org_OPT', 'Data_4_org_OPT', 
+                             'Cloud_1_OPT', 'Cloud_2_OPT', 'Cloud_3_OPT', 'Cloud_4_OPT', 
                              'Lat_Centro_OPT', 'Lon_Centro_OPT', 'MGRS_Tile_OPT', 'EPSG_OPT'])
 
 

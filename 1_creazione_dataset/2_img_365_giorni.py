@@ -115,15 +115,17 @@ def elabora_dataset(lista_csv_destinazioni, tipo_sensore, csv_output, max_worker
                 writer.writerow(['Nome_Serie', 
                                  'Data_1_org_SAR', 'Data_2_org_SAR', 'Data_3_org_SAR', 'Data_4_org_SAR', 
                                  'Data_1_SAR', 'Data_2_SAR', 'Data_3_SAR', 'Data_4_SAR', 
+                                 'ID_1_SAR', 'ID_2_SAR', 'ID_3_SAR', 'ID_4_SAR',
                                  'Lat_Centro_SAR', 'Lon_Centro_SAR', 'EPSG_SAR'])
             else:
                 writer.writerow(['Nome_Serie', 
                                  'Data_1_org_OPT', 'Data_2_org_OPT', 'Data_3_org_OPT', 'Data_4_org_OPT', 
                                  'Data_1_OPT', 'Data_2_OPT', 'Data_3_OPT', 'Data_4_OPT', 
+                                 'ID_1_OPT', 'ID_2_OPT', 'ID_3_OPT', 'ID_4_OPT',
                                  'Lat_Centro_OPT', 'Lon_Centro_OPT', 'MGRS_Tile_OPT', 'EPSG_OPT'])
     
         # funzione singolo thread
-        def processa_singola_serie(riga, cartella_out):
+        def processa_singola_serie(riga, cartella_out, riga_num, totale):
             nome_serie = riga['Nome_Serie']
             suffix = "SAR" if tipo_sensore == "SAR" else "OPT"
             
@@ -139,8 +141,9 @@ def elabora_dataset(lista_csv_destinazioni, tipo_sensore, csv_output, max_worker
 
             date_org_list = []
             date_effettive = ['NaN', 'NaN', 'NaN', 'NaN']
+            id_effettivi = ['NaN', 'NaN', 'NaN', 'NaN']
                                 
-            print(f"[{tipo_sensore}] Processo Serie: {nome_serie}")
+            print(f"[{tipo_sensore}] Riga {riga_num}/{totale} | Serie: {nome_serie}")
             
             # BBox 256x256
             bbox_esatto = punto_centro.buffer(RAGGIO_METRI).bounds()
@@ -181,17 +184,19 @@ def elabora_dataset(lista_csv_destinazioni, tipo_sensore, csv_output, max_worker
                     
                     try:
                         migliore_s1 = ee.Image(s1_filtrata.first())
-                        id_img = migliore_s1.id().getInfo()
+                        id_img = migliore_s1.get('system:id').getInfo()
                         if id_img:
+                            id_effettivi[step_temporale - 1] = id_img
                             nan_val = migliore_s1.get('nan_percent').getInfo()
 
                             timestamp = migliore_s1.get('system:time_start').getInfo()
                             if timestamp:
                                 date_effettive[step_temporale - 1] = datetime.fromtimestamp(timestamp / 1000.0, tz=timezone.utc).strftime('%Y-%m-%d')
-                            print(f"🔵 Immagine t{step_temporale} trovata | Data: {date_effettive[step_temporale - 1]} | ID: {id_img[:15]}")
+                            # print(f"🔵 Immagine t{step_temporale} trovata | Data: {date_effettive[step_temporale - 1]} | ID: {id_img[:15]}")
                             
                     except Exception as e:
-                        print(f"🔴 Nessuna immagine valida trovata | Data target: {data_target.strftime('%Y-%m-%d')}")
+                        # print(f"🔴 Nessuna immagine valida trovata | Data target: {data_target.strftime('%Y-%m-%d')}")
+                        pass
                 
                 # OTTICO
                 elif tipo_sensore == "OTTICO":
@@ -236,23 +241,25 @@ def elabora_dataset(lista_csv_destinazioni, tipo_sensore, csv_output, max_worker
                         
                     try:
                         migliore_s2 = ee.Image(s2_filtrata.first())
-                        id_img = migliore_s2.id().getInfo()
+                        id_img = migliore_s2.get('system:id').getInfo()
                         if id_img:
+                            id_effettivi[step_temporale - 1] = id_img
                             cloud_val = migliore_s2.get('CLOUDY_PIXEL_PERCENTAGE').getInfo()
 
                             timestamp = migliore_s2.get('system:time_start').getInfo()
                             if timestamp:
                                 date_effettive[step_temporale - 1] = datetime.fromtimestamp(timestamp / 1000.0, tz=timezone.utc).strftime('%Y-%m-%d')
-                            print(f"🔵 Immagine t{step_temporale} trovata | Data: {date_effettive[step_temporale - 1]} | ID: {id_img[:15]}")
+                            # print(f"🔵 Immagine t{step_temporale} trovata | Data: {date_effettive[step_temporale - 1]} | ID: {id_img[:15]}")
                             
                     except Exception as e:
-                        print(f"🔴 Nessuna immagine valida trovata | Data target: {data_target.strftime('%Y-%m-%d')}")
+                        # print(f"🔴 Nessuna immagine valida trovata | Data target: {data_target.strftime('%Y-%m-%d')}")
+                        pass
 
             if tipo_sensore == "SAR":
-                nuova_riga = [nome_serie] + date_org_list + date_effettive + [lat, lon, epsg]
+                nuova_riga = [nome_serie] + date_org_list + date_effettive + id_effettivi + [lat, lon, epsg]
             else:
                 mgrs_tile = riga.get('MGRS_Tile', 'N/A')
-                nuova_riga = [nome_serie] + date_org_list + date_effettive + [lat, lon, mgrs_tile, epsg]
+                nuova_riga = [nome_serie] + date_org_list + date_effettive + id_effettivi + [lat, lon, mgrs_tile, epsg]
             
             return nuova_riga
 
@@ -265,16 +272,23 @@ def elabora_dataset(lista_csv_destinazioni, tipo_sensore, csv_output, max_worker
                 
             with open(csv_path, mode='r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
-                for riga in reader:
+                # Uso enumerate partendo da 1 per contare le righe
+                for riga_num, riga in enumerate(reader, start=1):
                     if riga['Nome_Serie'] not in serie_gia_fatte:
-                        tasks_da_fare.append((riga, cartella_out))
+                        # Aggiungo riga_num come terzo elemento della tupla
+                        tasks_da_fare.append((riga, cartella_out, riga_num))
+                        
+        totale_tasks = len(tasks_da_fare)
 
         # esecuzione parallela
         print(f"\nAvvio esecuzione in parallelo per {len(tasks_da_fare)} serie...")
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # invio dati ai thread
-            futures = {executor.submit(processa_singola_serie, task[0], task[1]): task for task in tasks_da_fare}
+            # invio dati ai thread: passo task[0] (riga), task[1] (cartella), task[2] (riga_num) e totale_tasks
+            futures = {
+                executor.submit(processa_singola_serie, task[0], task[1], task[2], totale_tasks): task 
+                for task in tasks_da_fare
+            }
             
             # risultati
             for future in as_completed(futures):

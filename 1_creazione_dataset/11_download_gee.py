@@ -34,8 +34,8 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(script_dir) 
 
 # intervallo righe complete.series.csv (salta di default intestazione, riga 1 = prima serie valida, riga 10 compresa)
-ROW_START = 11
-ROW_END = 20
+ROW_START = 1
+ROW_END = 5000
 
 MAX_WORKERS = 15
 TARGET_SCALE = 10
@@ -76,7 +76,7 @@ def normalize(array):
     array_tagliato = np.clip(array, p_min, p_max)
     return (array_tagliato - p_min) / (p_max - p_min)
 
-def visualizza_serie_completa(paths_sar, paths_opt, nome_serie, nome_output):
+def visualizza_serie_completa(paths_sar, paths_opt, nome_serie, date_sar, date_opt, nome_output):
     try:
         fig, axes = plt.subplots(2, 4, figsize=(16, 8))
         fig.suptitle(f"Serie: {nome_serie}", fontsize=16)
@@ -89,19 +89,19 @@ def visualizza_serie_completa(paths_sar, paths_opt, nome_serie, nome_output):
                     img = src.read(1).astype(float)
                     if src.nodata is not None: img[img == src.nodata] = np.nan
                     ax_sar.imshow(normalize(img), cmap='gray')
-            ax_sar.set_title(f"SAR t{step+1}")
+            ax_sar.set_title(f"SAR t{step+1} - {date_sar[step]}")
             ax_sar.axis('off')
 
             # OTTICO (Riga 1)
             ax_opt = axes[1, step]
             if paths_opt[step]:
                 with rasterio.open(paths_opt[step]) as src:
-                    # 1. Lettura dati grezzi
+                    # lettura dati grezzi
                     r_raw = src.read(3).astype(float)
                     g_raw = src.read(2).astype(float)
                     b_raw = src.read(1).astype(float)
                     
-                    # 2. Gestione NoData (stessa di prima)
+                    # se non c'è foto spazio vuoto
                     if src.nodata is not None:
                         r_raw[r_raw == src.nodata] = np.nan
                         g_raw[g_raw == src.nodata] = np.nan
@@ -111,15 +111,17 @@ def visualizza_serie_completa(paths_sar, paths_opt, nome_serie, nome_output):
                         g_raw[g_raw == 0] = np.nan
                         b_raw[b_raw == 0] = np.nan
 
-                    # 3. Uniamo i canali nel formato corretto per l'immagine
+                    # unione canali RGB
                     rgb_stack = np.dstack((r_raw, g_raw, b_raw))
                     
-                    # 4. Normalizzazione FISSA per Sentinel-2 (Colori Naturali)
-                    # Tagliamo i valori estremi a 3000 e dividiamo per 3000 per avere la scala 0.0 - 1.0
+                    # normalizzazione e taglio colori eccessivi
                     rgb_norm = np.clip(rgb_stack, 0, 3000) / 3000.0
+
+                    # schiarisce mezzi toni, visualizzazione più naturale
+                    rgb_gamma = np.power(rgb_norm, 0.75)
                     
                     ax_opt.imshow(rgb_norm)
-            ax_opt.set_title(f"OPT t{step+1}")
+            ax_opt.set_title(f"OPT t{step+1} - {date_opt[step]}")
             ax_opt.axis('off')
 
         plt.tight_layout()
@@ -149,7 +151,7 @@ def scarica_geotiff(immagine_ee, bbox_ee, epsg, nome_file_out, cartella_dest):
             
         file_bytes = io.BytesIO(response.content)
         
-        # Scriviamo direttamente un file .zip compresso sul disco
+        # creazione .zip
         with zipfile.ZipFile(percorso_finale_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z_out:
             if zipfile.is_zipfile(file_bytes):
                 with zipfile.ZipFile(file_bytes) as z_in:
@@ -169,6 +171,8 @@ def scarica_geotiff(immagine_ee, bbox_ee, epsg, nome_file_out, cartella_dest):
 
 def processa_singola_serie(riga, genera_png, riga_num):
     nome_serie = riga['Nome_Serie']
+    date_sar = ['Data_1_SAR', 'Data_2_SAR', 'Data_3_SAR', 'Data_4_SAR']
+    date_opt = ['Data_1_OPT', 'Data_2_OPT', 'Data_3_OPT', 'Data_4_OPT']
     
     # box SAR
     lat_sar, lon_sar = float(riga['Lat_Centro_SAR']), float(riga['Lon_Centro_SAR'])
@@ -189,49 +193,35 @@ def processa_singola_serie(riga, genera_png, riga_num):
         # SAR 
         path_zip_sar = None
         nome_out_sar = f"{nome_serie}_SAR_t{step}"
-        data_str_sar = str(riga.get(f'Data_{step}_SAR', '')).strip()[:10]
+        id_sar = str(riga.get(f'ID_{step}_SAR', '')).strip()
         
-        if data_str_sar and data_str_sar != 'nan':
-            data_esatta = datetime.strptime(data_str_sar, '%Y-%m-%d')
-            d_inizio = (data_esatta - timedelta(days=1)).strftime('%Y-%m-%d')
-            d_fine = (data_esatta + timedelta(days=1)).strftime('%Y-%m-%d')
-            
-            s1_img = ee.ImageCollection('COPERNICUS/S1_GRD') \
-                .filterBounds(bbox_sar).filterDate(d_inizio, d_fine) \
-                .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV')) \
-                .filter(ee.Filter.eq('instrumentMode', 'IW')) \
-                .mosaic().select(['VV', 'VH'])
-                
+        # Se c'è un ID valido nel CSV, scarichiamo direttamente l'immagine
+        if id_sar and id_sar != 'nan' and id_sar != 'NaN':
+            # Nessuna ImageCollection, prendiamo direttamente la singola immagine dall'ID
+            s1_img = ee.Image(id_sar).select(['VV', 'VH'])
             path_zip_sar = scarica_geotiff(s1_img, bbox_sar, epsg_sar, nome_out_sar, S1_FOLDER)
             
         if genera_png:
             paths_per_png_sar.append(f"zip://{path_zip_sar}!{nome_out_sar}.tif" if path_zip_sar else None)
 
+
         # OTTICO
         path_zip_opt = None
         nome_out_opt = f"{nome_serie}_OPT_t{step}"
-        data_str_opt = str(riga.get(f'Data_{step}_OPT', '')).strip()[:10]
+        id_opt = str(riga.get(f'ID_{step}_OPT', '')).strip()
         
-        if data_str_opt and data_str_opt != 'nan':
-            data_esatta = datetime.strptime(data_str_opt, '%Y-%m-%d')
-            d_inizio = (data_esatta - timedelta(days=1)).strftime('%Y-%m-%d')
-            d_fine = (data_esatta + timedelta(days=1)).strftime('%Y-%m-%d')
-            
-            s2_img = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
-                .filterBounds(bbox_opt) \
-                .filterDate(d_inizio, d_fine) \
-                .first() \
-                .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12'])
-                
+        # Se c'è un ID valido nel CSV, scarichiamo direttamente l'immagine
+        if id_opt and id_opt != 'nan' and id_opt != 'NaN':
+            s2_img = ee.Image(id_opt).select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12'])
             path_zip_opt = scarica_geotiff(s2_img, bbox_opt, epsg_opt, nome_out_opt, S2_FOLDER)
             
         if genera_png:
-            paths_per_png_opt.append(f"zip://{path_zip_opt}!{nome_out_opt}.tif" if path_zip_opt else None)      
+            paths_per_png_opt.append(f"zip://{path_zip_opt}!{nome_out_opt}.tif" if path_zip_opt else None)  
 
     if genera_png:
         nome_output = os.path.join(BASE_PNG_FOLDER, f"{nome_serie}_riassunto.png")
         print(f"Generazione PNG per: {nome_serie}")
-        visualizza_serie_completa(paths_per_png_sar, paths_per_png_opt, nome_serie, nome_output)
+        visualizza_serie_completa(paths_per_png_sar, paths_per_png_opt, nome_serie, date_sar, date_opt, nome_output)
 
     print(f"Completata: {nome_serie} (Serie: {nome_serie})")
     return True

@@ -8,7 +8,7 @@ ARG USER_HOME=/home/${USER}
 RUN groupadd --gid $USER_GROUP_ID $USER \
     && useradd --uid $USER_ID --gid $USER_GROUP_ID -m $USER
 # setup image istructions
-RUN apt-get update && apt-get install -y curl
+RUN apt-get update && apt-get install -y curl libexpat1
 # set container user
 USER $USER
 # run script as non-root user
