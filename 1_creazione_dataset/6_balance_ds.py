@@ -25,6 +25,11 @@ path_incomplete = os.path.join(PROJECT_ROOT, "csv", "incomplete_series.csv")
 df_complete = pd.read_csv(path_complete)
 df_incomplete = pd.read_csv(path_incomplete)
 
+csv_save_output = os.path.join(PROJECT_ROOT, "csv", "step_6")
+os.makedirs(csv_save_output, exist_ok=True)
+
+copy_incomplete_file = os.path.join(csv_output, "incomplete_series_step_6.csv")
+
 # conteggio mesi complete_series.csv
 df_complete['Data_3_OPT'] = pd.to_datetime(df_complete['Data_3_OPT'], errors='coerce')
 conteggi_estratti = df_complete['Data_3_OPT'].dt.month.dropna().astype(int).value_counts().to_dict()
@@ -66,3 +71,6 @@ for m in range(1, 13):
 df_riepilogo = pd.DataFrame(risultati).set_index('Mese')
 print("--- RIEPILOGO BILANCIAMENTO ---")
 print(df_riepilogo.to_string())
+
+shutil.copy2(path_incomplete, copy_incomplete_file)
+print(f"\nGenerato file {copy_incomplete_file}")

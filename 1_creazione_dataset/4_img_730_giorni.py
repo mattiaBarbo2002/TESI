@@ -18,6 +18,7 @@
 import ee
 import csv
 import os
+import shutil
 from datetime import datetime, timedelta, timezone
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,8 +40,14 @@ ANNO_PRIMA = 730        # ricerca 2 anni prima della data originale
 
 # percorsi csv
 csv_output_dir = os.path.join(PROJECT_ROOT, "csv")
-incomplete_csv = os.path.join(csv_output_dir, "new_incomplete_series_gee_COMPLETO.csv")
-complete_csv = os.path.join(csv_output_dir, "new_complete_series_gee_COMPLETO.csv")
+complete_csv = os.path.join(csv_output_dir, "complete_series.csv")
+incomplete_csv = os.path.join(csv_output_dir, "incomplete_series.csv")
+
+csv_save_output = os.path.join(PROJECT_ROOT, "csv", "step_4")
+os.makedirs(csv_save_output, exist_ok=True)
+
+copy_complete_file = os.path.join(csv_output, "complete_series_step_4.csv")
+copy_incomplete_file = os.path.join(csv_output, "incomplete_series_step_4.csv")
 
 
 # inizializzazione api gee
@@ -284,3 +291,9 @@ def elabora_recupero():
 if __name__ == "__main__":
 
     elabora_recupero()
+
+    shutil.copy2(complete_csv, copy_complete_file)
+    print(f"\nGenerato file {copy_complete_file}")
+
+    shutil.copy2(incomplete_csv, copy_incomplete_file)
+    print(f"\nGenerato file {copy_incomplete_file}")

@@ -42,6 +42,12 @@ csv_output_dir = os.path.join(PROJECT_ROOT, "csv")
 complete_csv = os.path.join(csv_output_dir, "complete_series.csv")
 incomplete_csv = os.path.join(csv_output_dir, "incomplete_series.csv")
 
+csv_save_output = os.path.join(PROJECT_ROOT, "csv", "step_7")
+os.makedirs(csv_save_output, exist_ok=True)
+
+copy_complete_file = os.path.join(csv_output, "complete_series_step_7.csv")
+copy_incomplete_file = os.path.join(csv_output, "incomplete_series_step_7.csv")
+
 
 # stesso codice di 4_img:730_giorni.py
 # commenti solo su nuove funzioni
@@ -322,3 +328,9 @@ def elabora_recupero():
 if __name__ == "__main__":
     
     elabora_recupero()
+
+    shutil.copy2(complete_csv, copy_complete_file)
+    print(f"\nGenerato file {copy_complete_file}")
+
+    shutil.copy2(incomplete_csv, copy_incomplete_file)
+    print(f"\nGenerato file {copy_incomplete_file}")

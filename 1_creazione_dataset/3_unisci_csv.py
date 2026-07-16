@@ -27,6 +27,12 @@ os.makedirs(csv_output, exist_ok=True)
 complete_file = os.path.join(csv_output, "complete_series.csv")
 incomplete_file = os.path.join(csv_output, "incomplete_series.csv")
 
+csv_save_output = os.path.join(PROJECT_ROOT, "csv", "step_3")
+os.makedirs(csv_save_output, exist_ok=True)
+
+copy_complete_file = os.path.join(csv_save_output, "complete_series_step_3.csv")
+copy_incomplete_file = os.path.join(csv_save_output, "incomplete_series_step_3.csv")
+
 df_s1 = pd.read_csv(file_s1)
 df_s2 = pd.read_csv(file_s2)
 
@@ -61,6 +67,9 @@ df_incomplete = df_merged[df_merged.isna().any(axis=1)]
 
 df_complete.to_csv(complete_file, index=False)
 df_incomplete.to_csv(incomplete_file, index=False)
+
+df_complete.to_csv(copy_complete_file, index=False)
+df_incomplete.to_csv(copy_incomplete_file, index=False)
 
 print("Elaborazione terminata con successo!")
 print(f"Righe TOTALI elaborate: {len(df_merged)}")
