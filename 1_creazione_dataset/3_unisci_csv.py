@@ -21,8 +21,8 @@ import os
 script_dir = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(script_dir)
 
-file_s1 = os.path.join(PROJECT_ROOT, "csv", "S1_365.csv")
-file_s2 = os.path.join(PROJECT_ROOT, "csv", "S2_365.csv")
+file_s1 = os.path.join(PROJECT_ROOT, "csv", "org", "S1RTC_ORG.csv")
+file_s2 = os.path.join(PROJECT_ROOT, "csv", "org", "S2L2A_ORG.csv")
 
 csv_output = os.path.join(PROJECT_ROOT, "csv")
 os.makedirs(csv_output, exist_ok=True)

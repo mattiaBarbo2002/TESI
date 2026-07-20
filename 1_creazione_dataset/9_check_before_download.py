@@ -21,7 +21,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(script_dir) # /workspace/1_creazione_dataset
 
 # percorsi csv
-file_completi = os.path.join(PROJECT_ROOT, "csv", "new_complete_series_gee_COMPLETO.csv")
+file_completi = os.path.join(PROJECT_ROOT, "csv", "complete_series.csv")
 file_da_controllare = os.path.join(PROJECT_ROOT, "csv", "da_controllare.csv")
 
 df = pd.read_csv(file_completi)
@@ -72,10 +72,28 @@ for idx, (nome, is_dup, org_s, s, org_o, o) in enumerate(zip(nomi, duplicati_mas
         if diff_opt:
             motivi.append(f"ERRORE")
             
+    # --- NUOVO CONTROLLO: date uniche per SAR e OPT ---
+    riga = df.iloc[idx]
+    
+    # Estrazione delle 4 date
+    date_sar = [riga.get('Data_1_SAR'), riga.get('Data_2_SAR'), riga.get('Data_3_SAR'), riga.get('Data_4_SAR')]
+    date_opt = [riga.get('Data_1_OPT'), riga.get('Data_2_OPT'), riga.get('Data_3_OPT'), riga.get('Data_4_OPT')]
+    
+    # Filtro dei valori non validi ('NaN', stringhe vuote, ecc.) per evitare falsi positivi sui duplicati vuoti
+    date_sar_valide = [d for d in date_sar if pd.notna(d) and str(d).strip() not in ('nan', 'NaN', '')]
+    date_opt_valide = [d for d in date_opt if pd.notna(d) and str(d).strip() not in ('nan', 'NaN', '')]
+    
+    # Se la lunghezza della lista è diversa da quella del set (che elimina i duplicati), c'è un duplicato
+    if len(date_sar_valide) != len(set(date_sar_valide)):
+        motivi.append("Date SAR duplicate nella stessa serie")
+        
+    if len(date_opt_valide) != len(set(date_opt_valide)):
+        motivi.append("Date OPT duplicate nella stessa serie")
+    # ---------------------------------------------------
+            
     # salvataggio righe anomale
     if motivi:
         riga_dict = df.iloc[idx].to_dict()
-        
         
         riga_dict['Problema'] = " | ".join(motivi)
         righe_anomale.append(riga_dict)

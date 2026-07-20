@@ -171,8 +171,8 @@ def scarica_geotiff(immagine_ee, bbox_ee, epsg, nome_file_out, cartella_dest):
 
 def processa_singola_serie(riga, genera_png, riga_num):
     nome_serie = riga['Nome_Serie']
-    date_sar = ['Data_1_SAR', 'Data_2_SAR', 'Data_3_SAR', 'Data_4_SAR']
-    date_opt = ['Data_1_OPT', 'Data_2_OPT', 'Data_3_OPT', 'Data_4_OPT']
+    date_sar = [str(riga.get('Data_1_SAR', '')), str(riga.get('Data_2_SAR', '')), str(riga.get('Data_3_SAR', '')), str(riga.get('Data_4_SAR', ''))]
+    date_opt = [str(riga.get('Data_1_OPT', '')), str(riga.get('Data_2_OPT', '')), str(riga.get('Data_3_OPT', '')), str(riga.get('Data_4_OPT', ''))]
     
     # box SAR
     lat_sar, lon_sar = float(riga['Lat_Centro_SAR']), float(riga['Lon_Centro_SAR'])

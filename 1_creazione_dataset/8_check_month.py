@@ -10,7 +10,7 @@ import os
 script_dir = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(script_dir) # /workspace/1_creazione_dataset
 
-path_complete = os.path.join(PROJECT_ROOT, "csv", "new_complete_series_gee_COMPLETO.csv")
+path_complete = os.path.join(PROJECT_ROOT, "csv", "complete_series.csv")
 
 
 df = pd.read_csv(path_complete)

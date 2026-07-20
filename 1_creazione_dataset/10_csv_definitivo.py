@@ -6,7 +6,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(script_dir) # /workspace/1_creazione_dataset
 
 # percorsi csv
-file_completi = os.path.join(PROJECT_ROOT, "csv", "new_complete_series_gee_COMPLETO.csv")
+file_completi = os.path.join(PROJECT_ROOT, "csv", "complete_series.csv")
 file_da_controllare = os.path.join(PROJECT_ROOT, "csv", "da_controllare.csv")
 file_definitivo = os.path.join(PROJECT_ROOT, "csv", "definitivo.csv")
 
