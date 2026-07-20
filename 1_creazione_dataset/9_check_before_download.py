@@ -60,13 +60,13 @@ for idx, (nome, is_dup, org_s, s, org_o, o) in enumerate(zip(nomi, duplicati_mas
         if diff_opt <= 6:
             motivi.append(f"OPT troppo vicino ({diff_opt} mesi di distanza)")
 
-    # data target opt <= 6 mesi
+    # data target meno recente opt
     if pd.notna(org_o) and pd.notna(o):
         diff_opt = (org_o.year <= o.year) 
         if diff_opt:
             motivi.append(f"ERRORE")
 
-    # data target opt <= 6 mesi
+    # data target meno recente sar
     if pd.notna(org_s) and pd.notna(s):
         diff_opt = (org_s.year <= s.year) 
         if diff_opt:

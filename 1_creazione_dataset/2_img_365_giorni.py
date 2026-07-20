@@ -258,7 +258,7 @@ def elabora_dataset(lista_csv_destinazioni, tipo_sensore, csv_output, max_worker
             if tipo_sensore == "SAR":
                 nuova_riga = [nome_serie] + date_org_list + date_effettive + id_effettivi + [lat, lon, epsg]
             else:
-                mgrs_tile = riga.get('MGRS_Tile', 'N/A')
+                mgrs_tile = riga.get('MGRS_Tile_OPT', 'N/A')
                 nuova_riga = [nome_serie] + date_org_list + date_effettive + id_effettivi + [lat, lon, mgrs_tile, epsg]
             
             return nuova_riga

@@ -17,11 +17,11 @@
 import pandas as pd
 
 # rimuove doppioni dal file dei completi
-df_comp = pd.read_csv("csv/new_complete_series_gee_COMPLETO.csv")
+df_comp = pd.read_csv("csv/complete_series.csv")
 df_comp.drop_duplicates(subset=['Nome_Serie'], inplace=True)
-df_comp.to_csv("csv/new_complete_series_gee_COMPLETO.csv", index=False)
+df_comp.to_csv("csv/complete_series.csv", index=False)
 
 # rimuove dal file degli incompleti le serie che sono già nei completi
-df_inc = pd.read_csv("csv/new_incomplete_series_gee_COMPLETO.csv")
+df_inc = pd.read_csv("csv/incomplete_series.csv")
 df_inc = df_inc[~df_inc['Nome_Serie'].isin(df_comp['Nome_Serie'])]
-df_inc.to_csv("csv/new_incomplete_series_gee_COMPLETO.csv", index=False)
+df_inc.to_csv("csv/incomplete_series.csv", index=False)

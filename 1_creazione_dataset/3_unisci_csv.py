@@ -8,6 +8,9 @@
 # OUTPUT:
 #   complete_series.csv
 #   incomplete_series.csv
+#
+#   complete_series_step_3.csv          copia dell'output originali
+#   incomplete_series_step_3.csv
 # 
 # prossimo script 4_img_730_giorni.py
 
@@ -46,9 +49,6 @@ print("---------------------------------\n")
 
 df_s1['Nome_Serie'] = df_s1['Nome_Serie'].str.replace(r'_S1RTC$', '', regex=True)
 df_s2['Nome_Serie'] = df_s2['Nome_Serie'].str.replace(r'_S2L2A$', '', regex=True)
-
-df_s1 = df_s1.rename(columns={col: col + '_SAR' for col in df_s1.columns if col != 'Nome_Serie'})
-df_s2 = df_s2.rename(columns={col: col + '_OPT' for col in df_s2.columns if col != 'Nome_Serie'})
 
 print("\n--- TEST DI DIAGNOSTICA ---")
 print(f"Valori univoci in S1: {df_s1['Nome_Serie'].nunique()} su {len(df_s1)} righe totali")

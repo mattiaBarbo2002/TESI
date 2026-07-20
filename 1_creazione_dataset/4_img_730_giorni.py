@@ -12,6 +12,9 @@
 # OUTPUT:
 #   complete_series.csv (modificato)
 #   incomplete_series.csv (modificato)
+#
+#   complete_series_step_4.csv          copia dell'output originali
+#   incomplete_series_step_4.csv
 # 
 # prossimo script 6_balance_ds.py
 
@@ -46,8 +49,8 @@ incomplete_csv = os.path.join(csv_output_dir, "incomplete_series.csv")
 csv_save_output = os.path.join(PROJECT_ROOT, "csv", "step_4")
 os.makedirs(csv_save_output, exist_ok=True)
 
-copy_complete_file = os.path.join(csv_output, "complete_series_step_4.csv")
-copy_incomplete_file = os.path.join(csv_output, "incomplete_series_step_4.csv")
+copy_complete_file = os.path.join(csv_save_output, "complete_series_step_4.csv")
+copy_incomplete_file = os.path.join(csv_save_output, "incomplete_series_step_4.csv")
 
 
 # inizializzazione api gee

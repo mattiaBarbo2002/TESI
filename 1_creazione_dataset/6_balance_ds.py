@@ -13,6 +13,8 @@
 import pandas as pd
 import random
 import os 
+import shutil
+
 
 # percorso workspace
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +30,7 @@ df_incomplete = pd.read_csv(path_incomplete)
 csv_save_output = os.path.join(PROJECT_ROOT, "csv", "step_6")
 os.makedirs(csv_save_output, exist_ok=True)
 
-copy_incomplete_file = os.path.join(csv_output, "incomplete_series_step_6.csv")
+copy_incomplete_file = os.path.join(csv_save_output, "incomplete_series_step_6.csv")
 
 # conteggio mesi complete_series.csv
 df_complete['Data_3_OPT'] = pd.to_datetime(df_complete['Data_3_OPT'], errors='coerce')

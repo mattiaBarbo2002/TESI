@@ -19,6 +19,7 @@
 import ee
 import csv
 import os
+import shutil
 from datetime import datetime, timedelta, timezone
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -45,8 +46,8 @@ incomplete_csv = os.path.join(csv_output_dir, "incomplete_series.csv")
 csv_save_output = os.path.join(PROJECT_ROOT, "csv", "step_7")
 os.makedirs(csv_save_output, exist_ok=True)
 
-copy_complete_file = os.path.join(csv_output, "complete_series_step_7.csv")
-copy_incomplete_file = os.path.join(csv_output, "incomplete_series_step_7.csv")
+copy_complete_file = os.path.join(csv_save_output, "complete_series_step_7.csv")
+copy_incomplete_file = os.path.join(csv_save_output, "incomplete_series_step_7.csv")
 
 
 # stesso codice di 4_img:730_giorni.py
@@ -110,7 +111,7 @@ def elabora_recupero():
             nome_serie = riga['Nome_Serie']
             
             try:
-                mese_assegnato = int(float(riga.get('mese', riga.get('month', 0))))
+                mese_assegnato = int(float(riga.get('target_month', 0)))
                 if mese_assegnato == 0:
                     return None 
             except:
