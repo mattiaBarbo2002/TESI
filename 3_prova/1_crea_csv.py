@@ -170,6 +170,21 @@ df_merged = pd.merge(df_s1, df_s2, on='Nome_Serie', how='outer')
 # Sostituzione delle stringhe vuote o di soli spazi con NaN per pulizia formato
 df_merged = df_merged.replace(r'^\s*$', np.nan, regex=True)
 
+# -------------------------------------------------------------
+# --- NUOVA LOGICA: COPIA DELLE DATE MANCANTI FRA I SENSORI ---
+# -------------------------------------------------------------
+for i in range(1, 5):
+    col_sar = f'Data_{i}_org_SAR'
+    col_opt = f'Data_{i}_org_OPT'
+    
+    # Se la data ottica è mancante (NaN), copia il valore dalla data SAR corrispondente
+    if col_opt in df_merged.columns and col_sar in df_merged.columns:
+        df_merged[col_opt] = df_merged[col_opt].fillna(df_merged[col_sar])
+        
+        # Allo stesso modo, se la data SAR è mancante, copia il valore dalla data ottica
+        df_merged[col_sar] = df_merged[col_sar].fillna(df_merged[col_opt])
+# -------------------------------------------------------------
+
 # Salvataggio del file finale unito
 df_merged.to_csv(csv_merged, index=False)
 

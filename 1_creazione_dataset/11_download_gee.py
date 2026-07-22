@@ -41,7 +41,7 @@ MAX_WORKERS = 15
 TARGET_SCALE = 10
 RAGGIO_METRI = 1280  
 
-CSV_PATH = os.path.join(PROJECT_ROOT, "csv", "definitivo.csv")
+CSV_PATH = os.path.join(PROJECT_ROOT, "csv", "complete_series.csv")
 
 # cartelle
 S1_FOLDER = os.path.join(PROJECT_ROOT, "data", "dataset", "S1")
