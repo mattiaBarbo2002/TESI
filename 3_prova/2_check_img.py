@@ -34,8 +34,10 @@ GAP_MINIMO_GIORNI = 7   # giorni minimi di differenza tra fine intervallo preced
 # RIGA_INIZIO = 25001
 # RIGA_FINE = 30000
 
-RIGA_INIZIO = 79001
-RIGA_FINE = 80297
+# [fine - 79001] [79000 - 75001] [75000 - 74001] [74000 - 73901] [73900 - 73801] [73800 - 73701] [73700 - 73601]
+
+RIGA_INIZIO = 73601
+RIGA_FINE = 73700
 
 # percorsi
 input_csv = os.path.join(PROJECT_ROOT, "csv", "anomaly_ds.csv")

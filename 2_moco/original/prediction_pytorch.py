@@ -72,8 +72,8 @@ def main():
 
     batch_size = 8
     patch_size = 256
-    n_images1 = 4
-    n_images2 = 4
+    n_images1 = 10
+    n_images2 = 20
     #n_images3 = 21
     n_channels1 = 2
     n_channels2 = 1

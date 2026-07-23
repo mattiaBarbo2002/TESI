@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import time
 
-# no apertura finestre grafiche (modalità sicura per server/background)
+# no apertura finestre grafiche
 plt.switch_backend('Agg')
 
 # percorso workspace
@@ -29,11 +29,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(script_dir) 
 
 # intervallo righe
-ROW_START = 1
-ROW_END = 1220
-NR_PNG = 2             # numero totale righe / NR_PNG
+ROW_START = 4836
+ROW_END = 4836
+NR_PNG = 1             # numero totale righe / NR_PNG
 
-MAX_WORKERS = 5          # ORA PUOI ALZARLO IN TUTTA SICUREZZA!
+MAX_WORKERS = 5          
 TARGET_SCALE = 10
 RAGGIO_METRI = 1280  
 

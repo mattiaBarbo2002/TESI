@@ -4,9 +4,6 @@
 
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-
-# DA MODIFICARE TOTALMENTE
-
 import torch
 import random
 
@@ -28,10 +25,7 @@ class MoCoLoader(Dataset):
         self.n_images2 = n_images2
         self.n_channels2 = n_channels2
 
-    # prende i dati .tiff dal dataset (unici per sar e ottico)
-    # da modificare con mio dataset
     def __getitem__(self, index):
-
         ID = self.listIDs[index]
         #print(os.path.join(self.root, ID))
         img = np.array(tiff.imread(os.path.join(self.root, ID))).astype(np.float32)
@@ -57,8 +51,6 @@ class MoCoLoader(Dataset):
             im_q2 = im_2
             im_k1 = im_1
             im_k2 = im_2
-
-        # crea i dizioniari, vedi builder riga 309
         im_q = {'im1': im_q1, 'im2': im_q2}
         im_k = {'im1': im_k1, 'im2': im_k2}
         return im_q, im_k
@@ -142,8 +134,6 @@ class Singlemodal_Loader(Dataset):
     def __len__(self):
         return len(self.listIDs)
 
-# funzioni augmentation, probabilemente estratte da paper
-
 class TwoCropsTransform:
     """Take two random crops of one image as the query and key."""
 
@@ -166,7 +156,3 @@ class GaussianBlur:
         sigma = random.uniform(self.sigma[0], self.sigma[1])
         x = x.filter(ImageFilter.GaussianBlur(radius=sigma))
         return x
-
-
-# DOMANDE 
-# 1. augmentation
