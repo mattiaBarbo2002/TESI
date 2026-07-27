@@ -29,11 +29,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(script_dir) 
 
 # intervallo righe
-ROW_START = 4836
-ROW_END = 4836
+ROW_START = 5860
+ROW_END = 5860
 NR_PNG = 1             # numero totale righe / NR_PNG
 
-MAX_WORKERS = 5          
+MAX_WORKERS = 10          
 TARGET_SCALE = 10
 RAGGIO_METRI = 1280  
 

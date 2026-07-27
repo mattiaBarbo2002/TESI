@@ -30,6 +30,6 @@ pip freeze > requirements.txt
 # jumphost da wsl e vscode 
 
 ./opkssh login
-cp ~/.ssh/id_ecdsa* /mnt/c/Users/matti/.ssh/
+cp ~/.ssh/id_ecdsa* /mnt/c/Users/matti/.ssh/    
 
 # 🟢 🔴 🟡 🔵 ✔️ ❌
