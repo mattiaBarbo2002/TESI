@@ -36,5 +36,5 @@ def ottieni_link_google_maps(nome_serie):
 
 if __name__ == "__main__":
     
-    serie = "EMSR557_13_32VNP_x513675_y6856995"
+    serie = "EMSR564_1_38KMD_x447815_y7825245"
     ottieni_link_google_maps(serie)

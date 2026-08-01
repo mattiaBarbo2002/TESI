@@ -51,9 +51,16 @@ GAP_MINIMO_GIORNI = 7   # giorni minimi di differenza tra fine intervallo preced
 # [62000 - 61001] 
 # [61000 - 60001] 
 # [60000 - 59001]
+# [59000 - 58001]
+# [58000 - 57001]
+# [57000 - 56001]
+# [56000 - 55001]
+# [55000 - 54001]
+# [54000 - 53001]
+# [53000 - 52001]
 
-RIGA_INIZIO = 60001
-RIGA_FINE = 61000
+RIGA_INIZIO = 1
+RIGA_FINE = 10000
 
 
 # percorsi
