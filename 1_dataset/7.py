@@ -34,7 +34,7 @@ csv_lock = threading.Lock()
 # Imposta i valori da 1 in poi.
 # Se vuoi fare tutto il file in un colpo solo, imposta entrambi a None.
 RIGA_INIZIO = 1
-RIGA_FINE = 500
+RIGA_FINE = None
 
 # costanti
 CONTAINER = False
@@ -68,6 +68,30 @@ def conta_righe_csv(filepath):
             return sum(1 for row in reader)
         except StopIteration:
             return 0 
+
+def leggi_header_csv(filepath):
+    """Legge la prima riga (header) di un CSV già esistente. None se il file non esiste o è vuoto."""
+    if not os.path.exists(filepath):
+        return None
+    with open(filepath, mode='r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        try:
+            return next(reader)
+        except StopIteration:
+            return None
+
+def costruisci_header_completo(fieldnames_in):
+    """Ricostruisce l'header di complete_series.csv (colonne base + Data/ID SAR-OPT + Anni_Offset),
+    usato solo come fallback se complete_series.csv non esiste ancora."""
+    base = [f for f in fieldnames_in if f.lower() not in ['target_month', 'motivo_scarto']]
+    extra = []
+    for i in range(1, 5):
+        extra.append(f'Data_{i}_SAR')
+        extra.append(f'ID_{i}_SAR')
+        extra.append(f'Data_{i}_OPT')
+        extra.append(f'ID_{i}_OPT')
+    extra.append('Anni_Offset')
+    return base + extra
 
 # calcolo data (necessario per cambiare anno in caso di serie a cavallo tra due anni)
 def calcola_data_target(anno, mese_base, offset_mesi):
@@ -125,11 +149,18 @@ def elabora_recupero():
         tasks_da_processare = tutte_le_righe
         print(f"✅ Selezionate tutte le {len(tutte_le_righe)} righe per l'elaborazione")
 
-    # non includere in complete_series.csv la colonna 'target_month'
-    fieldnames_out = [f for f in fieldnames_in if f.lower() not in ['target_month']]
-
+    # Le colonne di complete_series.csv sono diverse da quelle di incomplete_series.csv
+    # (contengono Data_X_SAR/OPT, ID_X_SAR/OPT, Anni_Offset e NON Motivo_Scarto/target_month).
+    # Se il file esiste già (caso normale), usiamo il suo header reale per allineare la scrittura.
     file_completi_esiste = os.path.exists(complete_csv)
-    
+
+    header_esistente = leggi_header_csv(complete_csv)
+    if header_esistente:
+        fieldnames_out = header_esistente
+    else:
+        # fallback: file assente o vuoto, ricostruiamo l'header come farebbe lo script 1
+        fieldnames_out = costruisci_header_completo(fieldnames_in)
+
     serie_recuperate_set = set()
 
     with open(complete_csv, mode='a', encoding='utf-8', newline='') as f_out:
@@ -338,9 +369,12 @@ def elabora_recupero():
 
                     for chiave, valore in nuove_date_effettive.items():
                         riga[chiave] = valore
-                    
+
+                    riga['Anni_Offset'] = anno_originale - anno_test
+
                     riga.pop('target_month', None)
-                    
+                    riga.pop('Motivo_Scarto', None)
+
                     return riga
 
             print(f"🔴 Serie {nome_serie}: Impossibile completare (nessun anno valido trovato fino al 2015)")
