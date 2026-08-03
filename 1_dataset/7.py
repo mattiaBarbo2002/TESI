@@ -33,8 +33,8 @@ csv_lock = threading.Lock()
 # --- IMPOSTAZIONE INTERVALLO RIGHE ---
 # Imposta i valori da 1 in poi.
 # Se vuoi fare tutto il file in un colpo solo, imposta entrambi a None.
-RIGA_INIZIO = 1
-RIGA_FINE = None
+RIGA_INIZIO = 10001
+RIGA_FINE = 15000
 
 # costanti
 CONTAINER = False

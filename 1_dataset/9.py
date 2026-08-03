@@ -42,7 +42,7 @@ def filtra_date_distanti(percorso_csv):
             
             # Aggiorniamo la maschera: ~(diff_giorni > 7) scarta le righe oltre i 7 giorni.
             # I valori NaT (date vuote) daranno esito False al controllo > 7, quindi verranno mantenuti.
-            da_mantenere = da_mantenere & ~(diff_giorni > 7)
+            da_mantenere = da_mantenere & ~(diff_giorni > 14)
             
         # 4. Applichiamo il filtro al DataFrame
         df_pulito = df[da_mantenere]
@@ -55,7 +55,7 @@ def filtra_date_distanti(percorso_csv):
         
         print("Elaborazione completata con successo!")
         print(f"Righe presenti inizialmente: {righe_iniziali}")
-        print(f"Righe eliminate (scarto > 7 giorni): {righe_eliminate}")
+        print(f"Righe eliminate (scarto > 14 giorni): {righe_eliminate}")
         print(f"Righe mantenute: {righe_finali}")
         print(f"Il file '{percorso_csv}' è stato aggiornato e sovrascritto.")
         

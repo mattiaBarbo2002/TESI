@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 import tifffile as tiff
 import os
 import numpy as np
+import rasterio
 
 class MoCoLoader(Dataset):
     def __init__(self, listIDs, root, transform, patch_size=256, 
@@ -65,6 +66,132 @@ class MoCoLoader(Dataset):
 
     def __len__(self):
         return len(self.listIDs)
+
+# ==========================================
+# 1. Funzione helper di lettura ottimizzata
+# ==========================================
+def read_tiff_from_zip(zip_path):
+    """
+    Legge l'intero file .tif (256x256) direttamente dall'interno del file ZIP.
+    Utilizza rasterio (/vsizip/) per massimizzare l'efficienza ed evitare l'estrazione.
+    Restituisce un array NumPy con shape (Canali, Altezza, Larghezza).
+    """
+    abs_zip_path = os.path.abspath(zip_path)
+    
+    # Trova dinamicamente il nome del file TIF dentro lo ZIP
+    with zipfile.ZipFile(abs_zip_path, 'r') as z:
+        tif_names = [n for n in z.namelist() if n.lower().endswith(('.tif', '.tiff'))]
+        if not tif_names:
+            raise FileNotFoundError(f"Nessun file .tif trovato in {zip_path}")
+        tif_name = tif_names[0]
+
+    # Sintassi "/vsizip/" di GDAL per la lettura nativa
+    vsi_path = f"/vsizip/{abs_zip_path}/{tif_name}"
+
+    with rasterio.open(vsi_path) as src:
+        img_data = src.read()
+        
+    # Gestione di eventuali NaN
+    img_data = np.nan_to_num(img_data, nan=0.0).astype(np.float32)
+    return img_data
+
+# ==========================================
+# 2. Loader Multi-modale (S1 e S2)
+# ==========================================
+class MoCo2encodersLoader(Dataset):
+    def __init__(self, listIDs, root, transform, patch_size=256,
+                 n_images1=4, n_channels1=3, n_images2=4, n_channels2=2):
+        self.listIDs = listIDs
+        self.root = root
+        self.transform = transform
+        self.patch_size = patch_size
+        self.n_images1 = n_images1  # Serie S2 (Ottico)
+        self.n_channels1 = n_channels1
+        self.n_images2 = n_images2  # Serie S1 (SAR)
+        self.n_channels2 = n_channels2
+
+    def __getitem__(self, index):
+        ID = self.listIDs[index]
+        
+        # Inizializzazione tensori vuoti: shape (Canali, Tempo, Altezza, Larghezza)
+        im_1 = np.empty((self.n_channels1, self.n_images1, self.patch_size, self.patch_size), dtype=np.float32)
+        im_2 = np.empty((self.n_channels2, self.n_images2, self.patch_size, self.patch_size), dtype=np.float32)
+        
+        # --- Caricamento Ottico (S2) ---
+        for t in range(self.n_images1):
+            time_step = t + 1
+            zip_path_s2 = os.path.join(self.root, 'S2', f"{ID}_OPT_t{time_step}.zip")
+            
+            img_s2 = read_tiff_from_zip(zip_path_s2)
+            c_to_take = min(self.n_channels1, img_s2.shape[0])
+            im_1[:c_to_take, t, :, :] = img_s2[:c_to_take, :, :]
+                    
+        # --- Caricamento SAR (S1) ---
+        for t in range(self.n_images2):
+            time_step = t + 1
+            zip_path_s1 = os.path.join(self.root, 'S1', f"{ID}_SAR_t{time_step}.zip")
+            
+            img_s1 = read_tiff_from_zip(zip_path_s1)
+            c_to_take = min(self.n_channels2, img_s1.shape[0])
+            im_2[:c_to_take, t, :, :] = img_s1[:c_to_take, :, :]
+
+        # Conversione in tensori PyTorch
+        im_1 = torch.from_numpy(im_1)
+        im_2 = torch.from_numpy(im_2)
+
+        if self.transform is not None:
+            im_q = self.transform(im_1)
+            im_k = self.transform(im_2)
+        else:
+            im_q = im_1
+            im_k = im_2
+
+        return im_q, im_k
+
+    def __len__(self):
+        return len(self.listIDs)
+
+# ==========================================
+# 3. Loader Singola Modalità
+# ==========================================
+class Singlemodal_Loader(Dataset):
+    def __init__(self, listIDs, root, transform, patch_size=256,
+                 n_images=4, n_channels=3, data_type='S1'):
+        self.listIDs = listIDs
+        self.root = root
+        self.transform = transform
+        self.patch_size = patch_size
+        self.n_images = n_images
+        self.n_channels = n_channels
+        self.data_type = data_type 
+
+    def __getitem__(self, index):
+        ID = self.listIDs[index]
+        
+        # Inizializzazione tensore vuoto: shape (Canali, Tempo, Altezza, Larghezza)
+        im = np.empty((self.n_channels, self.n_images, self.patch_size, self.patch_size), dtype=np.float32)
+        
+        # Scelta del percorso e del nome in base alla modalità
+        folder = 'S2' if self.data_type == 'S2' else 'S1'
+        suffix = 'OPT' if self.data_type == 'S2' else 'SAR'
+        
+        for t in range(self.n_images):
+            time_step = t + 1
+            zip_path = os.path.join(self.root, folder, f"{ID}_{suffix}_t{time_step}.zip")
+            
+            img_data = read_tiff_from_zip(zip_path)
+            c_to_take = min(self.n_channels, img_data.shape[0])
+            im[:c_to_take, t, :, :] = img_data[:c_to_take, :, :]
+
+        im = torch.from_numpy(im)
+
+        if self.transform is not None:
+            im = self.transform(im)
+            
+        return im
+
+    def __len__(self):
+        return len(self.listIDs)        
 
 class MoCo2encodersLoader(Dataset):
     def __init__(self, listIDs, root, transform, patch_size=256, 
