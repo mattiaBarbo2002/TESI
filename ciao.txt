@@ -1,0 +1,4 @@
+./dhcli list projects 
+source ./set_env.sh env_variables.env
+nano env_variables.env
+rm env_variables.env 

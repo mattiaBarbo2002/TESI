@@ -1,3 +1,5 @@
+# FILE NON MODIFICATO
+
 import torch.nn as nn
 import torch
 
