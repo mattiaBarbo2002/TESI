@@ -19,24 +19,26 @@ import zipfile
 
 
 # lettura file zip senza estrarlo
-def read_tiff_from_zip(zip_path):
-    
+def read_tiff_from_zip(zip_path, expected_tif_name):
     abs_zip_path = os.path.abspath(zip_path)
-    
-    with zipfile.ZipFile(abs_zip_path, 'r') as z:
-        tif_names = [n for n in z.namelist() if n.lower().endswith(('.tif', '.tiff'))]
-        if not tif_names:
-            raise FileNotFoundError(f"No file .tif trovato in {zip_path}")
-        tif_name = tif_names[0]
-
-    vsi_path = f"/vsizip/{abs_zip_path}/{tif_name}"
+    vsi_path = f"/vsizip/{abs_zip_path}/{expected_tif_name}"
 
     with rasterio.open(vsi_path) as src:
         img_data = src.read()
         
-    #  gestione NaN
-    img_data = np.nan_to_num(img_data, nan=0.0).astype(np.float32)
-    return img_data
+    return np.nan_to_num(img_data, nan=0.0).astype(np.float32)
+
+
+# normalizzazione valori
+def normalize_image(img, data_type):
+    if data_type == 'OPT':
+        img = img / 10000.0
+        img = np.clip(img, 0.0, 1.5)  
+
+    else:  # 'SAR'
+        img = np.clip(img, -25.0, 0.0)
+        img = (img + 25.0) / 25.0  
+    return img
 
 
 # --- CLASSE MOCO ---
@@ -77,6 +79,7 @@ class MoCo2encodersLoader(Dataset):
             img_s2 = read_tiff_from_zip(zip_path_s2)
             c_to_take = min(self.n_channels2, img_s2.shape[0])
             im_2[:c_to_take, t, :, :] = img_s2[:c_to_take, :, :]
+            print("read_tiff_from_zip S2")
 
         # coversione in tensori
         im_1 = torch.from_numpy(im_1)
@@ -111,23 +114,49 @@ class Singlemodal_Loader(Dataset):
     def __getitem__(self, index):
         ID = self.listIDs[index]
         
-        # tensori vuoti
-        im = np.empty((self.n_channels, self.n_images, self.patch_size, self.patch_size), dtype=np.float32)
+        im = np.zeros((self.n_channels, self.n_images, self.patch_size, self.patch_size), dtype=np.float32)
         
-        # Scelta del percorso e del nome in base alla modalità
-        folder = 'S2' if self.data_type == 'OPT' else 'S1'
+        folder = 'OPT' if self.data_type == 'OPT' else 'SAR'
         suffix = 'OPT' if self.data_type == 'OPT' else 'SAR'
         
+        serie_temporale = []
+        
+        # lettura immagini singola serie temporale
         for t in range(self.n_images):
             time_step = t + 1
-            zip_path = os.path.join(self.root, folder, f"{ID}_{suffix}_t{time_step}.zip")
+            base_name = f"{ID}_{suffix}_t{time_step}"
+            zip_path = os.path.join(self.root, folder, f"{base_name}.zip")
+            tif_name = f"{base_name}.tif"
             
-            img_data = read_tiff_from_zip(zip_path)
-            c_to_take = min(self.n_channels, img_data.shape[0])
-            im[:c_to_take, t, :, :] = img_data[:c_to_take, :, :]
+            img_data = read_tiff_from_zip(zip_path, tif_name)
+
+            # normalizzazione 
+            img_data = normalize_image(img_data, self.data_type)   
+            serie_temporale.append(img_data)
+            
+        # crop da t=1
+        c_tot, h_tot, w_tot = serie_temporale[0].shape
+        
+        start_y = max(0, (h_tot - self.patch_size) // 2)
+        start_x = max(0, (w_tot - self.patch_size) // 2)
+        
+        pad_y = max(0, self.patch_size - h_tot)
+        pad_x = max(0, self.patch_size - w_tot)
+
+        # stesso taglio sugli altri t
+        for t in range(self.n_images):
+            img = serie_temporale[t]
+            c_to_take = min(self.n_channels, img.shape[0])
+            
+            img_cropped = img[:c_to_take, start_y:start_y+self.patch_size, start_x:start_x+self.patch_size]
+            
+            if pad_y > 0 or pad_x > 0:
+                img_cropped = np.pad(img_cropped, ((0,0), (0, pad_y), (0, pad_x)), mode='constant', constant_values=0.0)
+                
+            # img nel tensore
+            im[:c_to_take, t, :, :] = img_cropped
 
         im = torch.from_numpy(im)
-
         if self.transform is not None:
             im = self.transform(im)
             
