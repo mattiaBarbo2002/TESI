@@ -10,9 +10,9 @@ Created on Fri Dec  1 17:53:21 2023
 
 import os
 import torch
-from notebooks.src.multimodal_3Dconv_attention import Singlemodal_Encoder, Multimodal_Encoder, Singlemodal_CAE
-import notebooks.src.moco.loader
-import notebooks.src.moco.builder
+from src.multimodal_3Dconv_attention import Singlemodal_Encoder, Multimodal_Encoder, Singlemodal_CAE
+import src.moco.loader
+import src.moco.builder
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
