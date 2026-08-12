@@ -45,10 +45,7 @@ def pretrain_encoders(
     print("Inizio download dataset")
     
     # percorso "/data/dataset_mesh" per usare il volume
-    dataset_path = project_data.get_artifact("Floods_Standard").download("/data/dataset_mesh")
-    
-    # cartella train
-    # traindir = os.path.join(dataset_path, "dataset") 
+    dataset_path = project_data.get_artifact("Floods_test").download("/data/dataset_mesh")
 
     # recupero id serie SAR
     s1_dir = os.path.join(dataset_path, "SAR")
@@ -85,17 +82,20 @@ def pretrain_encoders(
             n_channels=n_channels2,
             data_type='OPT'
         )
+
     except Exception as e:
-                print("loader")
-                print({e})     
+        print(f"Eccezione in Loader S2:", {e}, flush=True)
+        
 
     try:
         dataloaderS2 = DataLoader(datasetS2, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
+
     except Exception as e:
-            print("dataloader")
-            print({e})    
+        print(f"Eccezione in DataLoader S2 {e}", flush=True)
+          
     
     resultsS2 = {'lr': [], 'train_loss': []}
+
 
     try:
         for epoch in range(1, epochs + 1):
@@ -126,34 +126,25 @@ def pretrain_encoders(
                 best_loss = epoch_loss
 
     except Exception as e:
-        print({e})
+        print(f"Eccezione in model train S2: {e}", flush=True)
     
 
     # salvataggio su digitalhub
-    print("finito S2")
-    print("salvataggio metriche S2")
+    print("Terminato train S2, salvataggio metriche")
 
     try:
         pd.DataFrame(resultsS2).to_csv('log_pretrainS2.csv', index_label='epoch')
         project_work.log_artifact(name="metrics-s2", source="log_pretrainS2.csv")
-    except Exception as e:
-        print(f"Errore salvataggio metriche S2: {e}")
+        project_work.log_artifact(name="encoder-s2-weights", source="modelS2_best.pth")
 
-    # 2. Salva il modello SOLO SE il file esiste fisicamente
-    try:
-        if os.path.exists('modelS2_best.pth'):
-            project_work.log_artifact(name="encoder-s2-weights", source="modelS2_best.pth")
-        else:
-            print("ATTENZIONE: modelS2_best.pth NON trovato sul disco. La loss era NaN oppure l'epoca 1 non è finita.")
     except Exception as e:
-        print(f"Errore caricamento modello S2 su Digital Hub: {e}")
+        print(f"Ecezzione in salvataggio metriche S2: {e}", flush=True)
 
-    print("fine salvataggio S2")
+    print("Metriche S2 salvate")
     
     del modelS2
     torch.cuda.empty_cache()
 
-    print("cache pulita")
 
     # SAR
     print("\n Pretraining S1")
@@ -172,17 +163,16 @@ def pretrain_encoders(
             n_channels=n_channels1,
             data_type='SAR'
         )
+
     except Exception as e:
-                print("loader S1")
-                print({e})    
+        print(f"Eccezione in Loader S1:", {e}, flush=True)   
 
 
     try:
         dataloaderS1 = DataLoader(datasetS1, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
+
     except Exception as e:
-            print("dataloade S1")
-            print({e})     
-    
+        print(f"Eccezione in DataLoader S1 {e}", flush=True)     
     
     resultsS1 = {'lr': [], 'train_loss': []}
 
@@ -215,9 +205,11 @@ def pretrain_encoders(
                 best_loss = epoch_loss
 
     except Exception as e:
-            print({e})        
+        print(f"Eccezione in model train S1: {e}", flush=True)       
+
 
     # salvataggio su digitalhub
+    print("Terminato train S1, salvataggio metriche")
     
     try:
         pd.DataFrame(resultsS1).to_csv('log_pretrainS1.csv', index_label='epoch')
@@ -225,6 +217,8 @@ def pretrain_encoders(
         project_work.log_artifact(name="metrics-s1", source="log_pretrainS1.csv")
 
     except Exception as e:
-        print({e})    
+        print(f"Ecezzione in salvataggio metriche S1: {e}", flush=True)
+
+    print("Metriche S1 salvate")    
 
     return "Pre-training SAR e OPT finito"

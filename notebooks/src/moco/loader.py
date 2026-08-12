@@ -41,63 +41,6 @@ def normalize_image(img, data_type):
     return img
 
 
-# --- CLASSE MOCO ---
-
-class MoCo2encodersLoader(Dataset):
-    def __init__(self, listIDs, root, transform, patch_size=256,
-                 n_images1=4, n_channels1=3, n_images2=4, n_channels2=2):
-        self.listIDs = listIDs
-        self.root = root
-        self.transform = transform
-        self.patch_size = patch_size
-        self.n_images1 = n_images1              # sar
-        self.n_channels1 = n_channels1
-        self.n_images2 = n_images2              # ottico
-        self.n_channels2 = n_channels2
-
-    def __getitem__(self, index):
-        ID = self.listIDs[index]
-        
-        # tensori vuoti
-        im_1 = np.empty((self.n_channels1, self.n_images1, self.patch_size, self.patch_size), dtype=np.float32)
-        im_2 = np.empty((self.n_channels2, self.n_images2, self.patch_size, self.patch_size), dtype=np.float32)
-        
-        # caricamento img SAR
-        for t in range(self.n_images1):
-            time_step = t + 1
-            zip_path_s1 = os.path.join(self.root, 'SAR', f"{ID}_SAR_t{time_step}.zip")
-            
-            img_s1 = read_tiff_from_zip(zip_path_s1)
-            c_to_take = min(self.n_channels1, img_s1.shape[0])
-            im_1[:c_to_take, t, :, :] = img_s1[:c_to_take, :, :]
-                    
-        # caricamento img OPT
-        for t in range(self.n_images2):
-            time_step = t + 1
-            zip_path_s2 = os.path.join(self.root, 'OPT', f"{ID}_OPT_t{time_step}.zip")
-            
-            img_s2 = read_tiff_from_zip(zip_path_s2)
-            c_to_take = min(self.n_channels2, img_s2.shape[0])
-            im_2[:c_to_take, t, :, :] = img_s2[:c_to_take, :, :]
-            print("read_tiff_from_zip S2")
-
-        # coversione in tensori
-        im_1 = torch.from_numpy(im_1)
-        im_2 = torch.from_numpy(im_2)
-
-        if self.transform is not None:
-            im_q = self.transform(im_2)
-            im_k = self.transform(im_1)
-        else:
-            im_q = im_2
-            im_k = im_1
-
-        return im_q, im_k
-
-    def __len__(self):
-        return len(self.listIDs)
-
-
 # --- SINGOLO ENCODER ---
 
 class Singlemodal_Loader(Dataset):
@@ -163,14 +106,67 @@ class Singlemodal_Loader(Dataset):
         return im
 
     def __len__(self):
-        return len(self.listIDs)        
+        return len(self.listIDs)  
+
+
+# --- CLASSE MOCO ---
+
+class MoCo2encodersLoader(Dataset):
+    def __init__(self, listIDs, root, transform, patch_size=256,
+                 n_images1=4, n_channels1=3, n_images2=4, n_channels2=2):
+        self.listIDs = listIDs
+        self.root = root
+        self.transform = transform
+        self.patch_size = patch_size
+        self.n_images1 = n_images1              # sar
+        self.n_channels1 = n_channels1
+        self.n_images2 = n_images2              # ottico
+        self.n_channels2 = n_channels2
+
+    def __getitem__(self, index):
+        ID = self.listIDs[index]
+        
+        # tensori vuoti
+        im_1 = np.empty((self.n_channels1, self.n_images1, self.patch_size, self.patch_size), dtype=np.float32)
+        im_2 = np.empty((self.n_channels2, self.n_images2, self.patch_size, self.patch_size), dtype=np.float32)
+        
+        # caricamento img SAR
+        for t in range(self.n_images1):
+            time_step = t + 1
+            zip_path_s1 = os.path.join(self.root, 'SAR', f"{ID}_SAR_t{time_step}.zip")
+            
+            img_s1 = read_tiff_from_zip(zip_path_s1)
+            c_to_take = min(self.n_channels1, img_s1.shape[0])
+            im_1[:c_to_take, t, :, :] = img_s1[:c_to_take, :, :]
+                    
+        # caricamento img OPT
+        for t in range(self.n_images2):
+            time_step = t + 1
+            zip_path_s2 = os.path.join(self.root, 'OPT', f"{ID}_OPT_t{time_step}.zip")
+            
+            img_s2 = read_tiff_from_zip(zip_path_s2)
+            c_to_take = min(self.n_channels2, img_s2.shape[0])
+            im_2[:c_to_take, t, :, :] = img_s2[:c_to_take, :, :]
+            print("read_tiff_from_zip S2")
+
+        # coversione in tensori
+        im_1 = torch.from_numpy(im_1)
+        im_2 = torch.from_numpy(im_2)
+
+        if self.transform is not None:
+            im_q = self.transform(im_2)
+            im_k = self.transform(im_1)
+        else:
+            im_q = im_2
+            im_k = im_1
+
+        return im_q, im_k
+
+    def __len__(self):
+        return len(self.listIDs)
       
 
-
-# DOMANDE 
-# 1. augmentation
-
-# ALTRE FUNZIONI ORIGINALI
+# ALTRE CLASSI E FUNZIONI MAI USATE
 
 """
 class MoCoLoader(Dataset):

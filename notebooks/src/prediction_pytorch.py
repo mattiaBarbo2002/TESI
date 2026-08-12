@@ -10,9 +10,9 @@ Created on Fri Dec  1 17:53:21 2023
 
 import os
 import torch
-from multimodal_3Dconv_attention import Singlemodal_Encoder, Multimodal_Encoder, Singlemodal_CAE
-import moco.loader
-import moco.builder
+from notebooks.src.multimodal_3Dconv_attention import Singlemodal_Encoder, Multimodal_Encoder, Singlemodal_CAE
+import notebooks.src.moco.loader
+import notebooks.src.moco.builder
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
@@ -96,7 +96,7 @@ def main():
     #         device=device,
     #     ).to(device=device)
 
-    model = moco.builder.MoCo2encoders(
+    model = notebooks.src.moco.builder.MoCo2encoders(
         base_encoder_q = modelS2.encoder,
         base_encoder_k = modelS1.encoder,
         dim=args.moco_dim,
@@ -120,7 +120,7 @@ def main():
     list_test_files = list_non_draining_files+list_draining_files
     dim1 = image_size1[:2]
 
-    non_draining_training_dataset = moco.loader.MoCo2encodersLoader(
+    non_draining_training_dataset = notebooks.src.moco.loader.MoCo2encodersLoader(
         listIDs = list_non_draining_training,
         root = './',
         transform = None,
@@ -131,7 +131,7 @@ def main():
         n_channels2 = n_channels2
     )
 
-    draining_dataset = moco.loader.MoCo2encodersLoader(
+    draining_dataset = notebooks.src.moco.loader.MoCo2encodersLoader(
         listIDs = list_draining_files,
         root = './',
         transform = None,
@@ -142,7 +142,7 @@ def main():
         n_channels2 = n_channels2
     )
 
-    non_draining_dataset = moco.loader.MoCo2encodersLoader(
+    non_draining_dataset = notebooks.src.moco.loader.MoCo2encodersLoader(
         listIDs = list_non_draining_files,
         root = './',
         transform = None,
