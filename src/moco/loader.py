@@ -19,6 +19,7 @@ import zipfile
 
 
 # lettura file zip senza estrarlo
+
 def read_tiff_from_zip(zip_path, expected_tif_name):
     abs_zip_path = os.path.abspath(zip_path)
     vsi_path = f"/vsizip/{abs_zip_path}/{expected_tif_name}"
@@ -30,6 +31,7 @@ def read_tiff_from_zip(zip_path, expected_tif_name):
 
 
 # normalizzazione valori
+
 def normalize_image(img, data_type):
     if data_type == 'OPT':
         img = img / 10000.0
@@ -41,7 +43,7 @@ def normalize_image(img, data_type):
     return img
 
 
-# --- SINGOLO ENCODER ---
+# SINGOLO ENCODER
 
 class Singlemodal_Loader(Dataset):
     def __init__(self, listIDs, root, transform, patch_size=256,
@@ -109,8 +111,78 @@ class Singlemodal_Loader(Dataset):
         return len(self.listIDs)  
 
 
-# --- CLASSE MOCO ---
+# CLASSE MOCO
+# stessa logica Singlemodal_Loader
 
+class MoCo2encodersLoader(Dataset):
+    def __init__(self, listIDs, root, transform, patch_size=256,
+                 n_images1=4, n_channels1=3, n_images2=4, n_channels2=2):
+        self.listIDs = listIDs
+        self.root = root
+        self.transform = transform
+        self.patch_size = patch_size
+        self.n_images1 = n_images1              # sar
+        self.n_channels1 = n_channels1
+        self.n_images2 = n_images2              # ottico
+        self.n_channels2 = n_channels2
+
+    def _load_series(self, ID, folder, suffix, n_images, n_channels, data_type):
+        im = np.zeros((n_channels, n_images, self.patch_size, self.patch_size), dtype=np.float32)
+        serie_temporale = []
+
+        for t in range(n_images):
+            time_step = t + 1
+            base_name = f"{ID}_{suffix}_t{time_step}"
+            zip_path = os.path.join(self.root, folder, f"{base_name}.zip")
+            tif_name = f"{base_name}.tif"
+
+            img_data = read_tiff_from_zip(zip_path, tif_name)
+            img_data = normalize_image(img_data, data_type)
+            serie_temporale.append(img_data)
+
+        # crop centrato calcolato dalla prima immagine, applicato identico a tutte
+        c_tot, h_tot, w_tot = serie_temporale[0].shape
+        start_y = max(0, (h_tot - self.patch_size) // 2)
+        start_x = max(0, (w_tot - self.patch_size) // 2)
+        pad_y = max(0, self.patch_size - h_tot)
+        pad_x = max(0, self.patch_size - w_tot)
+
+        for t in range(n_images):
+            img = serie_temporale[t]
+            c_to_take = min(n_channels, img.shape[0])
+            img_cropped = img[:c_to_take, start_y:start_y+self.patch_size, start_x:start_x+self.patch_size]
+            if pad_y > 0 or pad_x > 0:
+                img_cropped = np.pad(img_cropped, ((0, 0), (0, pad_y), (0, pad_x)), mode='constant', constant_values=0.0)
+            im[:c_to_take, t, :, :] = img_cropped
+
+        return im
+
+    def __getitem__(self, index):
+        ID = self.listIDs[index]
+
+        im_1 = self._load_series(ID, 'SAR', 'SAR', self.n_images1, self.n_channels1, 'SAR')
+        im_2 = self._load_series(ID, 'OPT', 'OPT', self.n_images2, self.n_channels2, 'OPT')
+
+        im_1 = torch.from_numpy(im_1)
+        im_2 = torch.from_numpy(im_2)
+
+        if self.transform is not None:
+            im_q = self.transform(im_2)
+            im_k = self.transform(im_1)
+        else:
+            im_q = im_2
+            im_k = im_1
+
+        return im_q, im_k
+
+    def __len__(self):
+        return len(self.listIDs)
+
+
+
+# CLASSI E FUNZIONI ORIGINALI  
+
+"""
 class MoCo2encodersLoader(Dataset):
     def __init__(self, listIDs, root, transform, patch_size=256,
                  n_images1=4, n_channels1=3, n_images2=4, n_channels2=2):
@@ -164,7 +236,8 @@ class MoCo2encodersLoader(Dataset):
 
     def __len__(self):
         return len(self.listIDs)
-      
+
+"""    
 
 # ALTRE CLASSI E FUNZIONI MAI USATE
 
