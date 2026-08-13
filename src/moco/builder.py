@@ -77,8 +77,9 @@ class MoCo2encoders(nn.Module):
             param_proj_k.requires_grad = False  # not update by gradient
 
         # coda e indice
+        # coda inizializzata con valore randomici distribuzione normale
         self.register_buffer("queue", torch.randn(dim, K))
-        self.queue = nn.functional.normalize(self.queue, dim=0)
+        self.queue = nn.functional.normalize(self.queue, dim=0)                     # normalizzazione, ogni vettore = norma unitaria
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
     # @no_grad: blocco che non calcola i gradienti, risparmio memoria
