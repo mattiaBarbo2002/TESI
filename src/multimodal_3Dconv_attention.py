@@ -137,7 +137,7 @@ class CBAM(nn.Module):
         # passa valore medio a MLP
         # traspose inverte i canali e tempo, avg e max prendono gli ultimi tre valori e calcolano media e max
         # senza inversione prende t, H, W e gli schiaccia creando un numero per ogni canale
-        # 
+        
         avgOut = self.globalAvgPool(torch.transpose(x, 1, 2))       
         avgOut = avgOut.view(avgOut.size(0), -1)
         avgOut = self.mlp(avgOut)
@@ -199,22 +199,22 @@ class Singlemodal_Encoder(nn.Module):
         # output channel = 256
         # dimensioni H = 4, W = 4
         self.stage1 = nn.Sequential(ConvBlock(16, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage2 = nn.Sequential(ConvBlock(64, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage3 = nn.Sequential(ConvBlock(64, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage4 = nn.Sequential(ConvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage5 = nn.Sequential(ConvBlock(128, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage6 = nn.Sequential(ConvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
-                                    CBAM(n_images, reduction_ratio=4)
+                                  CBAM(n_images, reduction_ratio=1)
         )
 
         # Mamba per analisi temporale
@@ -273,34 +273,34 @@ class Multimodal_Encoder(nn.Module):
 								  nn.ReLU()
 		)
         self.stage1_1 = nn.Sequential(ConvBlock(16, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-								  CBAM(n_images1, reduction_ratio=4)
+								  CBAM(n_images1, reduction_ratio=1)
 		)
         self.stage1_2 = nn.Sequential(ConvBlock(16, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-								  CBAM(n_images2, reduction_ratio=4)
+								  CBAM(n_images2, reduction_ratio=1)
 		)
         self.stage2_1 = nn.Sequential(ConvBlock(64, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
-								  CBAM(n_images1, reduction_ratio=4)
+								  CBAM(n_images1, reduction_ratio=1)
 		)
         self.stage2_2 = nn.Sequential(ConvBlock(64, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
-								  CBAM(n_images2, reduction_ratio=4)
+								  CBAM(n_images2, reduction_ratio=1)
 		)
         self.stage3_1 = nn.Sequential(ConvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
-								  CBAM(n_images1, reduction_ratio=4)
+								  CBAM(n_images1, reduction_ratio=1)
 		)
         self.stage3_2 = nn.Sequential(ConvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
-                                  CBAM(n_images2, reduction_ratio=4)
+                                  CBAM(n_images2, reduction_ratio=1)
         )
         self.stage4_1 = nn.Sequential(ConvBlock(128, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
-								  CBAM(n_images1, reduction_ratio=4)
+								  CBAM(n_images1, reduction_ratio=1)
 		)
         self.stage4_2 = nn.Sequential(ConvBlock(128, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
-                                  CBAM(n_images2, reduction_ratio=4)
+                                  CBAM(n_images2, reduction_ratio=1)
         )
         self.stage5_1 = nn.Sequential(ConvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
-								  CBAM(n_images1, reduction_ratio=4)
+								  CBAM(n_images1, reduction_ratio=1)
 		)
         self.stage5_2 = nn.Sequential(ConvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
-                                  CBAM(n_images2//2, reduction_ratio=4)
+                                  CBAM(n_images2//2, reduction_ratio=1)
         )
 
         self.conv_lstm = ConvLSTM(input_dim=512, hidden_dim=64, kernel_size=(3, 3), num_layers=1, batch_first=True, bias=True, return_all_layers=False)
@@ -365,22 +365,22 @@ class Singlemodal_CAE(nn.Module):
             self.conv_lstm = ConvLSTM(input_dim=64, hidden_dim=256, kernel_size=(3, 3), num_layers=1, batch_first=True, bias=True, return_all_layers=False)
 
         self.stage1 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage2 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage3 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage4 = nn.Sequential(DeconvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)
         self.stage5 = nn.Sequential(DeconvBlock(128, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)    
         self.stage6 = nn.Sequential(DeconvBlock(64, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-								  CBAM(n_images, reduction_ratio=4)
+								  CBAM(n_images, reduction_ratio=1)
 		)                         
         self.conv1 = nn.Conv3d(64, input_dim, kernel_size=(1,7,7), padding='same', stride=(1, 1, 1))
           
@@ -419,6 +419,5 @@ class Singlemodal_CAE(nn.Module):
 #
 # 1. CBAM channel_in -> canali o tempo?
 # 2. CBAM reduction_ratio -> solo 4 istanti temporali, serve?
-# 3. Singlemodal_CAE mai usato
-# 4. Multimodal_Encoder mai usato
+# 3. Multimodal_Encoder mai usato
 #
