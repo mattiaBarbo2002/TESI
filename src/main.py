@@ -12,6 +12,8 @@ import digitalhub as dh
 import sys
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
+#from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+
 
 import time
 import zipfile
@@ -25,6 +27,9 @@ from moco.loader import Singlemodal_Loader
 
 from moco.builder import MoCo2encoders
 from moco.loader import MoCo2encodersLoader
+
+# from anomaly import PairLoader
+
 
 
 # main.py contiene tutti gli handler, il file DEVE chiamarsi main.py 
@@ -62,7 +67,7 @@ def pretrain_encoders(
     project_data = dh.get_project("datasets")
 
     # download dataset
-    print("Download dataset", flush=True)
+    print(f"Download: {dataset}", flush=True)
     dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
     print("OK -> Download terminato")
 
@@ -116,6 +121,11 @@ def pretrain_encoders(
             n_channels=n_channels1,
             data_type='SAR'
         )
+
+        for zip_path in set(sar_zip_map.values()):
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        print("OK -> ZIP SAR eliminati", flush=True)
 
     except Exception as e:
         print(f"EXC -> Eccezione in Loader S1:", {e}, flush=True)   
@@ -204,6 +214,17 @@ def pretrain_encoders(
     del modelS1
     torch.cuda.empty_cache() 
 
+    try:
+        cache_sar_dir = "/data/cache_SAR" 
+        if os.path.exists(cache_sar_dir):
+            print(f"Pulizia cartella SAR: {cache_sar_dir}", flush=True)
+            shutil.rmtree(cache_sar_dir)
+            print("OK -> Cartella SAR rimossa", flush=True)
+        else:
+            print("Nessuna cache SAR trovata da rimuovere.", flush=True)
+    except Exception as e:
+        print(f"EXC -> Eccezione durante la pulizia della cache SAR: {e}", flush=True)
+
 
     # OTTICO
     print("\n Training S2")
@@ -225,6 +246,11 @@ def pretrain_encoders(
             n_channels=n_channels2,
             data_type='OPT'
         )
+
+        for zip_path in set(opt_zip_map.values()):
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            print("OK -> ZIP OPT eliminati", flush=True)
 
     except Exception as e:
         print(f"EXC -> Eccezione in Loader S2:", {e}, flush=True)
@@ -335,6 +361,185 @@ def pretrain_encoders(
     print("OK -> Metriche S2 salvate")
 
     return "TERMINATO -> training SAR e OPT finito"
+
+
+@handler()
+def pretrain_encoder_s1(
+    epochs: int = 1, 
+    batch_size: int = 1, 
+    lr: float = 1e-4, 
+    weight_decay: float = 1e-4,
+    patch_size: int = 256,
+    n_images1: int = 4,
+    n_channels1: int = 2,
+    n_images2: int = 4,
+    n_channels2: int = 10,
+    mamba: bool = False,
+    workers: int = 0,
+    patience: int = 20,
+    job_name: str = "nome_job",
+    dataset: str = "Test",
+    time_debug: bool = False
+):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device, "\n", flush=True)
+
+    n_gpus = torch.cuda.device_count()
+    print(f"GPU: {n_gpus}", flush=True)
+
+    torch.backends.cudnn.benchmark = True
+    
+    # progetti digital hub
+    project_work = dh.get_project("floods")
+    project_data = dh.get_project("datasets")
+
+    # download dataset
+    print(f"Download dataset: {dataset}", flush=True)
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
+    print("OK -> Download terminato")
+
+    try:
+        # recupero id serie SAR + mappa serie -> zip che la contiene
+        s1_dir = os.path.join(dataset_path, "SAR")
+        sar_zip_map = {}
+        for zip_file in sorted(glob(os.path.join(s1_dir, "SAR_*.zip"))):
+            with zipfile.ZipFile(zip_file, 'r') as z:
+                for n in z.namelist():
+                    if n.lower().endswith('.tif'):
+                        ID = os.path.basename(n).split('_SAR_')[0]
+                        sar_zip_map[ID] = zip_file
+        train_data_SAR_IDS = list(sar_zip_map.keys())
+        print(f"{len(train_data_SAR_IDS)} serie SAR trovate")
+
+    except Exception as e:
+        print(f"EXC -> Eccezione recupero liste: {e}", flush=True)    
+
+
+    # SAR
+    print("\n Training S1")
+    modelS1 = Singlemodal_CAE(input_dim=n_channels1, output_dim=10, n_images=n_images1, mamba=mamba).to(device)
+    if n_gpus > 1:
+        modelS1 = nn.DataParallel(modelS1)
+    optimizerS1 = torch.optim.Adam(modelS1.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.MSELoss().to(device)
+    scalerS1 = torch.cuda.amp.GradScaler()
+    best_loss = 9999.0
+
+    try:
+        datasetS1 = Singlemodal_Loader(
+            listIDs=train_data_SAR_IDS,
+            root=dataset_path,
+            zip_map=sar_zip_map,
+            transform=None,
+            patch_size=patch_size,
+            n_images=n_images1,
+            n_channels=n_channels1,
+            data_type='SAR'
+        )
+
+        for zip_path in set(sar_zip_map.values()):
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        print("OK -> ZIP SAR eliminati", flush=True)
+
+    except Exception as e:
+        print(f"EXC -> Eccezione in Loader S1:", {e}, flush=True)   
+
+    try:
+        dataloaderS1 = DataLoader(datasetS1, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
+
+    except Exception as e:
+        print(f"EXC -> Eccezione in DataLoader S1 {e}", flush=True)     
+
+    resultsS1 = {'lr': [], 'train_loss': []}
+    epochs_no_improve = 0
+
+    
+    try:
+        for epoch in range(1, epochs + 1):
+            modelS1.train()
+            total_loss, total_num, train_bar = 0.0, 0, tqdm(dataloaderS1)
+
+            if time_debug:
+                t_prev = time.time()
+
+            for im in train_bar:
+
+                if time_debug:  
+                    torch.cuda.synchronize()
+                    t_data = time.time()
+
+                im = im.to(non_blocking=True, device=device)
+
+                if time_debug:
+                    torch.cuda.synchronize()
+                    t_transfer = time.time()                
+
+                with torch.cuda.amp.autocast():
+                    output = modelS1(im)
+                    loss = loss_fn(output, im)
+
+                if time_debug:
+                    torch.cuda.synchronize()
+                    t_forward = time.time()                    
+                
+                optimizerS1.zero_grad()
+                scalerS1.scale(loss).backward()
+                scalerS1.step(optimizerS1)
+                scalerS1.update()
+
+                if time_debug:
+                    torch.cuda.synchronize()
+                    t_backward = time.time()
+
+                    print(f"dati: {t_data-t_prev:.3f}s | trasferimento: {t_transfer-t_data:.3f}s | "
+                    f"forward: {t_forward-t_transfer:.3f}s | backward: {t_backward-t_forward:.3f}s", flush=True)
+                    t_prev = time.time()                
+                
+                total_num += dataloaderS1.batch_size
+                total_loss += loss.item() * dataloaderS1.batch_size
+                train_bar.set_description(f'S1 Epoch: [{epoch}/{epochs}], Loss: {loss.item():.4f}')
+                
+            epoch_loss = total_loss / total_num
+            resultsS1['lr'].append(optimizerS1.param_groups[0]['lr'])
+            resultsS1['train_loss'].append(epoch_loss)
+            
+            # salvataggio temporaneo nel container
+            if epoch_loss < best_loss:
+                state_dict = modelS1.module.state_dict() if n_gpus > 1 else modelS1.state_dict()
+                torch.save(state_dict, f'modelS1_best_{job_name}.pth')
+                best_loss = epoch_loss
+                epochs_no_improve = 0
+
+            else:
+                epochs_no_improve += 1
+
+                if epochs_no_improve >= patience:
+                    epochs_no_improve = 0
+                    print(f"Early Stopping S1: epoch {epoch}")
+                    break    
+
+    except Exception as e:
+        print(f"EXC -> Eccezione in model train S1: {e}", flush=True)       
+
+
+    # salvataggio su digitalhub
+    print("OK -> Terminato training S1")     
+
+    # salvataggio su digitalhub
+    print("Salvataggio metriche")
+
+    try:
+        pd.DataFrame(resultsS1).to_csv(f'log_pretrainS1_{job_name}.csv', index_label='epoch')
+        project_work.log_artifact(name=f"encoder-s1-weights_{job_name}", source=f"modelS1_best_{job_name}.pth")
+        project_work.log_artifact(name=f"metrics-s1_{job_name}", source=f"log_pretrainS1_{job_name}.csv")
+
+    except Exception as e:
+        print(f"EXC -> Eccezione in salvataggio metriche S1: {e}", flush=True)
+
+    print("OK -> Metriche S1 salvate")      
+
+    return "TERMINATO -> training SAR finito"
 
 
 
@@ -480,3 +685,5 @@ def train_moco(
     print("OK -> MoCo training finito")    
 
     return "TERMINATO -> MoCo training finito"
+
+

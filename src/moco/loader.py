@@ -82,7 +82,7 @@ class Singlemodal_Loader(Dataset):
         for t in range(self.n_images):
             time_step = t + 1
             base_name = f"{ID}_{suffix}_t{time_step}"
-            img_data = read_tiff_from_zip(zip_path, f"{base_name}.tif")   # niente più prefisso di cartella
+            img_data = read_tiff_from_zip(zip_path, f"{base_name}.tif")   
             img_data = normalize_image(img_data, self.data_type)
             serie_temporale.append(img_data)
 

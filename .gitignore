@@ -16,3 +16,5 @@ EOT
 venv/
 .venv/
 env/
+
+prova.c
