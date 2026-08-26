@@ -17,9 +17,6 @@ import rasterio
 import zipfile
 
 
-
-
-
 # lettura file zip senza estrarlo
 
 def read_tiff_from_zip(zip_path, expected_tif_name):
@@ -59,12 +56,11 @@ class Singlemodal_Loader(Dataset):
         self.n_channels = n_channels
         self.data_type = data_type
 
-        
         suffix = 'OPT' if self.data_type == 'OPT' else 'SAR'
         self.cache_dir = f"/data/cache_{suffix}"
         os.makedirs(self.cache_dir, exist_ok=True)
         
-        print(f"Precalcolo {len(listIDs)} serie {data_type} su disco...", flush=True)
+        print(f"Precalcolo {len(listIDs)} serie {data_type}", flush=True)
         for ID in self.listIDs:
             save_path = os.path.join(self.cache_dir, f"{ID}.npy")
             # Calcola e salva solo se non esiste già
@@ -124,7 +120,7 @@ class Singlemodal_Loader(Dataset):
 
 class MoCo2encodersLoader(Dataset):
     def __init__(self, listIDs, root, transform, patch_size=256,
-                 n_images1=4, n_channels1=3, n_images2=4, n_channels2=2):
+                 n_images1=4, n_channels1=2, n_images2=4, n_channels2=10):
         self.listIDs = listIDs
         self.root = root
         self.transform = transform
@@ -134,21 +130,49 @@ class MoCo2encodersLoader(Dataset):
         self.n_images2 = n_images2              # ottico
         self.n_channels2 = n_channels2
 
-    def _load_series(self, ID, folder, suffix, n_images, n_channels, data_type):
+        self.cache_dir_sar = "/data/cache_moco_SAR"
+        self.cache_dir_opt = "/data/cache_moco_OPT"
+        os.makedirs(self.cache_dir_sar, exist_ok=True)
+        os.makedirs(self.cache_dir_opt, exist_ok=True)
+
+        print(f"Precalcolo {len(listIDs)} serie SAR", flush=True)
+        for ID in self.listIDs:
+            save_path = os.path.join(self.cache_dir_sar, f"{ID}.npy")
+            if not os.path.exists(save_path):
+                im = self._load_and_process(ID, self.sar_map, 'SAR', self.n_images1, self.n_channels1)
+                np.save(save_path, im)
+        print("Precalcolo SAR completato", flush=True)
+
+        for zip_path in set(self.sar_map.values()):
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        print("OK -> ZIP SAR eliminati", flush=True)
+
+        print(f"Precalcolo {len(listIDs)} serie OPT", flush=True)
+        for ID in self.listIDs:
+            save_path = os.path.join(self.cache_dir_opt, f"{ID}.npy")
+            if not os.path.exists(save_path):
+                im = self._load_and_process(ID, self.opt_map, 'OPT', self.n_images2, self.n_channels2)
+                np.save(save_path, im)
+        print("Precalcolo OPT completato", flush=True)
+
+        for zip_path in set(self.opt_map.values()):
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        print("OK -> ZIP OPT eliminati", flush=True)
+
+    def _load_and_process(self, ID, archive_map, suffix, n_images, n_channels):
         im = np.zeros((n_channels, n_images, self.patch_size, self.patch_size), dtype=np.float32)
         serie_temporale = []
+        zip_path = archive_map[ID]
 
         for t in range(n_images):
             time_step = t + 1
             base_name = f"{ID}_{suffix}_t{time_step}"
-            zip_path = os.path.join(self.root, folder, f"{base_name}.zip")
-            tif_name = f"{base_name}.tif"
-
-            img_data = read_tiff_from_zip(zip_path, tif_name)
-            img_data = normalize_image(img_data, data_type)
+            img_data = read_tiff_from_zip(zip_path, f"{base_name}.tif")
+            img_data = normalize_image(img_data, suffix)
             serie_temporale.append(img_data)
 
-        # crop centrato calcolato dalla prima immagine, applicato identico a tutte
         c_tot, h_tot, w_tot = serie_temporale[0].shape
         start_y = max(0, (h_tot - self.patch_size) // 2)
         start_x = max(0, (w_tot - self.patch_size) // 2)
@@ -168,18 +192,18 @@ class MoCo2encodersLoader(Dataset):
     def __getitem__(self, index):
         ID = self.listIDs[index]
 
-        im_1 = self._load_series(ID, 'SAR', 'SAR', self.n_images1, self.n_channels1, 'SAR')
-        im_2 = self._load_series(ID, 'OPT', 'OPT', self.n_images2, self.n_channels2, 'OPT')
+        im_sar = np.load(os.path.join(self.cache_dir_sar, f"{ID}.npy"), mmap_mode='r')
+        im_sar = torch.from_numpy(im_sar.copy())
 
-        im_1 = torch.from_numpy(im_1)
-        im_2 = torch.from_numpy(im_2)
+        im_opt = np.load(os.path.join(self.cache_dir_opt, f"{ID}.npy"), mmap_mode='r')
+        im_opt = torch.from_numpy(im_opt.copy())
 
         if self.transform is not None:
-            im_q = self.transform(im_2)
-            im_k = self.transform(im_1)
+            im_q = self.transform(im_opt)
+            im_k = self.transform(im_sar)
         else:
-            im_q = im_2
-            im_k = im_1
+            im_q = im_opt
+            im_k = im_sar
 
         return im_q, im_k
 

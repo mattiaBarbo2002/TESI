@@ -96,7 +96,7 @@ def main():
     #         device=device,
     #     ).to(device=device)
 
-    model = notebooks.src.moco.builder.MoCo2encoders(
+    model = builder.MoCo2encoders(
         base_encoder_q = modelS2.encoder,
         base_encoder_k = modelS1.encoder,
         dim=args.moco_dim,
@@ -120,7 +120,7 @@ def main():
     list_test_files = list_non_draining_files+list_draining_files
     dim1 = image_size1[:2]
 
-    non_draining_training_dataset = notebooks.src.moco.loader.MoCo2encodersLoader(
+    non_draining_training_dataset = moco.loader.MoCo2encodersLoader(
         listIDs = list_non_draining_training,
         root = './',
         transform = None,
@@ -131,7 +131,7 @@ def main():
         n_channels2 = n_channels2
     )
 
-    draining_dataset = notebooks.src.moco.loader.MoCo2encodersLoader(
+    draining_dataset = moco.loader.MoCo2encodersLoader(
         listIDs = list_draining_files,
         root = './',
         transform = None,
@@ -142,7 +142,7 @@ def main():
         n_channels2 = n_channels2
     )
 
-    non_draining_dataset = notebooks.src.moco.loader.MoCo2encodersLoader(
+    non_draining_dataset = moco.loader.MoCo2encodersLoader(
         listIDs = list_non_draining_files,
         root = './',
         transform = None,

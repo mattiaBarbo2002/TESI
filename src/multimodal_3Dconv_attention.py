@@ -256,6 +256,7 @@ class Singlemodal_Encoder(nn.Module):
         x = self.fc(x)                      # layer fully connected (dim = output_dim)
         return x
 
+    
 
 class Multimodal_Encoder(nn.Module):
     def __init__(self, input_dim1=2, input_dim2=1, output_dim=256, n_images1=10, n_images2=20, device='cuda'):
@@ -413,6 +414,73 @@ class Singlemodal_CAE(nn.Module):
         x = self.stage6(x)
         x = self.conv1(x)
         return x
+
+    class Singlemodal_CAE(nn.Module):
+        def __init__(self, input_dim=2, output_channels=None, output_dim=256, n_images=10, mamba=False):
+            super(Singlemodal_CAE, self).__init__()
+            self.input_dim = input_dim
+            self.output_dim = output_dim
+            self.n_images = n_images
+            self.mamba = mamba
+            self.encoder = Singlemodal_Encoder(input_dim=input_dim, output_dim=output_dim, n_images=n_images, mamba=mamba)
+            if self.mamba:
+                self.fc = nn.Linear(output_dim,256*n_images)
+                self.mamba_config = MambaConfig(d_model=256,n_layers=1)
+                self.mamba = Mamba(self.mamba_config)
+                self.mamba_proj_out = nn.Linear(256, 256*4*4)
+            else:
+                self.fc = nn.Linear(output_dim,1024*n_images)
+                self.conv_lstm = ConvLSTM(input_dim=64, hidden_dim=256, kernel_size=(3, 3), num_layers=1, batch_first=True, bias=True, return_all_layers=False)
+
+            self.stage1 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
+                                    CBAM(n_images, reduction_ratio=1)
+            )
+            self.stage2 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
+                                    CBAM(n_images, reduction_ratio=1)
+            )
+            self.stage3 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
+                                    CBAM(n_images, reduction_ratio=1)
+            )
+            self.stage4 = nn.Sequential(DeconvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
+                                    CBAM(n_images, reduction_ratio=1)
+            )
+            self.stage5 = nn.Sequential(DeconvBlock(128, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
+                                    CBAM(n_images, reduction_ratio=1)
+            )    
+            self.stage6 = nn.Sequential(DeconvBlock(64, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
+                                    CBAM(n_images, reduction_ratio=1)
+            )                         
+            self.conv1 = nn.Conv3d(64, self.output_channels, kernel_size=(1,7,7), padding='same', stride=(1, 1, 1))
+            
+                    
+        # x passa dal singleEncoder
+        # si rifà fc per ripristinare le dimensioni di prima (pre fc singleEncoder)
+        # è il primo passaggio di ricorstruzione
+        def forward(self, x):
+            x = x.float()
+            x = self.encoder(x)
+            x = self.fc(x)
+
+            if self.mamba:
+                x = x.reshape(x.size(0), self.n_images, 256)        # Reshape to (batch, time, features)
+                x = self.mamba(x)                                   # Apply Mamba
+                x = self.mamba_proj_out(x)                          # Project back to spatial dimensions
+                x = x.reshape(x.size(0), self.n_images, 256, 4, 4)  # Reshape to (batch, channels, time, height, width)
+
+            else:
+                x = x.reshape(x.size(0), self.n_images, 64, 4, 4)   # (batch, time, channels, height, width)
+                x, _ = self.conv_lstm(x)
+                x = x[0]  
+
+            x = x.permute(0, 2, 1, 3, 4)                            # (batch, channels, time, height, width)
+            x = self.stage1(x)
+            x = self.stage2(x)
+            x = self.stage3(x)
+            x = self.stage4(x)
+            x = self.stage5(x)
+            x = self.stage6(x)
+            x = self.conv1(x)
+            return x    
 
 
 # DOMANDE
