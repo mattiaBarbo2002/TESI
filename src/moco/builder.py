@@ -142,12 +142,12 @@ class MoCo2encoders(nn.Module):
     # q = matrice [dim_batch x dim (128)] di vettori del batch im_q processati da q_encoder
     def contrastive_loss(self, im_q, im_k):
         
-        print("im_q.type: ", type(im_q))
+        #print("im_q.type: ", type(im_q))
         # blocco no.grad non salvo valori per backpropagation
         with torch.no_grad():
             q = self.encoder_q(im_q)  
         q = nn.functional.normalize(self.proj_q(q), dim=1)  
-        print("contrastive_loss: q.shape:", q.shape)    
+        #print("contrastive_loss: q.shape:", q.shape)    
 
         # encoder_k mescola chiavi, processa batch, riordina chiavi 
         # no gradient
@@ -160,8 +160,9 @@ class MoCo2encoders(nn.Module):
             # riordina
             k = self._batch_unshuffle_single_gpu(k, idx_unshuffle)
 
-        print("contrastive_loss: k.shape:", k.shape)  
+        #print("contrastive_loss: k.shape:", k.shape)  
 
+        # CALCOLO COSINE SIMILARITY
         # similarità positiva: moltiplica matrice q per colonna corretta k
         # vettori normalizzati quindi prodotto [-1,1]
         # output colonna dim_batch*1, ogni riga è il singolo punteggio della serie
@@ -171,6 +172,7 @@ class MoCo2encoders(nn.Module):
         # output matrice dim_batch*dim_coda
         l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
 
+        # CALCOLO INFONCE
         # aggiunge colonna positiva all'inizio della matrice negativa
         # output matrice dim_batch*(dim_coda+1)
         # divide per temperatura softmax, differenze minime esplodono
@@ -189,7 +191,7 @@ class MoCo2encoders(nn.Module):
             'we encode the queries and their corresponding keys, which form the positive sample pairs. 
             The negative samples are from the queue'
         """
-        print("contrastive_loss()", "minibatch loss value", loss)
+        #print("contrastive_loss()", "minibatch loss value", loss)
 
         return loss, q, k
 

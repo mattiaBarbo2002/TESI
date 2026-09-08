@@ -279,7 +279,244 @@ exp
     }
 
 
+// iif statement
 
+"iif" {return IIF;}
+
+
+
+%token <ifStmt> IIF;
+
+statement
+    :
+    | iff_statement
+
+iif_statement
+    : IIF LPAR assign_statement SEMI exp RPAR
+    {
+        createLabel(program, $1.lElse);
+        createLabel(program, $1.lExit);
+        BEQ(program, $5, REG_0, $1.lElse);
+    }
+    code_block
+    {
+        // if computation
+        genJ(program, $1.lExit);
+        assignLabel(program, $1.lElse);
+    }
+    else_part
+    {
+        // else computation
+        assignLabel(program, $1.lExit)
+    }
+
+ // count_while
+ 
+"count_while" { return COUNT_WHILE; }
+
+// In parser.y (dichiarazioni)
+typedef struct {
+    t_label *lLoop;
+    t_label *lExit;
+    t_regID rCount; // Uniformato a rCount
+} t_count_while_stmt;
+
+%union {
+    // ...
+    t_count_while_stmt cwhileStmt; // Nome del tipo corretto
+}
+
+%token <cwhileStmt> COUNT_WHILE
+
+// Nelle regole
+statement
+    // ...
+    | count_while_statement SEMI // Aggiunto SEMI
+    ;
+
+count_while_statement
+    : var_id ASSIGN COUNT_WHILE
+    {
+        // Controllo richiesto dalla traccia: deve essere uno scalare
+        if (isArray($1)) {
+            yyerror("La destinazione deve essere una variabile scalare");
+            YYERROR;
+        }
+
+        $3.lLoop = createLabel(program);
+        $3.lExit = createLabel(program);
+        
+        $3.rCount = getNewRegister(program);
+        genLI(program, $3.rCount, 0);
+        
+        // Etichetta per il ricalcolo della condizione
+        assignLabel(program, $3.lLoop);
+    }
+    LPAR exp RPAR
+    {
+        // (Rimossa la doppia assignLabel)
+        // Se la condizione è falsa (0), esco dal ciclo
+        genBEQ(program, $6, REG_0, $3.lExit);
+    }
+    code_block
+    {
+        // 1. Incremento il contatore (genADDI corretto)
+        genADDI(program, $3.rCount, $3.rCount, 1);
+        
+        // 2. Torno all'inizio per rivalutare la condizione
+        genJ(program, $3.lLoop);
+        
+        // 3. Fine del ciclo
+        assignLabel(program, $3.lExit);
+        
+        // 4. SOLO ORA salvo il contatore nella variabile, fuori dal loop!
+        genStoreRegisterToVariable(program, $1, $3.rCount);
+    }
+;
+
+// if repeat
+
+"if_repeat" { return IFR; }
+"until"     { return UN; }
+
+// Nota: tolto il punto e virgola dalla definizione del token
+%token <whileStmt> IFR
+%token UN 
+
+statement
+    // ...
+    | IFR LPAR exp RPAR
+    {
+        $1.lLoop = createLabel(program);
+        $1.lExit = createLabel(program);
+
+        // 1. Se exp1 è falsa (0), esco subito scavalcando tutto
+        genBEQ(program, $3, REG_0, $1.lExit);
+
+        // 2. Metto QUI l'etichetta di loop, così il code_block che 
+        // verrà generato subito dopo si troverà sotto l'etichetta!
+        assignLabel(program, $1.lLoop);
+    }
+    code_block UN LPAR exp RPAR
+    {
+        // 3. Logica UNTIL: se exp2 (ora in $9) è FALSA (0), torno su a ripetere.
+        // Se è vera, non salto e cado morbidamente nell'etichetta di uscita.
+        genBEQ(program, $9, REG_0, $1.lLoop);
+        
+        // 4. Etichetta di uscita finale
+        assignLabel(program, $1.lExit);
+    }
+;
+
+// repeat_exp
+
+"if_repeat" {return IFR;}
+
+typedef struct{
+    l_label *lLoop;
+    l_label *lExit;
+    t_regID rRes;
+} ifr_stmt;
+
+%union {
+    ifr_stmt ifrStmt;
+}
+
+%token <ifrStmt> IFR;
+
+statement
+    :
+    | REXP RPAR var_id ASSIGN exp COMMA exp
+    {
+        $1.lLoop = createLabel(program);
+        $1.lExit = createLabel(program);
+
+        $1.rRes = genNewRegister(program);
+        genAdd(program, $1.rRes, REG_0, $5);
+        genStoreToVariable(program, $3, $1.rRes);
+
+        assignLabel(program, $1.lLoop);
+        BLE(program, $7, REG_0, $1.lExit);
+    }
+    COMMA exp RPAR SEMICOL
+    {
+        // esecuzione codice
+        genAdd(program, $1.rRes, REG_0, $10);
+        genStoreToVariable(program, $3, $1.rRes);
+        genJ(program, $1.lLoop);
+
+        assignLabel(program, $1.lExit);
+    }
+;    
+
+// converge
+
+statement
+    :
+    | CONV var_id
+    {
+        $1.lLoop = createLabel(program);
+        $1.lExit = createLabel(program);
+
+        assignLabel($1.lLoop);
+    }
+    code_block
+    {
+        assignLabel($1.lLoop);
+    }
+
+
+// zip
+
+// 1. controllo dimensioni, conto dimensione piu piccola, inizializzo registro dim_min
+// 2. inserisco in output solo fino a grandezza array3 -> altro registro
+
+statement
+    :
+    | ZIP var_id COMMA var_id COMMA var_id
+    {
+        if(!isArray($2) || !isArray($4) || !isArray($6)){
+            yyerror("errore");
+            YYERROR;
+        }
+
+        $1.lLoop = createLabel(program);
+        $1.lExit = createLabel(program);
+        $1.rIdx = genNewRegister(program);
+        genLI(program, $1.rIdx = )
+
+        t_regID rMin = genNewRegister(program);
+        t_regID rMin = genNewRegister(program);
+
+        int len1 = $1->arraySize();
+        int len2 = $3->arraySize();
+
+        if(len1 < len2){
+            genLI(program, rMin, len1);
+        } else {
+            genLI(program, rMin, len2);
+        }
+        $1.genLI(program, );
+        
+    }
+
+
+list
+    | exp list
+    {
+
+    }
+    | exp
+    {
+
+    }
+
+statement
+    :
+    | var_id ASSIGN ALL LPAR list RPAR
+    {
+        
+    }   
 
 
 

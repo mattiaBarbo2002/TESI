@@ -1,0 +1,24 @@
+ECONDERS
+    sar: encoders-Floods_Standard_train_s1_v5_200
+    opt: 
+
+    Test_train_s12_v1_20 = normale
+    Test_train_s12_v2_20 = wd:0
+    Test_train_s12_v3_20 = out_dim:128  -> SAR: 0.0365, OPT: 0.0114, pesi grandi
+    Test_train_s12_v4_20 = out_dim:512  -> SAR: 0.0323, OPT: 0.0124, pesi piccoli
+    Test_train_s12_v5_20 = out_dim:256  -> SAR: 0.0353, OPT: 0.0146, pesi meno grandi
+
+    Test_test_encoders_weights_v2 = Test_train_s12_v2_20
+    Test_test_encoders_weights_v4 = Test_train_s12_v3_20
+    Test_test_encoders_weights_v5 = Test_train_s12_v4_20
+    Test_test_encoders_weights_v5* = Test_train_s12_v4_20
+
+
+
+PESI 
+    batch norm -> media 0, dev 1 -> [-2, +2]
+    linear -> [-1/rad(4096), +1/rad(4096)]
+    pesi vect -> [-0.0156, +0.0156]
+
+
+
