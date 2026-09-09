@@ -24,6 +24,7 @@ import torchvision.transforms as transforms
 from digitalhub_runtime_python import handler
 
 from multimodal_3Dconv_attention import Singlemodal_CAE
+from multimodal_3Dconv_attention import Singlemodal_CAE_2d
 from multimodal_3Dconv_attention import MaskedAutoEncoder
 
 from moco.loader import Singlemodal_Loader
@@ -57,7 +58,7 @@ def log_artifact_safe(project, name, source, retries=3, delay=5):
 # notebook -> encoders
 
 @handler()
-def pretrain_encoders(
+def train_autoencoders_1D(
     epochs: int = 1, 
     batch_size: int = 1, 
     lr: float = 1e-4, 
@@ -430,6 +431,380 @@ def pretrain_encoders(
     return "TERMINATO -> training SAR e OPT finito"
 
 
+@handler()
+def train_autoencoders_2D(
+    epochs: int = 1, 
+    batch_size: int = 1, 
+    lr: float = 1e-4, 
+    weight_decay: float = 1e-4,
+    patch_size: int = 256,
+    n_images1: int = 4,
+    n_channels1: int = 2,
+    n_images2: int = 4,
+    output_dim: int = 16,
+    n_channels2: int = 10,
+    mamba: bool = False,
+    workers: int = 0,
+    job_name: str = "nome_job",
+    dataset: str = "Test",
+    train_sar: bool = True,
+    train_opt: bool = True,
+    patience: int = 20,
+    min_delta: float = 1e-4,
+    time_debug: bool = False
+):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device, "\n", flush=True)
+
+    n_gpus = torch.cuda.device_count()
+    print(f"GPU: {n_gpus}", flush=True)
+
+    torch.backends.cudnn.benchmark = True
+    
+    # progetti digital hub
+    project_work = dh.get_project("floods")
+    project_data = dh.get_project("datasets")
+
+    # download dataset
+    print(f"Download: {dataset}", flush=True)
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
+    print("OK -> Download terminato")
+
+    try:
+
+        if train_sar:
+            # recupero id serie SAR + mappa serie -> zip che la contiene
+            s1_dir = os.path.join(dataset_path, "SAR")
+            sar_zip_map = {}
+            for zip_file in sorted(glob(os.path.join(s1_dir, "SAR_*.zip"))):
+                with zipfile.ZipFile(zip_file, 'r') as z:
+                    for n in z.namelist():
+                        if n.lower().endswith('.tif'):
+                            ID = os.path.basename(n).split('_SAR_')[0]
+                            sar_zip_map[ID] = zip_file
+            train_data_SAR_IDS = list(sar_zip_map.keys())
+            print(f"{len(train_data_SAR_IDS)} serie SAR trovate")
+
+        if train_opt:
+            # recupero id serie OPT + mappa serie -> zip che la contiene
+            s2_dir = os.path.join(dataset_path, "OPT")
+            opt_zip_map = {}
+            for zip_file in sorted(glob(os.path.join(s2_dir, "OPT_*.zip"))):
+                with zipfile.ZipFile(zip_file, 'r') as z:
+                    for n in z.namelist():
+                        if n.lower().endswith('.tif'):
+                            ID = os.path.basename(n).split('_OPT_')[0]
+                            opt_zip_map[ID] = zip_file
+            train_data_OPT_IDS = list(opt_zip_map.keys())
+            print(f"{len(train_data_OPT_IDS)} serie OPT trovate")
+
+    except Exception as e:
+        print(f"EXC -> Eccezione recupero liste: {e}", flush=True)    
+
+    # TRAINING SAR
+    if train_sar:
+    
+        print("\n Training S1")
+        modelS1 = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, n_head=n_head, d_k=d_k).to(device)
+        if n_gpus > 1:
+            modelS1 = nn.DataParallel(modelS1)
+        optimizerS1 = torch.optim.Adam(modelS1.parameters(), lr=lr, weight_decay=weight_decay)
+        loss_fn = nn.MSELoss().to(device)
+        scalerS1 = torch.cuda.amp.GradScaler()
+        best_loss = float('inf')
+
+        try:
+            datasetS1 = Singlemodal_Loader(
+                listIDs=train_data_SAR_IDS, root=dataset_path, zip_map=sar_zip_map,
+                transform=None, patch_size=patch_size, n_images=n_images1,
+                n_channels=n_channels1, data_type='SAR'
+            )
+            for zip_path in set(sar_zip_map.values()):
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            print("OK -> ZIP SAR eliminati", flush=True)
+        except Exception as e:
+            print(f"EXC -> Eccezione in Loader S1:", {e}, flush=True)
+
+        # baseline per mse
+        try:
+            sample_ids = train_data_SAR_IDS[:50]
+            mean_accum, n = None, 0
+            for ID in sample_ids:
+                im = np.load(os.path.join(datasetS1.cache_dir, f"{ID}.npy"))
+                if mean_accum is None:
+                    mean_accum = np.zeros_like(im, dtype=np.float64)
+                mean_accum += im
+                n += 1
+            mean_image = (mean_accum / n).astype(np.float32)
+
+            total_se, total_count = 0.0, 0
+            for ID in sample_ids:
+                im = np.load(os.path.join(datasetS1.cache_dir, f"{ID}.npy"))
+                total_se += np.sum((im - mean_image) ** 2)
+                total_count += im.size
+
+            print(f"MSE baseline S1: {total_se/total_count:.6f}", flush=True)
+        except Exception as e:
+            print(f"EXC -> Eccezione calcolo baseline S2: {e}", flush=True)    
+
+
+        try:
+            dataloaderS1 = DataLoader(datasetS1, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
+        except Exception as e:
+            print(f"EXC -> Eccezione in DataLoader S1 {e}", flush=True)
+
+        resultsS1 = {'lr': [], 'train_loss': []}
+        epochs_no_improve = 0
+
+        try:
+            for epoch in range(1, epochs + 1):
+                modelS1.train()
+                total_loss, total_num, train_bar = 0.0, 0, tqdm(dataloaderS1, mininterval=5.0)
+
+                if time_debug:
+                    t_prev = time.time()
+
+                for im in train_bar:
+                    if time_debug:
+                        torch.cuda.synchronize()
+                        t_data = time.time()
+
+                    im = im.to(non_blocking=True, device=device)
+
+                    if time_debug:
+                        torch.cuda.synchronize()
+                        t_transfer = time.time()
+
+                    with torch.cuda.amp.autocast():
+                        output = modelS1(im)
+                        loss = loss_fn(output, im)
+
+                    if time_debug:
+                        torch.cuda.synchronize()
+                        t_forward = time.time()
+
+                    optimizerS1.zero_grad()
+                    scalerS1.scale(loss).backward()
+                    scalerS1.step(optimizerS1)
+                    scalerS1.update()
+
+                    if time_debug:
+                        torch.cuda.synchronize()
+                        t_backward = time.time()
+                        print(f"dati: {t_data-t_prev:.3f}s | trasferimento: {t_transfer-t_data:.3f}s | "
+                            f"forward: {t_forward-t_transfer:.3f}s | backward: {t_backward-t_forward:.3f}s", flush=True)
+                        t_prev = time.time()
+
+                    total_num += dataloaderS1.batch_size
+                    total_loss += loss.item() * dataloaderS1.batch_size
+                    train_bar.set_description(f'S1 Epoch: [{epoch}/{epochs}], Loss: {loss.item():.4f}')
+
+                epoch_loss = total_loss / total_num
+                resultsS1['lr'].append(optimizerS1.param_groups[0]['lr'])
+                resultsS1['train_loss'].append(epoch_loss)
+
+                if epoch_loss < best_loss - min_delta:
+                    state_dict = modelS1.module.state_dict() if n_gpus > 1 else modelS1.state_dict()
+                    torch.save(state_dict, f'modelS1_best_{job_name}_{dataset}_{epochs}.pth')
+                    best_loss = epoch_loss
+                    epochs_no_improve = 0
+                    print(f"best loss epoch {epoch} (new): {best_loss}", flush=True)
+
+                    pd.DataFrame(resultsS1).to_csv(f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
+
+                    # evitare scadenza token auth 
+                    try:
+                        project_work = dh.get_project("floods")
+                        print("OK -> token aggiornato", flush=True)
+
+                    except Exception as e:
+                        print(f"EXC -> aggiornamento token: {e}", flush=True)
+
+                    log_artifact_safe(project_work, f"encoder-s1-weights_{job_name}_{dataset}_{epochs}", f'modelS1_best_{job_name}_{dataset}_{epochs}.pth')
+
+                    try:    
+                        project_work.log_artifact(name=f"metrics-s1_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv')
+                    except Exception as e:
+                        print(f"EXC -> upload intermedio S1: {e}", flush=True)
+
+                else:
+                    epochs_no_improve += 1
+                    print(f"best loss epoch {epoch} (old): {best_loss}", flush=True)
+
+                    if epochs_no_improve >= patience:
+                        print(f"Early Stopping S1: epoch {epoch}, best loss: {best_loss}")
+                        break
+
+        except Exception as e:
+            print(f"EXC -> Eccezione in model train S1: {e}", flush=True)
+
+        best_loss_s1 = best_loss
+        print(f"OK -> Terminato training S1, LOSS (MSE): {best_loss_s1}", flush=True)     
+
+
+        del modelS1
+        torch.cuda.empty_cache() 
+
+        try:
+            cache_sar_dir = "/data/cache_SAR" 
+            if os.path.exists(cache_sar_dir):
+                print(f"Pulizia cartella SAR: {cache_sar_dir}", flush=True)
+                shutil.rmtree(cache_sar_dir)
+                print("OK -> Cartella SAR rimossa", flush=True)
+            else:
+                print("Nessuna cache SAR trovata da rimuovere.", flush=True)
+        except Exception as e:
+            print(f"EXC -> Eccezione durante la pulizia della cache SAR: {e}", flush=True)
+
+    # TRAINING OTTICO
+    if train_opt:
+    
+        print("\n Training S2")
+        modelS2 = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, n_head=n_head, d_k=d_k).to(device)
+        if n_gpus > 1:
+            modelS2 = nn.DataParallel(modelS2)
+        optimizerS2 = torch.optim.Adam(modelS2.parameters(), lr=lr, weight_decay=weight_decay)
+        loss_fn = nn.MSELoss().to(device)
+        scalerS2 = torch.cuda.amp.GradScaler()
+        best_loss = float('inf')
+
+        try:
+            datasetS2 = Singlemodal_Loader(
+                listIDs=train_data_OPT_IDS, root=dataset_path, zip_map=opt_zip_map,
+                transform=None, patch_size=patch_size, n_images=n_images2,
+                n_channels=n_channels2, data_type='OPT'
+            )
+            for zip_path in set(opt_zip_map.values()):
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            print("OK -> ZIP OPT eliminati", flush=True)
+        except Exception as e:
+            print(f"EXC -> Eccezione in Loader S2:", {e}, flush=True)
+
+        try:
+            sample_ids = train_data_OPT_IDS[:200]
+            mean_accum, n = None, 0
+            for ID in sample_ids:
+                im = np.load(os.path.join(datasetS2.cache_dir, f"{ID}.npy"))
+                if mean_accum is None:
+                    mean_accum = np.zeros_like(im, dtype=np.float64)
+                mean_accum += im
+                n += 1
+            mean_image = (mean_accum / n).astype(np.float32)
+
+            total_se, total_count = 0.0, 0
+            for ID in sample_ids:
+                im = np.load(os.path.join(datasetS2.cache_dir, f"{ID}.npy"))
+                total_se += np.sum((im - mean_image) ** 2)
+                total_count += im.size
+
+            print(f"MSE baseline S2: {total_se/total_count:.6f}", flush=True)
+        except Exception as e:
+            print(f"EXC -> Eccezione calcolo baseline S2: {e}", flush=True)
+
+        try:
+            dataloaderS2 = DataLoader(datasetS2, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
+        except Exception as e:
+            print(f"EXC -> Eccezione in DataLoader S2 {e}", flush=True)
+
+        resultsS2 = {'lr': [], 'train_loss': []}
+        epochs_no_improve = 0
+
+        try:
+            for epoch in range(1, epochs + 1):
+                modelS2.train()
+                total_loss, total_num, train_bar = 0.0, 0, tqdm(dataloaderS2)
+
+                if time_debug:
+                    t_prev = time.time()
+
+                for im in train_bar:
+                    if time_debug:
+                        torch.cuda.synchronize()
+                        t_data = time.time()
+
+                    im = im.to(non_blocking=True, device=device)
+
+                    if time_debug:
+                        torch.cuda.synchronize()
+                        t_transfer = time.time()
+
+                    with torch.cuda.amp.autocast():
+                        output = modelS2(im)
+                        loss = loss_fn(output, im)
+
+                    if time_debug:
+                        torch.cuda.synchronize()
+                        t_forward = time.time()
+
+                    optimizerS2.zero_grad()
+                    scalerS2.scale(loss).backward()
+                    scalerS2.step(optimizerS2)
+                    scalerS2.update()
+
+                    if time_debug:
+                        torch.cuda.synchronize()
+                        t_backward = time.time()
+                        print(f"dati: {t_data-t_prev:.3f}s | trasferimento: {t_transfer-t_data:.3f}s | "
+                            f"forward: {t_forward-t_transfer:.3f}s | backward: {t_backward-t_forward:.3f}s", flush=True)
+                        t_prev = time.time()
+
+                    total_num += dataloaderS2.batch_size
+                    total_loss += loss.item() * dataloaderS2.batch_size
+                    train_bar.set_description(f'S2 Epoch: [{epoch}/{epochs}], Loss: {loss.item():.4f}')
+
+                epoch_loss = total_loss / total_num
+                resultsS2['lr'].append(optimizerS2.param_groups[0]['lr'])
+                resultsS2['train_loss'].append(epoch_loss)
+
+                if epoch_loss < best_loss - min_delta:
+                    state_dict = modelS2.module.state_dict() if n_gpus > 1 else modelS2.state_dict()
+                    torch.save(state_dict, f'modelS2_best_{job_name}_{dataset}_{epochs}.pth')
+                    best_loss = epoch_loss
+                    epochs_no_improve = 0
+                    print(f"best loss epoch {epoch} (new): {best_loss}", flush=True)
+
+                    pd.DataFrame(resultsS2).to_csv(f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
+
+                    try:
+                        project_work = dh.get_project("floods")
+                    except Exception as e:
+                        print(f"EXC -> aggiornamento token: {e}", flush=True)
+    
+                    log_artifact_safe(project_work, f"encoder-s2-weights_{job_name}_{dataset}_{epochs}", f'modelS2_best_{job_name}_{dataset}_{epochs}.pth')
+
+                    try:
+                        project_work.log_artifact(name=f"metrics-s2_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv')
+                    except Exception as e:
+                        print(f"EXC -> upload intermedio S2: {e}", flush=True)
+
+                else:
+                    epochs_no_improve += 1
+                    print(f"best loss epoch {epoch} (old): {best_loss}", flush=True)
+
+                    if epochs_no_improve >= patience:
+                        print(f"Early Stopping S2: epoch {epoch}, best loss: {best_loss}")
+                        break
+
+        except Exception as e:
+            print(f"EXC -> Eccezione in model train S2: {e}", flush=True)
+
+        best_loss_s2 = best_loss
+        del modelS2
+        torch.cuda.empty_cache()
+
+        print(f"OK -> Terminato training S2, LOSS (MSE): {best_loss_s2}", flush=True)
+
+        print("OK -> Terminato training S2\n")
+
+        print("RISULTATI")
+        if train_sar: print(f"LOSS (MSE) SAR: {best_loss_s1}") 
+        if train_opt: print(f"LOSS (MSE) OPT: {best_loss_s2}") 
+    
+    return "TERMINATO -> training SAR e OPT finito"
+
+
 # notebook -> moco
 # valori uguali al codice originale tranne coda moco_k
 
@@ -452,8 +827,8 @@ def train_moco(
     workers: int = 0,
     job_name: str = "nome_job",
     dataset: str = "Test",
-    weights_encoder_sar: str = "",
-    weights_encoder_opt: str = "",
+    weights_encoder_sar: str = "train_s1_v3_Standard_200",
+    weights_encoder_opt: str = "train_s2_v3_Standard_200",
     patience: int = 20,
     min_delta: float = 1e-4,
     time_debug: bool = False

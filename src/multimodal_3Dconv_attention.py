@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from convlstm import ConvLSTM
+from ltae import LTAE2d
 # from mambapy.mamba import MambaConfig, Mamba
 
 class ConvBlock(nn.Module):
@@ -496,49 +497,48 @@ class MaskedAutoEncoder(nn.Module):
 # no lstm o mamba
 # output non piu vettore 1d ma mappa feature 8 o 16 canali
 
-class Singlemodal_Encoder_v2(nn.Module):
-    def __init__(self, input_dim=2, output_channels=256, n_images=10):
-            super(Singlemodal_Encoder, self).__init__()
-            self.input_dim = input_dim
-            self.output_channels = output_channels
-            self.n_images = n_images
-    
-            # 6+1 layers: si usa ConvBlock e CBAM definiti prima
-    
-            # stage 0. prima scansione (1x7x7), tempo congelato = considera un t alla volta
-            # input dim = canali satellite
-            # output channel = 16
-            # dimensioni H e W invariate
-            self.conv1 = nn.Sequential(nn.Conv3d(input_dim, 16, kernel_size=(1,7,7), padding='same', stride=(1, 1, 1)),
-                nn.BatchNorm3d(16),
-                nn.ReLU()
-            )
-    
-            # stage 1 - 2 - 3 - 4 - 5 - 6. ConvBlock + CBAM
-            # CBAM n_images = istanti temporali serie
-            # output channel = 256
-            # dimensioni H = 4, W = 4
-            self.stage1 = nn.Sequential(ConvBlock(16, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-                                      CBAM(n_images, reduction_ratio=1)
-            )
-            self.stage2 = nn.Sequential(ConvBlock(64, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-                                      CBAM(n_images, reduction_ratio=1)
-            )
-            self.stage3 = nn.Sequential(ConvBlock(64, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 1, 1)),
-                                      CBAM(n_images, reduction_ratio=1)
-            )
-            self.stage4 = nn.Sequential(ConvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 1, 1)),
-                                      CBAM(n_images, reduction_ratio=1)
-            )
-            self.stage5 = nn.Sequential(ConvBlock(128, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 1, 1)),
-                                      CBAM(n_images, reduction_ratio=1)
-            )
-            self.stage6 = nn.Sequential(ConvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 1, 1)),
-                                      CBAM(n_images, reduction_ratio=1)
-            )
+class Singlemodal_Encoder_2d(nn.Module):
+    def __init__(self, input_dim=2, output_dim=16, n_images=4, n_head=8, d_k=8):
+        super(Singlemodal_Encoder_2d, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.n_images = n_images
 
-            # prende in input concatenazione, crea mappa 64x64xoutput_channels (8 o 16)
-            self.channel_proj = nn.Conv2d(256 * n_images, output_channels, kernel_size=1)
+        # Uguale a Singlemodal_Encoder
+        # stage 0: scansione (1x7x7) considera un t alla volta
+        self.conv1 = nn.Sequential(
+            nn.Conv3d(input_dim, 16, kernel_size=(1, 7, 7), padding='same', stride=(1, 1, 1)),
+            nn.BatchNorm3d(16),
+            nn.ReLU()
+        )
+
+        # stage 1-2: ridimensione spaziale H e W (256 -> 128 -> 64)
+        self.stage1 = nn.Sequential(ConvBlock(16, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)),
+                                     CBAM(n_images, reduction_ratio=1))
+        self.stage2 = nn.Sequential(ConvBlock(64, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)),
+                                     CBAM(n_images, reduction_ratio=1))
+
+        # stage 3-6: dim spaziale rimane 64x64, i canali aumentano a 256
+        self.stage3 = nn.Sequential(ConvBlock(64, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)),
+                                     CBAM(n_images, reduction_ratio=1))
+        self.stage4 = nn.Sequential(ConvBlock(128, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)),
+                                     CBAM(n_images, reduction_ratio=1))
+        self.stage5 = nn.Sequential(ConvBlock(128, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)),
+                                     CBAM(n_images, reduction_ratio=1))
+        self.stage6 = nn.Sequential(ConvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)),
+                                     CBAM(n_images, reduction_ratio=1))
+
+        # Ltae : attention e fusione 4 istanti, output canali = output_dim
+        self.temporal_attn = LTAE2d(
+            in_channels=256,
+            n_head=n_head,
+            d_k=d_k,
+            mlp=[256, output_dim],
+            d_model=256,
+            T=1000,
+            return_att=False,
+            positional_encoding=True,
+        )
 
     def forward(self, x):
         x = self.conv1(x.float())
@@ -548,61 +548,66 @@ class Singlemodal_Encoder_v2(nn.Module):
         x = self.stage4(x)
         x = self.stage5(x)
         x = self.stage6(x)
+        x = x.permute(0, 2, 1, 3, 4)  # (batch, channels, time, H, W) -> (batch, time, channels, H, W)
 
-        x = x.reshape(x.size(0), -1, x.size(3), x.size(4))      # concatenazione canali+tempo: (batch, 256*n_images, 64, 64)
-        x = self.channel_proj(x)                                # (batch, output_channels, 64, 64)
+        batch_positions = torch.arange(self.n_images, device=x.device).float().unsqueeze(0).expand(x.size(0), -1)   # necessario per passare gli istanti corretti di ogni serie nello stesso batch
+        x = self.temporal_attn(x, batch_positions=batch_positions)  # (batch, output_dim, 64, 64)
         return x
 
 
 
-class Singlemodal_CAE_v2(nn.Module):
-    def __init__(self, input_dim=2, output_channels=16, n_images=4):
-        super(Singlemodal_CAE_v2, self).__init__()
+class Singlemodal_CAE_2d(nn.Module):
+    def __init__(self, input_dim=2, output_dim=16, n_images=4, n_head=8, d_k=8):
+        super(Singlemodal_CAE_2d, self).__init__()
         self.input_dim = input_dim
-        self.output_channels = output_channels
+        self.output_dim = output_dim
         self.n_images = n_images
-        self.encoder = Singlemodal_Encoder_v2(input_dim=input_dim, output_channels=output_channels, n_images=n_images)
+        self.encoder = Singlemodal_Encoder_2d(input_dim=input_dim, output_dim=output_dim,
+                                            n_images=n_images, n_head=n_head, d_k=d_k)
 
-        # inverso concatenazione
-        self.channel_invProj = nn.Conv2d(output_channels, 256 * n_images, kernel_size=1)
+        # ConvLSTM per ricreare dimensione temporale iniziale:
+        # stesso input ripetuto 4 volte (output encoder), hidden state prende genera istante 1, poi aggiorna il suo stato -> istante 2 è diverso anche se input è lo stesso
+        # lstm dovrebbe imparare evoluzione temporale e stagionale
+        self.conv_lstm = ConvLSTM(input_dim=output_dim, hidden_dim=256, kernel_size=(3, 3),
+                                   num_layers=1, batch_first=True, bias=True, return_all_layers=False)
 
-        # stride 1 
-        self.stage1 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 1, 1)),
-                                  CBAM(n_images, reduction_ratio=1))
+        # stage 1-4: solo canali, dim spaziale (64x64) 
+        self.stage1 = nn.Sequential(DeconvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)),
+                                     CBAM(n_images, reduction_ratio=1))
         
-        self.stage2 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 128], strides=(1, 1, 1)),
-                                  CBAM(n_images, reduction_ratio=1))
+        self.stage2 = nn.Sequential(DeconvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)),
+                                     CBAM(n_images, reduction_ratio=1))
         
-        self.stage3 = nn.Sequential(DeconvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 1, 1)),
-                                  CBAM(n_images, reduction_ratio=1))
+        self.stage3 = nn.Sequential(DeconvBlock(256, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)),
+                                     CBAM(n_images, reduction_ratio=1))
         
-        self.stage4 = nn.Sequential(DeconvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 64], strides=(1, 1, 1)),
-                                  CBAM(n_images, reduction_ratio=1))
+        self.stage4 = nn.Sequential(DeconvBlock(128, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)),
+                                     CBAM(n_images, reduction_ratio=1))
         
-        # stride 2
-        self.stage5 = nn.Sequential(DeconvBlock(64, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-                                  CBAM(n_images, reduction_ratio=1))
-        
-        self.stage6 = nn.Sequential(DeconvBlock(64, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
-                                  CBAM(n_images, reduction_ratio=1))
-        
-        self.conv1 = nn.Conv3d(64, input_dim, kernel_size=(1,7,7), padding='same', stride=(1, 1, 1))
+        # stage 5-6: dim spaziale 64 -> 128 -> 256 
+        self.stage5 = nn.Sequential(DeconvBlock(128, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)),
+                                     CBAM(n_images, reduction_ratio=1))
+        self.stage6 = nn.Sequential(DeconvBlock(64, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)),
+                                     CBAM(n_images, reduction_ratio=1))
+        self.conv1 = nn.Conv3d(64, input_dim, kernel_size=(1, 7, 7), padding='same', stride=(1, 1, 1))
 
     def forward(self, x):
         x = x.float()
-        x = self.encoder(x)                                                     # (batch, output_channels, 64, 64)
+        x = self.encoder(x)                                         # (batch, output_dim, 64, 64) 
 
-        x = self.channel_invProj(x)                                             # (batch, 256*n_images, 64, 64)
-        x = x.reshape(x.size(0), 256, self.n_images, x.size(2), x.size(3))      # "srotola" il tempo: (B, 256, T, 64, 64)
+        x = x.unsqueeze(1).expand(-1, self.n_images, -1, -1, -1)    # stesso input 4 volte -> (batch, 4, output_dim, 64, 64)
+        x, _ = self.conv_lstm(x)
+        x = x[0]                                                    # (batch, 4, 256, 64, 64)
 
+        x = x.permute(0, 2, 1, 3, 4)                                # (batch, 256, 4, 64, 64)
         x = self.stage1(x)
         x = self.stage2(x)
         x = self.stage3(x)
         x = self.stage4(x)
         x = self.stage5(x)
-        x = self.stage6(x)
-        x = self.conv1(x)
-        return x
+        x = self.stage6(x)                                          # (batch, input dim, 4, 256, 256)
+        x = self.conv1(x)       
+        return x                                                    
 
 
 # DOMANDE
