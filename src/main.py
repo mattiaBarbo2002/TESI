@@ -1301,6 +1301,10 @@ def test_encoders(
     weights_s2: str = "weights_s2",
     n_samples: int = 10
 ):
+    print("torch file:", torch.__file__, flush=True)
+    print("torch version:", torch.__version__, flush=True)
+    print("torch cuda version:", torch.version.cuda, flush=True)
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
 
