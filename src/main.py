@@ -33,15 +33,105 @@ from moco.loader import PairsLoader
 
 from moco.builder import MoCo2encoders
 
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # niente display nei job DigitalHub, salva solo su file
+import matplotlib.pyplot as plt
+
+
+def save_reconstruction_pngs(model, x, save_dir="reconstruction_debug", prefix="series", channels=None, device=None):
+    """
+    Salva un PNG per ogni istante temporale della serie, con l'input (così
+    come arriva al modello: dopo normalizzazione e ritaglio) e l'output
+    (ricostruzione dell'autoencoder) affiancati.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+ 
+    if device is None:
+        device = next(model.parameters()).device
+ 
+    x = torch.as_tensor(x).float()
+    if x.dim() == 4:  # (C, T, H, W) -> aggiungo la dimensione batch
+        x = x.unsqueeze(0)
+    x = x.to(device)
+ 
+    model.eval()
+    with torch.no_grad():
+        out = model(x)
+ 
+    x_np = x[0].cpu().numpy()      # (C, T, H, W)
+    out_np = out[0].cpu().numpy()  # (C, T, H, W)
+    C, T, H, W = x_np.shape
+ 
+    print(f"INPUT  ({prefix}) - min: {x_np.min():.4f}, max: {x_np.max():.4f}, "
+          f"mean: {x_np.mean():.4f}, std: {x_np.std():.4f}", flush=True)
+    print(f"OUTPUT ({prefix}) - min: {out_np.min():.4f}, max: {out_np.max():.4f}, "
+          f"mean: {out_np.mean():.4f}, std: {out_np.std():.4f}", flush=True)
+ 
+    if channels is None:
+        channels = list(range(min(3, C)))
+    rgb_mode = len(channels) == 3
+ 
+    for t in range(T):
+        in_frame = np.clip(x_np[:, t, :, :][channels], 0.0, 1.0)
+        out_frame = np.clip(out_np[:, t, :, :][channels], 0.0, 1.0)
+        out_path = os.path.join(save_dir, f"{prefix}_t{t + 1}.png")
+ 
+        if rgb_mode:
+            in_img = np.transpose(in_frame, (1, 2, 0))
+            out_img = np.transpose(out_frame, (1, 2, 0))
+ 
+            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+            axes[0].imshow(in_img)
+            axes[0].set_title(f"Input t{t + 1}")
+            axes[1].imshow(out_img)
+            axes[1].set_title(f"Output t{t + 1}")
+            for ax in axes:
+                ax.axis("off")
+            fig.suptitle(f"{prefix} - istante {t + 1}/{T} (canali {channels})")
+ 
+        else:
+            n_ch = len(channels)
+            fig, axes = plt.subplots(2, n_ch, figsize=(3 * n_ch, 6), squeeze=False)
+            for i, ch in enumerate(channels):
+                axes[0][i].imshow(in_frame[i], cmap="gray", vmin=0, vmax=1)
+                axes[0][i].set_title(f"Input ch{ch}")
+                axes[0][i].axis("off")
+                axes[1][i].imshow(out_frame[i], cmap="gray", vmin=0, vmax=1)
+                axes[1][i].set_title(f"Output ch{ch}")
+                axes[1][i].axis("off")
+            fig.suptitle(f"{prefix} - istante {t + 1}/{T}")
+ 
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+ 
+    print(f"OK -> {T} PNG salvati in {save_dir}/ (prefisso '{prefix}')", flush=True)
+
+
+
+# ------------------------------------------------------------------
+# Esempi d'uso
+# ------------------------------------------------------------------
+# SAR (2 canali -> mostrati singolarmente in scala di grigi)
+# sample = datasetS1[0]  # o datasetS1._cache[qualche_ID] a seconda della versione del loader
+# save_reconstruction_pngs(modelS1, sample, save_dir="/data/debug_recon", prefix="SAR")
+
+# Ottico (10 canali -> di default primi 3 come RGB, passa channels= se vuoi
+# bande specifiche)
+# sample = datasetS2[0]
+# save_reconstruction_pngs(modelS2, sample, save_dir="/data/debug_recon", prefix="OPT")
+
 # from anomaly import PairLoader
 
 # main.py contiene tutti gli handler, il file DEVE chiamarsi main.py 
 
-def log_artifact_safe(project, name, source, retries=3, delay=5):
+def log_artifact_safe(project, name, source, kind="artifact", retries=3, delay=5):
    
     for attempt in range(1, retries + 1):
         try:
-            art = project.log_artifact(name=name, source=source)
+            art = project.log_artifact(name=name, source=source, kind=kind)
             art.refresh()
 
             if art.status.state == "READY":
@@ -77,6 +167,7 @@ def train_autoencoders_1D(
     train_opt: bool = True,
     patience: int = 20,
     min_delta: float = 1e-4,
+    resume: bool = True,
     time_debug: bool = False
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -139,6 +230,24 @@ def train_autoencoders_1D(
         scalerS1 = torch.cuda.amp.GradScaler()
         best_loss = float('inf')
 
+        if resume:
+            try:
+                w_path = project_work.get_artifact(f"encoder-s1-weights_{job_name}_{dataset}_{epochs}").download("/data")
+                state_dict = torch.load(w_path, map_location=device)
+                (modelS1.module if n_gpus > 1 else modelS1).load_state_dict(state_dict)
+                print("OK -> pesi S1 vecchi caricati", flush=True)
+            except Exception as e:
+                print(f"EXC -> nessun peso S1 vecchio, inizializzazione casuale: {e}", flush=True)
+
+            try:
+                m_path = project_work.get_artifact(f"metrics-s1_{job_name}_{dataset}_{epochs}").download("/data")
+                prev_df = pd.read_csv(m_path)
+                best_loss = prev_df['train_loss'].min()
+                resultsS1 = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
+                print(f"OK -> metriche S1 caricate, best_loss={best_loss}", flush=True)
+            except Exception as e:
+                print(f"EXC -> nessuna metrica S1 vecchia trovata: {e}", flush=True)
+
         try:
             datasetS1 = Singlemodal_Loader(
                 listIDs=train_data_SAR_IDS, root=dataset_path, zip_map=sar_zip_map,
@@ -180,7 +289,6 @@ def train_autoencoders_1D(
         except Exception as e:
             print(f"EXC -> Eccezione in DataLoader S1 {e}", flush=True)
 
-        resultsS1 = {'lr': [], 'train_loss': []}
         epochs_no_improve = 0
 
         try:
@@ -241,16 +349,22 @@ def train_autoencoders_1D(
 
                     # evitare scadenza token auth 
                     try:
+                        dh.refresh_token()
+                        print("OK -> refresh token", flush=True)
+                    except Exception as e:
+                        print(f"EXC -> refresh token: {e}", flush=True)
+
+                    try:
                         project_work = dh.get_project("floods")
-                        print("OK -> token aggiornato", flush=True)
+                        print("OK -> get project", flush=True)
 
                     except Exception as e:
-                        print(f"EXC -> aggiornamento token: {e}", flush=True)
+                        print(f"EXC -> get project: {e}", flush=True)
 
                     log_artifact_safe(project_work, f"encoder-s1-weights_{job_name}_{dataset}_{epochs}", f'modelS1_best_{job_name}_{dataset}_{epochs}.pth')
 
                     try:    
-                        project_work.log_artifact(name=f"metrics-s1_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv')
+                        project_work.log_artifact(name=f"metrics-s1_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
                     except Exception as e:
                         print(f"EXC -> upload intermedio S1: {e}", flush=True)
 
@@ -295,6 +409,24 @@ def train_autoencoders_1D(
         scalerS2 = torch.cuda.amp.GradScaler()
         best_loss = float('inf')
 
+        if resume:
+            try:
+                w_path = project_work.get_artifact(f"encoder-s2-weights_{job_name}_{dataset}_{epochs}").download("/data")
+                state_dict = torch.load(w_path, map_location=device)
+                (modelS2.module if n_gpus > 1 else modelS2).load_state_dict(state_dict)
+                print("OK -> pesi S2 vecchi caricati", flush=True)
+            except Exception as e:
+                print(f"EXC -> nessun peso S2 vecchio, inizializzazione casuale: {e}", flush=True)
+
+            try:
+                m_path = project_work.get_artifact(f"metrics-s2_{job_name}_{dataset}_{epochs}").download("/data")
+                prev_df = pd.read_csv(m_path)
+                best_loss = prev_df['train_loss'].min()
+                resultsS2 = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
+                print(f"OK -> metriche S2 caricate, best_loss={best_loss}", flush=True)
+            except Exception as e:
+                print(f"EXC -> nessuna metrica S2 vecchia trovata: {e}", flush=True)
+
         try:
             datasetS2 = Singlemodal_Loader(
                 listIDs=train_data_OPT_IDS, root=dataset_path, zip_map=opt_zip_map,
@@ -334,7 +466,6 @@ def train_autoencoders_1D(
         except Exception as e:
             print(f"EXC -> Eccezione in DataLoader S2 {e}", flush=True)
 
-        resultsS2 = {'lr': [], 'train_loss': []}
         epochs_no_improve = 0
 
         try:
@@ -394,14 +525,21 @@ def train_autoencoders_1D(
                     pd.DataFrame(resultsS2).to_csv(f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
 
                     try:
-                        project_work = dh.get_project("floods")
+                        dh.refresh_token()
+                        print("OK -> refresh token", flush=True)
                     except Exception as e:
-                        print(f"EXC -> aggiornamento token: {e}", flush=True)
+                        print(f"EXC -> refresh token: {e}", flush=True)
+
+                    try:
+                        project_work = dh.get_project("floods")
+                        print("OK -> get project", flush=True)
+                    except Exception as e:
+                        print(f"EXC -> get project: {e}", flush=True)
     
                     log_artifact_safe(project_work, f"encoder-s2-weights_{job_name}_{dataset}_{epochs}", f'modelS2_best_{job_name}_{dataset}_{epochs}.pth')
 
                     try:
-                        project_work.log_artifact(name=f"metrics-s2_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv')
+                        project_work.log_artifact(name=f"metrics-s2_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
                     except Exception as e:
                         print(f"EXC -> upload intermedio S2: {e}", flush=True)
 
@@ -624,7 +762,7 @@ def train_autoencoders_2D(
                     log_artifact_safe(project_work, f"encoder-s1-weights_{job_name}_{dataset}_{epochs}", f'modelS1_best_{job_name}_{dataset}_{epochs}.pth')
 
                     try:    
-                        project_work.log_artifact(name=f"metrics-s1_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv')
+                        project_work.log_artifact(name=f"metrics-s1_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
                     except Exception as e:
                         print(f"EXC -> upload intermedio S1: {e}", flush=True)
 
@@ -775,7 +913,7 @@ def train_autoencoders_2D(
                     log_artifact_safe(project_work, f"encoder-s2-weights_{job_name}_{dataset}_{epochs}", f'modelS2_best_{job_name}_{dataset}_{epochs}.pth')
 
                     try:
-                        project_work.log_artifact(name=f"metrics-s2_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv')
+                        project_work.log_artifact(name=f"metrics-s2_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
                     except Exception as e:
                         print(f"EXC -> upload intermedio S2: {e}", flush=True)
 
@@ -886,14 +1024,14 @@ def train_moco(
     with open(f'train_ids_{job_name}_{dataset}_{epochs}.json', 'w') as f:
         json.dump(train_ids, f)
     try:
-        project_work.log_artifact(name=f"moco-train-ids_{job_name}_{dataset}_{epochs}", source=f'train_ids_{job_name}_{dataset}_{epochs}.json')
+        project_work.log_artifact(name=f"moco-train-ids_{job_name}_{dataset}_{epochs}", source=f'train_ids_{job_name}_{dataset}_{epochs}.json', kind='artifact')
     except Exception as e:
         print(f"EXC -> upload train ids fallito: {e}", flush=True)
 
     with open(f'test_ids_{job_name}_{dataset}_{epochs}.json', 'w') as f:
         json.dump(held_out_ids, f)
     try:
-        project_work.log_artifact(name=f"moco-test-ids_{job_name}_{dataset}_{epochs}", source=f'test_ids_{job_name}_{dataset}_{epochs}.json')
+        project_work.log_artifact(name=f"moco-test-ids_{job_name}_{dataset}_{epochs}", source=f'test_ids_{job_name}_{dataset}_{epochs}.json', kind='artifact')
     except Exception as e:
         print(f"EXC -> upload held-out ids fallito: {e}", flush=True)
 
@@ -902,10 +1040,10 @@ def train_moco(
     path_s1 = project_work.get_artifact(f"encoder-s1-weights_{weights_encoder_sar}").download(f"modelS1_best_{weights_encoder_sar}.pth")
     path_s2 = project_work.get_artifact(f"encoder-s2-weights_{weights_encoder_opt}").download(f"modelS2_best_{weights_encoder_opt}.pth")
 
-    modelS1 = Singlemodal_CAE(input_dim=n_channels1, output_dim=10, n_images=n_images1, mamba=mamba).to(device)
+    modelS1 = Singlemodal_CAE(input_dim=n_channels1, output_dim=512, n_images=n_images1, mamba=mamba).to(device)
     modelS1.load_state_dict(torch.load(path_s1, map_location=device))
 
-    modelS2 = Singlemodal_CAE(input_dim=n_channels2, output_dim=10, n_images=n_images2, mamba=mamba).to(device)
+    modelS2 = Singlemodal_CAE(input_dim=n_channels2, output_dim=512, n_images=n_images2, mamba=mamba).to(device)
     modelS2.load_state_dict(torch.load(path_s2, map_location=device))
     print("OK -> Pesi Encoders caricati", flush=True)
 
@@ -1023,12 +1161,12 @@ def train_moco(
                 pd.DataFrame(results).to_csv(f'log_moco_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
 
                 try:
-                    project_work.log_artifact(name=f"moco-weights_{job_name}_{dataset}_{epochs}", source=f'moco_best_{job_name}_{dataset}_{epochs}.pth')
+                    project_work.log_artifact(name=f"moco-weights_{job_name}_{dataset}_{epochs}", source=f'moco_best_{job_name}_{dataset}_{epochs}.pth', kind='artifact')
                 except Exception as e:
                     print(f"EXC -> upload pesi MoCo: {e}", flush=True)
 
                 try:
-                    project_work.log_artifact(name=f"moco-metrics_{job_name}_{dataset}_{epochs}", source=f'log_moco_{job_name}_{dataset}_{epochs}.csv')
+                    project_work.log_artifact(name=f"moco-metrics_{job_name}_{dataset}_{epochs}", source=f'log_moco_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
                 except Exception as e:
                     print(f"EXC -> upload metriche MoCo: {e}", flush=True)
             else:
@@ -1258,11 +1396,11 @@ def train_mae(
 
                 pd.DataFrame(results_mae).to_csv(f'log_train_mae_{job_name}_{direction}_{dataset}_{epochs}.csv', index_label='epoch')
                 try:
-                    project_work.log_artifact(name=f"encoder-mae-weights_{job_name}_{direction}_{dataset}_{epochs}", source=f'model_mae_best_{job_name}_{direction}_{dataset}_{epochs}.pth')
+                    project_work.log_artifact(name=f"encoder-mae-weights_{job_name}_{direction}_{dataset}_{epochs}", source=f'model_mae_best_{job_name}_{direction}_{dataset}_{epochs}.pth', kind='artifact')
                 except Exception as e:    
                     print(f"EXC -> upload pesi mae: {e}", flush=True)
                 try:    
-                    project_work.log_artifact(name=f"metrics-mae_{job_name}_{direction}_{dataset}_{epochs}", source=f'log_train_mae_{job_name}_{direction}_{dataset}_{epochs}.csv')
+                    project_work.log_artifact(name=f"metrics-mae_{job_name}_{direction}_{dataset}_{epochs}", source=f'log_train_mae_{job_name}_{direction}_{dataset}_{epochs}.csv', kind='artifact')
                 except Exception as e:
                     print(f"EXC -> upload intermedio mae: {e}", flush=True)
             else:
@@ -1286,7 +1424,7 @@ def train_mae(
 # TEST
 
 @handler()
-def test_encoders(
+def test_encoders_visual(
     patch_size: int = 256,
     n_images1: int = 4,
     n_channels1: int = 2,
@@ -1299,33 +1437,28 @@ def test_encoders(
     test_opt: bool = True,
     weights_s1: str = "weights_s1",
     weights_s2: str = "weights_s2",
-    n_samples: int = 10
+    n_samples: int = 10,
+    recon_channels: list | None = None,
+    save_dir: str = "/data/debug_recon",
 ):
-    print("torch file:", torch.__file__, flush=True)
     print("torch version:", torch.__version__, flush=True)
-    print("torch cuda version:", torch.version.cuda, flush=True)
-    
+ 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
-
-    n_gpus = torch.cuda.device_count()
-    print(f"GPU: {n_gpus}", flush=True)
-
+ 
     torch.backends.cudnn.benchmark = True
-    
-    # progetti digital hub
+ 
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
-
-    # download dataset
+ 
     print(f"Download: {dataset}", flush=True)
     dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
-    print("OK -> Download terminato")
-
+    print("OK -> Download terminato", flush=True)
+ 
+    os.makedirs(save_dir, exist_ok=True)
+ 
     try:
-
         if test_sar:
-            # recupero id serie SAR + mappa serie -> zip che la contiene
             s1_dir = os.path.join(dataset_path, "SAR")
             sar_zip_map = {}
             for zip_file in sorted(glob(os.path.join(s1_dir, "SAR_*.zip"))):
@@ -1335,12 +1468,10 @@ def test_encoders(
                             ID = os.path.basename(n).split('_SAR_')[0]
                             sar_zip_map[ID] = zip_file
             train_data_SAR_IDS = list(sar_zip_map.keys())
-
             random_sar_ids = random.sample(train_data_SAR_IDS, min(n_samples, len(train_data_SAR_IDS))) if train_data_SAR_IDS else []
-            print(f"{len(train_data_SAR_IDS)} serie SAR trovate")
-
+            print(f"{len(train_data_SAR_IDS)} serie SAR trovate", flush=True)
+ 
         if test_opt:
-            # recupero id serie OPT + mappa serie -> zip che la contiene
             s2_dir = os.path.join(dataset_path, "OPT")
             opt_zip_map = {}
             for zip_file in sorted(glob(os.path.join(s2_dir, "OPT_*.zip"))):
@@ -1350,97 +1481,118 @@ def test_encoders(
                             ID = os.path.basename(n).split('_OPT_')[0]
                             opt_zip_map[ID] = zip_file
             train_data_OPT_IDS = list(opt_zip_map.keys())
-
             random_opt_ids = random.sample(train_data_OPT_IDS, min(n_samples, len(train_data_OPT_IDS))) if train_data_OPT_IDS else []
-            print(f"{len(train_data_OPT_IDS)} serie OPT trovate")
-
+            print(f"{len(train_data_OPT_IDS)} serie OPT trovate", flush=True)
+ 
     except Exception as e:
-        print(f"EXC -> Eccezione recupero liste: {e}", flush=True) 
-
+        print(f"EXC -> Eccezione recupero liste: {e}", flush=True)
+ 
     if test_sar:
-        
         try:
             s1_path = project_work.get_artifact(weights_s1).download("/data/weights_s1.pth")
         except Exception as e:
             print(f"EXC -> {weights_s1} non trovato: {e}", flush=True)
             s1_path = None
-
+ 
         if s1_path:
             modelS1 = Singlemodal_CAE(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, mamba=mamba).to(device)
-            
+ 
             state_dict = torch.load(s1_path, map_location=device)
             if all(k.startswith('module.') for k in state_dict.keys()):
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            
             modelS1.load_state_dict(state_dict)
-            modelS1.eval() # freeze pesi
-
+            modelS1.eval()
+ 
             datasetS1 = Singlemodal_Loader(
                 listIDs=random_sar_ids, root=dataset_path, zip_map=sar_zip_map,
                 transform=None, patch_size=patch_size, n_images=n_images1,
                 n_channels=n_channels1, data_type='SAR'
             )
             loaderS1 = torch.utils.data.DataLoader(datasetS1, batch_size=1, shuffle=False)
-
-            print("SAR:", flush=True)
+ 
+            print("SERIE SAR:", flush=True)
             with torch.no_grad():
                 for i, im in enumerate(loaderS1):
                     im = im.to(device)
-                    
+ 
                     try:
                         latent_vector = modelS1.encoder(im)
-                    except AttributeError:
+                    except AttributeError as e:
                         print(f"EXC -> nome encoder s1: {e}", flush=True)
                         break
-                    
+ 
                     vector = latent_vector.cpu().numpy().flatten()
-                    print(f"ID: {random_sar_ids[i]} | shape: {list(latent_vector.shape)}")
+                    print(f"ID {i}: {random_sar_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
                     print(f"VEC: {np.round(vector, 4)}\n", flush=True)
-
+ 
+                    save_reconstruction_pngs(
+                        modelS1, im, save_dir=save_dir,
+                        prefix=f"SAR_{random_sar_ids[i]}",
+                        channels=recon_channels, device=device,
+                    )
+ 
             del modelS1
             torch.cuda.empty_cache()
-
-    
-    if test_opt:        
-        
+ 
+    if test_opt:
         try:
             s2_path = project_work.get_artifact(weights_s2).download("/data/weights_s2.pth")
         except Exception as e:
             print(f"EXC -> {weights_s2} non trovato: {e}", flush=True)
             s2_path = None
-
+ 
         if s2_path:
             modelS2 = Singlemodal_CAE(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, mamba=mamba).to(device)
-
+ 
             state_dict = torch.load(s2_path, map_location=device)
             if all(k.startswith('module.') for k in state_dict.keys()):
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-                
             modelS2.load_state_dict(state_dict)
-            modelS2.eval() # freeze pesi
-
+            modelS2.eval()
+ 
             datasetS2 = Singlemodal_Loader(
                 listIDs=random_opt_ids, root=dataset_path, zip_map=opt_zip_map,
                 transform=None, patch_size=patch_size, n_images=n_images2,
                 n_channels=n_channels2, data_type='OPT'
             )
             loaderS2 = torch.utils.data.DataLoader(datasetS2, batch_size=1, shuffle=False)
-
+ 
+            print("SERIE OPT:", flush=True)
             with torch.no_grad():
                 for i, im in enumerate(loaderS2):
                     im = im.to(device)
-                    
+ 
                     try:
                         latent_vector = modelS2.encoder(im)
-                    except AttributeError:
-                        print(f"EXC -> nome encoder s1: {e}", flush=True)
+                    except AttributeError as e:
+                        print(f"EXC -> nome encoder s2: {e}", flush=True)
                         break
-                    
+ 
                     vector = latent_vector.cpu().numpy().flatten()
-                    print(f"ID: {random_opt_ids[i]} | shape: {list(latent_vector.shape)}")
+                    print(f"ID {i}: {random_opt_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
                     print(f"VEC: {np.round(vector, 4)}\n", flush=True)
-
+ 
+                    save_reconstruction_pngs(
+                        modelS2, im, save_dir=save_dir,
+                        prefix=f"OPT_{random_opt_ids[i]}",
+                        channels=recon_channels, device=device,
+                    )
+ 
             del modelS2
             torch.cuda.empty_cache()
-
+ 
+    # zippo tutti i PNG e li carico come artifact, altrimenti spariscono col container del job
+    zip_base = save_dir.rstrip("/")
+    zip_path = f"{zip_base}.zip"
+    try:
+        shutil.make_archive(zip_base, 'zip', save_dir)
+        project_work.log_artifact(
+            name=f"test-encoders-reconstructions_{dataset}",
+            kind="artifact",
+            source=zip_path
+        )
+        print(f"OK -> {zip_path} caricato come artifact", flush=True)
+    except Exception as e:
+        print(f"EXC -> upload zip ricostruzioni: {e}", flush=True)
+ 
     return "TERMINATO"

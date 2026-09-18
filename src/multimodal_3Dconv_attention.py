@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from convlstm import ConvLSTM
 from ltae import LTAE2d
 # from mambapy.mamba import MambaConfig, Mamba
@@ -109,6 +110,51 @@ class DeconvBlock(nn.Module):
         x = x + residual
         out = self.relu(x)
         return out
+
+class NewDeconvBlock(nn.Module):
+    def __init__(self, channel_num, kernel_size, filters, strides=(1, 2, 2)):
+        super(NewDeconvBlock, self).__init__()
+
+        self.channel_num = channel_num
+        self.kernel_size = kernel_size
+        self.filters = filters
+        self.strides = strides
+        self.padding = tuple(k // 2 for k in kernel_size)
+
+        # upsampling spaziale pulito: nearest + conv, al posto di
+        # ConvTranspose3d(kernel_size=1, stride=strides) che lascia
+        # le posizioni intermedie a zero (origine del checkerboard)
+        self.up1 = nn.Upsample(scale_factor=self.strides, mode='nearest')
+        self.conv_block1 = nn.Sequential(
+            nn.Conv3d(self.channel_num, self.filters[0], kernel_size=1),
+            nn.BatchNorm3d(self.filters[0]),
+            nn.ReLU()
+        )
+
+        self.conv_block2 = nn.Sequential(
+            nn.Conv3d(self.filters[0], self.filters[1], kernel_size=self.kernel_size, padding=self.padding),
+            nn.BatchNorm3d(self.filters[1]),
+            nn.ReLU()
+        )
+        self.conv_block3 = nn.Sequential(
+            nn.Conv3d(self.filters[1], self.filters[2], kernel_size=1),
+            nn.BatchNorm3d(self.filters[2])
+        )
+
+        self.up_shortcut = nn.Upsample(scale_factor=self.strides, mode='nearest')
+        self.shortcut = nn.Sequential(
+            nn.Conv3d(self.channel_num, self.filters[2], kernel_size=1),
+            nn.BatchNorm3d(self.filters[2])
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        residual = self.shortcut(self.up_shortcut(x))
+        x = self.conv_block1(self.up1(x))
+        x = self.conv_block2(x)
+        x = self.conv_block3(x)
+        x = x + residual
+        return self.relu(x)    
 
 class CBAM(nn.Module):
     def __init__(self, in_channel, reduction_ratio, dilation=1):
@@ -366,22 +412,22 @@ class Singlemodal_CAE(nn.Module):
             self.fc = nn.Linear(output_dim,1024*n_images)
             self.conv_lstm = ConvLSTM(input_dim=64, hidden_dim=256, kernel_size=(3, 3), num_layers=1, batch_first=True, bias=True, return_all_layers=False)
 
-        self.stage1 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
+        self.stage1 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
 								  CBAM(n_images, reduction_ratio=1)
 		)
-        self.stage2 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
+        self.stage2 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1,3,3), filters=[64, 64, 256], strides=(1, 2, 2)),
 								  CBAM(n_images, reduction_ratio=1)
 		)
-        self.stage3 = nn.Sequential(DeconvBlock(256, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
+        self.stage3 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
 								  CBAM(n_images, reduction_ratio=1)
 		)
-        self.stage4 = nn.Sequential(DeconvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
+        self.stage4 = nn.Sequential(NewDeconvBlock(128, kernel_size=(1,3,3), filters=[32, 32, 128], strides=(1, 2, 2)),
 								  CBAM(n_images, reduction_ratio=1)
 		)
-        self.stage5 = nn.Sequential(DeconvBlock(128, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
+        self.stage5 = nn.Sequential(NewDeconvBlock(128, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
 								  CBAM(n_images, reduction_ratio=1)
 		)    
-        self.stage6 = nn.Sequential(DeconvBlock(64, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
+        self.stage6 = nn.Sequential(NewDeconvBlock(64, kernel_size=(1,3,3), filters=[16, 16, 64], strides=(1, 2, 2)),
 								  CBAM(n_images, reduction_ratio=1)
 		)                         
         self.conv1 = nn.Conv3d(64, input_dim, kernel_size=(1,7,7), padding='same', stride=(1, 1, 1))
