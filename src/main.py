@@ -36,32 +36,28 @@ from moco.builder import MoCo2encoders
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # niente display nei job DigitalHub, salva solo su file
+matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
 
 
-def save_reconstruction_pngs(model, x, save_dir="reconstruction_debug", prefix="series", channels=None, device=None):
-    """
-    Salva un PNG per ogni istante temporale della serie, con l'input (così
-    come arriva al modello: dopo normalizzazione e ritaglio) e l'output
-    (ricostruzione dell'autoencoder) affiancati.
-    """
+def save_reconstruction_pngs(model, x, save_dir="reconstruction_img", prefix="series", channels=None, device=None):
+
     os.makedirs(save_dir, exist_ok=True)
  
     if device is None:
         device = next(model.parameters()).device
  
     x = torch.as_tensor(x).float()
-    if x.dim() == 4:  # (C, T, H, W) -> aggiungo la dimensione batch
+    if x.dim() == 4:                # (C, T, H, W)
         x = x.unsqueeze(0)
     x = x.to(device)
  
-    model.eval()
+    model.train()
     with torch.no_grad():
         out = model(x)
  
-    x_np = x[0].cpu().numpy()      # (C, T, H, W)
-    out_np = out[0].cpu().numpy()  # (C, T, H, W)
+    x_np = x[0].cpu().numpy()       # (C, T, H, W)
+    out_np = out[0].cpu().numpy()   # (C, T, H, W)
     C, T, H, W = x_np.shape
  
     print(f"INPUT  ({prefix}) - min: {x_np.min():.4f}, max: {x_np.max():.4f}, "
@@ -110,22 +106,47 @@ def save_reconstruction_pngs(model, x, save_dir="reconstruction_debug", prefix="
     print(f"OK -> {T} PNG salvati in {save_dir}/ (prefisso '{prefix}')", flush=True)
 
 
+def recalibrate_batchnorm(model, dataloader, num_batches=None, device=None):
+    """
+    Ricalibra running_mean/running_var di tutti i BatchNorm del modello
+    facendo solo forward pass (nessun backward, nessun update dei pesi).
+    Al termine il modello resta in eval(), pronto per uso normale.
+ 
+    num_batches=None (default) -> passa sull'intero dataloader una volta,
+    copre tutto il dataset passato (consigliato: zero rischio di campione
+    non rappresentativo). Passa un numero se il dataset è troppo grande
+    per farlo in tempi ragionevoli.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+ 
+    bn_layers = [m for m in model.modules() if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))]
+ 
+    old_momentum = []
+    for m in bn_layers:
+        old_momentum.append(m.momentum)
+        m.reset_running_stats()
+        m.momentum = None  # media cumulativa vera su tutti i batch visti,
+                            # non media mobile esponenziale pesata sui recenti
+ 
+    model.train()
+    with torch.no_grad():
+        n = 0
+        for batch in dataloader:
+            if num_batches is not None and n >= num_batches:
+                break
+            batch = batch.to(device)
+            model(batch)
+            n += 1
+ 
+    for m, mom in zip(bn_layers, old_momentum):
+        m.momentum = mom  # ripristina il momentum originale
+ 
+    model.eval()
+    print(f"OK -> BatchNorm ricalibrato su {n} batch", flush=True)
 
-# ------------------------------------------------------------------
-# Esempi d'uso
-# ------------------------------------------------------------------
-# SAR (2 canali -> mostrati singolarmente in scala di grigi)
-# sample = datasetS1[0]  # o datasetS1._cache[qualche_ID] a seconda della versione del loader
-# save_reconstruction_pngs(modelS1, sample, save_dir="/data/debug_recon", prefix="SAR")
 
-# Ottico (10 canali -> di default primi 3 come RGB, passa channels= se vuoi
-# bande specifiche)
-# sample = datasetS2[0]
-# save_reconstruction_pngs(modelS2, sample, save_dir="/data/debug_recon", prefix="OPT")
 
-# from anomaly import PairLoader
-
-# main.py contiene tutti gli handler, il file DEVE chiamarsi main.py 
 
 def log_artifact_safe(project, name, source, kind="artifact", retries=3, delay=5):
    
@@ -229,6 +250,8 @@ def train_autoencoders_1D(
         loss_fn = nn.MSELoss().to(device)
         scalerS1 = torch.cuda.amp.GradScaler()
         best_loss = float('inf')
+
+        resultsS1 = {'lr': [], 'train_loss': []}
 
         if resume:
             try:
@@ -409,6 +432,8 @@ def train_autoencoders_1D(
         scalerS2 = torch.cuda.amp.GradScaler()
         best_loss = float('inf')
 
+        resultsS2 = {'lr': [], 'train_loss': []}
+
         if resume:
             try:
                 w_path = project_work.get_artifact(f"encoder-s2-weights_{job_name}_{dataset}_{epochs}").download("/data")
@@ -571,9 +596,9 @@ def train_autoencoders_1D(
 
 @handler()
 def train_autoencoders_2D(
-    epochs: int = 1, 
-    batch_size: int = 1, 
-    lr: float = 1e-4, 
+    epochs: int = 1,
+    batch_size: int = 1,
+    lr: float = 1e-4,
     weight_decay: float = 1e-4,
     patch_size: int = 256,
     n_images1: int = 4,
@@ -589,68 +614,97 @@ def train_autoencoders_2D(
     train_opt: bool = True,
     patience: int = 20,
     min_delta: float = 1e-4,
+    ltae: bool = False,
+    resume: bool = True,
     time_debug: bool = False
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
-
+ 
     n_gpus = torch.cuda.device_count()
     print(f"GPU: {n_gpus}", flush=True)
-
+ 
     torch.backends.cudnn.benchmark = True
-    
+ 
     # progetti digital hub
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
-
-    # download dataset
+ 
+    sar_zip_map = {}
+    opt_zip_map = {}
+    train_data_SAR_IDS = []
+    train_data_OPT_IDS = []
+   
+ 
+    # prova prima la cache precalcolata: se disponibile, evita del tutto il
+    # download del dataset grezzo per la modalita' in questione
     print(f"Download: {dataset}", flush=True)
-    dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}_crop_norm").download("/data/dataset_floods")
     print("OK -> Download terminato")
 
-    try:
 
-        if train_sar:
-            # recupero id serie SAR + mappa serie -> zip che la contiene
-            s1_dir = os.path.join(dataset_path, "SAR")
-            sar_zip_map = {}
-            for zip_file in sorted(glob(os.path.join(s1_dir, "SAR_*.zip"))):
-                with zipfile.ZipFile(zip_file, 'r') as z:
-                    for n in z.namelist():
-                        if n.lower().endswith('.tif'):
-                            ID = os.path.basename(n).split('_SAR_')[0]
-                            sar_zip_map[ID] = zip_file
-            train_data_SAR_IDS = list(sar_zip_map.keys())
-            print(f"{len(train_data_SAR_IDS)} serie SAR trovate")
+    if train_sar:
+        try:
+            os.makedirs("/data/cache_SAR", exist_ok=True)
+            part_files = sorted(glob(os.path.join(dataset_path, "SAR", "part*.zip")))
+            if part_files:
+                for part_path in part_files:
+                    with zipfile.ZipFile(part_path, 'r') as z:
+                        z.extractall("/data/cache_SAR")
+                train_data_SAR_IDS = [f[:-4] for f in os.listdir("/data/cache_SAR") if f.endswith('.npy')]
+                sar_cache_ready = True
+                print(f"OK -> SAR caricato: {len(train_data_SAR_IDS)} serie", flush=True)
+        except Exception as e:
+            print(f"EXC -> caricamento SAR: {e}", flush=True)
 
-        if train_opt:
-            # recupero id serie OPT + mappa serie -> zip che la contiene
-            s2_dir = os.path.join(dataset_path, "OPT")
-            opt_zip_map = {}
-            for zip_file in sorted(glob(os.path.join(s2_dir, "OPT_*.zip"))):
-                with zipfile.ZipFile(zip_file, 'r') as z:
-                    for n in z.namelist():
-                        if n.lower().endswith('.tif'):
-                            ID = os.path.basename(n).split('_OPT_')[0]
-                            opt_zip_map[ID] = zip_file
-            train_data_OPT_IDS = list(opt_zip_map.keys())
-            print(f"{len(train_data_OPT_IDS)} serie OPT trovate")
-
-    except Exception as e:
-        print(f"EXC -> Eccezione recupero liste: {e}", flush=True)    
-
+    if train_opt:
+        try:
+            os.makedirs("/data/cache_OPT", exist_ok=True)
+            part_files = sorted(glob(os.path.join(dataset_path, "OPT", "part*.zip")))
+            if part_files:
+                for part_path in part_files:
+                    with zipfile.ZipFile(part_path, 'r') as z:
+                        z.extractall("/data/cache_OPT")
+                train_data_OPT_IDS = [f[:-4] for f in os.listdir("/data/cache_OPT") if f.endswith('.npy')]
+                opt_cache_ready = True
+                print(f"OK -> OPT caricato: {len(train_data_OPT_IDS)} serie", flush=True)
+        except Exception as e:
+            print(f"EXC -> caricamento OPT: {e}", flush=True)
+ 
+    
+ 
     # TRAINING SAR
     if train_sar:
-    
+ 
         print("\n Training S1")
-        modelS1 = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, n_head=n_head, d_k=d_k).to(device)
+        modelS1 = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, n_head=8, d_k=8, ltae=ltae).to(device)
         if n_gpus > 1:
             modelS1 = nn.DataParallel(modelS1)
         optimizerS1 = torch.optim.Adam(modelS1.parameters(), lr=lr, weight_decay=weight_decay)
         loss_fn = nn.MSELoss().to(device)
         scalerS1 = torch.cuda.amp.GradScaler()
         best_loss = float('inf')
-
+ 
+        resultsS1 = {'lr': [], 'train_loss': []}
+ 
+        if resume:
+            try:
+                w_path = project_work.get_artifact(f"encoder-s1-weights_{job_name}_{dataset}_{epochs}").download("/data")
+                state_dict = torch.load(w_path, map_location=device)
+                (modelS1.module if n_gpus > 1 else modelS1).load_state_dict(state_dict)
+                print("OK -> pesi S1 vecchi caricati", flush=True)
+            except Exception as e:
+                print(f"EXC -> nessun peso S1 vecchio, inizializzazione casuale: {e}", flush=True)
+ 
+            try:
+                m_path = project_work.get_artifact(f"metrics-s1_{job_name}_{dataset}_{epochs}").download("/data")
+                prev_df = pd.read_csv(m_path)
+                best_loss = prev_df['train_loss'].min()
+                resultsS1 = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
+                print(f"OK -> metriche S1 caricate, best_loss={best_loss}", flush=True)
+            except Exception as e:
+                print(f"EXC -> nessuna metrica S1 vecchia trovata: {e}", flush=True)
+ 
         try:
             datasetS1 = Singlemodal_Loader(
                 listIDs=train_data_SAR_IDS, root=dataset_path, zip_map=sar_zip_map,
@@ -663,7 +717,7 @@ def train_autoencoders_2D(
             print("OK -> ZIP SAR eliminati", flush=True)
         except Exception as e:
             print(f"EXC -> Eccezione in Loader S1:", {e}, flush=True)
-
+ 
         # baseline per mse
         try:
             sample_ids = train_data_SAR_IDS[:50]
@@ -675,117 +729,119 @@ def train_autoencoders_2D(
                 mean_accum += im
                 n += 1
             mean_image = (mean_accum / n).astype(np.float32)
-
+ 
             total_se, total_count = 0.0, 0
             for ID in sample_ids:
                 im = np.load(os.path.join(datasetS1.cache_dir, f"{ID}.npy"))
                 total_se += np.sum((im - mean_image) ** 2)
                 total_count += im.size
-
+ 
             print(f"MSE baseline S1: {total_se/total_count:.6f}", flush=True)
         except Exception as e:
-            print(f"EXC -> Eccezione calcolo baseline S2: {e}", flush=True)    
-
-
+            print(f"EXC -> Eccezione calcolo baseline S2: {e}", flush=True)
+ 
         try:
             dataloaderS1 = DataLoader(datasetS1, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
         except Exception as e:
             print(f"EXC -> Eccezione in DataLoader S1 {e}", flush=True)
-
-        resultsS1 = {'lr': [], 'train_loss': []}
+ 
         epochs_no_improve = 0
-
+ 
         try:
             for epoch in range(1, epochs + 1):
                 modelS1.train()
                 total_loss, total_num, train_bar = 0.0, 0, tqdm(dataloaderS1, mininterval=5.0)
-
+ 
                 if time_debug:
                     t_prev = time.time()
-
+ 
                 for im in train_bar:
                     if time_debug:
                         torch.cuda.synchronize()
                         t_data = time.time()
-
+ 
                     im = im.to(non_blocking=True, device=device)
-
+ 
                     if time_debug:
                         torch.cuda.synchronize()
                         t_transfer = time.time()
-
+ 
                     with torch.cuda.amp.autocast():
                         output = modelS1(im)
                         loss = loss_fn(output, im)
-
+ 
                     if time_debug:
                         torch.cuda.synchronize()
                         t_forward = time.time()
-
+ 
                     optimizerS1.zero_grad()
                     scalerS1.scale(loss).backward()
                     scalerS1.step(optimizerS1)
                     scalerS1.update()
-
+ 
                     if time_debug:
                         torch.cuda.synchronize()
                         t_backward = time.time()
                         print(f"dati: {t_data-t_prev:.3f}s | trasferimento: {t_transfer-t_data:.3f}s | "
                             f"forward: {t_forward-t_transfer:.3f}s | backward: {t_backward-t_forward:.3f}s", flush=True)
                         t_prev = time.time()
-
+ 
                     total_num += dataloaderS1.batch_size
                     total_loss += loss.item() * dataloaderS1.batch_size
                     train_bar.set_description(f'S1 Epoch: [{epoch}/{epochs}], Loss: {loss.item():.4f}')
-
+ 
                 epoch_loss = total_loss / total_num
                 resultsS1['lr'].append(optimizerS1.param_groups[0]['lr'])
                 resultsS1['train_loss'].append(epoch_loss)
-
+ 
+                # salva/carica il csv OGNI epoca, non solo sui miglioramenti
+                pd.DataFrame(resultsS1).to_csv(f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
+                try:
+                    project_work.log_artifact(name=f"metrics-s1_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
+                except Exception as e:
+                    print(f"EXC -> upload intermedio S1: {e}", flush=True)
+ 
                 if epoch_loss < best_loss - min_delta:
                     state_dict = modelS1.module.state_dict() if n_gpus > 1 else modelS1.state_dict()
                     torch.save(state_dict, f'modelS1_best_{job_name}_{dataset}_{epochs}.pth')
                     best_loss = epoch_loss
                     epochs_no_improve = 0
                     print(f"best loss epoch {epoch} (new): {best_loss}", flush=True)
-
-                    pd.DataFrame(resultsS1).to_csv(f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
-
-                    # evitare scadenza token auth 
+ 
+                    # evitare scadenza token auth
+                    try:
+                        dh.refresh_token()
+                        print("OK -> refresh token")
+                    except Exception as e:
+                        print(f"EXC -> refresh token: {e}", flush=True)
+ 
                     try:
                         project_work = dh.get_project("floods")
-                        print("OK -> token aggiornato", flush=True)
-
+                        print("OK -> get project")
                     except Exception as e:
-                        print(f"EXC -> aggiornamento token: {e}", flush=True)
-
+                        print(f"EXC -> get project: {e}", flush=True)
+ 
                     log_artifact_safe(project_work, f"encoder-s1-weights_{job_name}_{dataset}_{epochs}", f'modelS1_best_{job_name}_{dataset}_{epochs}.pth')
-
-                    try:    
-                        project_work.log_artifact(name=f"metrics-s1_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS1_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
-                    except Exception as e:
-                        print(f"EXC -> upload intermedio S1: {e}", flush=True)
-
+ 
                 else:
                     epochs_no_improve += 1
                     print(f"best loss epoch {epoch} (old): {best_loss}", flush=True)
-
+ 
                     if epochs_no_improve >= patience:
                         print(f"Early Stopping S1: epoch {epoch}, best loss: {best_loss}")
                         break
-
+ 
         except Exception as e:
             print(f"EXC -> Eccezione in model train S1: {e}", flush=True)
-
+ 
         best_loss_s1 = best_loss
-        print(f"OK -> Terminato training S1, LOSS (MSE): {best_loss_s1}", flush=True)     
-
-
+        print(f"OK -> Terminato training S1, LOSS (MSE): {best_loss_s1}", flush=True)
+ 
         del modelS1
-        torch.cuda.empty_cache() 
-
+        torch.cuda.empty_cache()
+ 
         try:
-            cache_sar_dir = "/data/cache_SAR" 
+            cache_sar_dir = "/data/cache_SAR"
             if os.path.exists(cache_sar_dir):
                 print(f"Pulizia cartella SAR: {cache_sar_dir}", flush=True)
                 shutil.rmtree(cache_sar_dir)
@@ -794,19 +850,39 @@ def train_autoencoders_2D(
                 print("Nessuna cache SAR trovata da rimuovere.", flush=True)
         except Exception as e:
             print(f"EXC -> Eccezione durante la pulizia della cache SAR: {e}", flush=True)
-
+ 
     # TRAINING OTTICO
     if train_opt:
-    
+ 
         print("\n Training S2")
-        modelS2 = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, n_head=n_head, d_k=d_k).to(device)
+        modelS2 = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, n_head=8, d_k=8, ltae=ltae).to(device)
         if n_gpus > 1:
             modelS2 = nn.DataParallel(modelS2)
         optimizerS2 = torch.optim.Adam(modelS2.parameters(), lr=lr, weight_decay=weight_decay)
         loss_fn = nn.MSELoss().to(device)
         scalerS2 = torch.cuda.amp.GradScaler()
         best_loss = float('inf')
-
+ 
+        resultsS2 = {'lr': [], 'train_loss': []}
+ 
+        if resume:
+            try:
+                w_path = project_work.get_artifact(f"encoder-s2-weights_{job_name}_{dataset}_{epochs}").download("/data")
+                state_dict = torch.load(w_path, map_location=device)
+                (modelS2.module if n_gpus > 1 else modelS2).load_state_dict(state_dict)
+                print("OK -> pesi S2 vecchi caricati", flush=True)
+            except Exception as e:
+                print(f"EXC -> nessun peso S2 vecchio, inizializzazione casuale: {e}", flush=True)
+ 
+            try:
+                m_path = project_work.get_artifact(f"metrics-s2_{job_name}_{dataset}_{epochs}").download("/data")
+                prev_df = pd.read_csv(m_path)
+                best_loss = prev_df['train_loss'].min()
+                resultsS2 = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
+                print(f"OK -> metriche S2 caricate, best_loss={best_loss}", flush=True)
+            except Exception as e:
+                print(f"EXC -> nessuna metrica S2 vecchia trovata: {e}", flush=True)
+ 
         try:
             datasetS2 = Singlemodal_Loader(
                 listIDs=train_data_OPT_IDS, root=dataset_path, zip_map=opt_zip_map,
@@ -819,7 +895,7 @@ def train_autoencoders_2D(
             print("OK -> ZIP OPT eliminati", flush=True)
         except Exception as e:
             print(f"EXC -> Eccezione in Loader S2:", {e}, flush=True)
-
+ 
         try:
             sample_ids = train_data_OPT_IDS[:200]
             mean_accum, n = None, 0
@@ -830,117 +906,123 @@ def train_autoencoders_2D(
                 mean_accum += im
                 n += 1
             mean_image = (mean_accum / n).astype(np.float32)
-
+ 
             total_se, total_count = 0.0, 0
             for ID in sample_ids:
                 im = np.load(os.path.join(datasetS2.cache_dir, f"{ID}.npy"))
                 total_se += np.sum((im - mean_image) ** 2)
                 total_count += im.size
-
+ 
             print(f"MSE baseline S2: {total_se/total_count:.6f}", flush=True)
         except Exception as e:
             print(f"EXC -> Eccezione calcolo baseline S2: {e}", flush=True)
-
+ 
         try:
             dataloaderS2 = DataLoader(datasetS2, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
         except Exception as e:
             print(f"EXC -> Eccezione in DataLoader S2 {e}", flush=True)
-
-        resultsS2 = {'lr': [], 'train_loss': []}
+ 
         epochs_no_improve = 0
-
+ 
         try:
             for epoch in range(1, epochs + 1):
                 modelS2.train()
                 total_loss, total_num, train_bar = 0.0, 0, tqdm(dataloaderS2)
-
+ 
                 if time_debug:
                     t_prev = time.time()
-
+ 
                 for im in train_bar:
                     if time_debug:
                         torch.cuda.synchronize()
                         t_data = time.time()
-
+ 
                     im = im.to(non_blocking=True, device=device)
-
+ 
                     if time_debug:
                         torch.cuda.synchronize()
                         t_transfer = time.time()
-
+ 
                     with torch.cuda.amp.autocast():
                         output = modelS2(im)
                         loss = loss_fn(output, im)
-
+ 
                     if time_debug:
                         torch.cuda.synchronize()
                         t_forward = time.time()
-
+ 
                     optimizerS2.zero_grad()
                     scalerS2.scale(loss).backward()
                     scalerS2.step(optimizerS2)
                     scalerS2.update()
-
+ 
                     if time_debug:
                         torch.cuda.synchronize()
                         t_backward = time.time()
                         print(f"dati: {t_data-t_prev:.3f}s | trasferimento: {t_transfer-t_data:.3f}s | "
                             f"forward: {t_forward-t_transfer:.3f}s | backward: {t_backward-t_forward:.3f}s", flush=True)
                         t_prev = time.time()
-
+ 
                     total_num += dataloaderS2.batch_size
                     total_loss += loss.item() * dataloaderS2.batch_size
                     train_bar.set_description(f'S2 Epoch: [{epoch}/{epochs}], Loss: {loss.item():.4f}')
-
+ 
                 epoch_loss = total_loss / total_num
                 resultsS2['lr'].append(optimizerS2.param_groups[0]['lr'])
                 resultsS2['train_loss'].append(epoch_loss)
-
+ 
+                pd.DataFrame(resultsS2).to_csv(f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
+                try:
+                    project_work.log_artifact(name=f"metrics-s2_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
+                except Exception as e:
+                    print(f"EXC -> upload intermedio S2: {e}", flush=True)
+ 
                 if epoch_loss < best_loss - min_delta:
                     state_dict = modelS2.module.state_dict() if n_gpus > 1 else modelS2.state_dict()
                     torch.save(state_dict, f'modelS2_best_{job_name}_{dataset}_{epochs}.pth')
                     best_loss = epoch_loss
                     epochs_no_improve = 0
                     print(f"best loss epoch {epoch} (new): {best_loss}", flush=True)
-
-                    pd.DataFrame(resultsS2).to_csv(f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
-
+ 
+                    try:
+                        dh.refresh_token()
+                        print("OK -> refresh token")
+                    except Exception as e:
+                        print(f"EXC -> refresh token: {e}", flush=True)
+ 
                     try:
                         project_work = dh.get_project("floods")
+                        print("OK -> get project")
                     except Exception as e:
-                        print(f"EXC -> aggiornamento token: {e}", flush=True)
-    
+                        print(f"EXC -> get project: {e}", flush=True)
+ 
                     log_artifact_safe(project_work, f"encoder-s2-weights_{job_name}_{dataset}_{epochs}", f'modelS2_best_{job_name}_{dataset}_{epochs}.pth')
-
-                    try:
-                        project_work.log_artifact(name=f"metrics-s2_{job_name}_{dataset}_{epochs}", source=f'log_pretrainS2_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
-                    except Exception as e:
-                        print(f"EXC -> upload intermedio S2: {e}", flush=True)
-
+ 
                 else:
                     epochs_no_improve += 1
                     print(f"best loss epoch {epoch} (old): {best_loss}", flush=True)
-
+ 
                     if epochs_no_improve >= patience:
                         print(f"Early Stopping S2: epoch {epoch}, best loss: {best_loss}")
                         break
-
+ 
         except Exception as e:
             print(f"EXC -> Eccezione in model train S2: {e}", flush=True)
-
+ 
         best_loss_s2 = best_loss
         del modelS2
         torch.cuda.empty_cache()
-
+ 
         print(f"OK -> Terminato training S2, LOSS (MSE): {best_loss_s2}", flush=True)
-
+ 
         print("OK -> Terminato training S2\n")
-
+ 
         print("RISULTATI")
-        if train_sar: print(f"LOSS (MSE) SAR: {best_loss_s1}") 
-        if train_opt: print(f"LOSS (MSE) OPT: {best_loss_s2}") 
-    
+        if train_sar: print(f"LOSS (MSE) SAR: {best_loss_s1}")
+        if train_opt: print(f"LOSS (MSE) OPT: {best_loss_s2}")
+ 
     return "TERMINATO -> training SAR e OPT finito"
+
 
 
 # notebook -> moco
@@ -965,10 +1047,11 @@ def train_moco(
     workers: int = 0,
     job_name: str = "nome_job",
     dataset: str = "Test",
-    weights_encoder_sar: str = "train_s1_v3_Standard_200",
-    weights_encoder_opt: str = "train_s2_v3_Standard_200",
+    weights_encoder_sar: str = "train_sar_1D_v1_Standard_200",
+    weights_encoder_opt: str = "train_opt_1D_v1_Standard_200",
     patience: int = 20,
     min_delta: float = 1e-4,
+    calib_batch_size: int = 32,
     time_debug: bool = False
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1046,6 +1129,46 @@ def train_moco(
     modelS2 = Singlemodal_CAE(input_dim=n_channels2, output_dim=512, n_images=n_images2, mamba=mamba).to(device)
     modelS2.load_state_dict(torch.load(path_s2, map_location=device))
     print("OK -> Pesi Encoders caricati", flush=True)
+
+    # ricalibrazione batchNorm
+    try:
+        calib_ids_sar = list(sar_zip_map.keys())
+        if len(calib_ids_sar) > 2000:
+            calib_ids_sar = random.sample(calib_ids_sar, 2000)
+
+        calib_datasetS1 = Singlemodal_Loader(
+            listIDs=calib_ids_sar, root=dataset_path, zip_map=sar_zip_map,
+            transform=None, patch_size=patch_size, n_images=n_images1,
+            n_channels=n_channels1, data_type='SAR'
+        )
+        calib_loaderS1 = torch.utils.data.DataLoader(
+            calib_datasetS1, batch_size=calib_batch_size, shuffle=True,
+            num_workers=workers, pin_memory=True, drop_last=True
+        )
+        recalibrate_batchnorm(modelS1, calib_loaderS1, num_batches=None, device=device)
+        print("OK -> ricalibrazione BN SAR", flush=True)
+    except Exception as e:
+        print(f"EXC -> ricalibrazione BN SAR: {e}", flush=True)
+ 
+    try:
+        calib_ids_opt = list(opt_zip_map.keys())
+        if len(calib_ids_opt) > 2000:
+            calib_ids_opt = random.sample(calib_ids_opt, 2000)
+
+        calib_datasetS2 = Singlemodal_Loader(
+            listIDs=calib_ids_opt, root=dataset_path, zip_map=opt_zip_map,
+            transform=None, patch_size=patch_size, n_images=n_images2,
+            n_channels=n_channels2, data_type='OPT'
+        )
+        calib_loaderS2 = torch.utils.data.DataLoader(
+            calib_datasetS2, batch_size=calib_batch_size, shuffle=True,
+            num_workers=workers, pin_memory=True, drop_last=True
+        )
+        recalibrate_batchnorm(modelS2, calib_loaderS2, num_batches=None, device=device)
+        print("OK -> ricalibrazione BN OPT", flush=True)
+    except Exception as e:
+        print(f"EXC -> ricalibrazione BN OPT: {e}", flush=True)
+
 
     model = MoCo2encoders(
         base_encoder_q=modelS2.encoder,
@@ -1153,22 +1276,23 @@ def train_moco(
             results['lr'].append(optimizer.param_groups[0]['lr'])
             results['train_loss'].append(epoch_loss)
 
+            pd.DataFrame(results).to_csv(f'log_moco_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
+
+            try:
+                project_work.log_artifact(name=f"moco-metrics_{job_name}_{dataset}_{epochs}", source=f'log_moco_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
+                print(f"OK -> metriche salvate", flush=True)
+            except Exception as e:
+                print(f"EXC -> upload metriche MoCo: {e}", flush=True)
+
             if epoch_loss < best_loss - min_delta:
                 torch.save(model.state_dict(), f'moco_best_{job_name}_{dataset}_{epochs}.pth')
                 best_loss = epoch_loss
                 epochs_no_improve = 0
-
-                pd.DataFrame(results).to_csv(f'log_moco_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
-
                 try:
                     project_work.log_artifact(name=f"moco-weights_{job_name}_{dataset}_{epochs}", source=f'moco_best_{job_name}_{dataset}_{epochs}.pth', kind='artifact')
+                    print(f"OK -> pesi salvati", flush=True)
                 except Exception as e:
                     print(f"EXC -> upload pesi MoCo: {e}", flush=True)
-
-                try:
-                    project_work.log_artifact(name=f"moco-metrics_{job_name}_{dataset}_{epochs}", source=f'log_moco_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
-                except Exception as e:
-                    print(f"EXC -> upload metriche MoCo: {e}", flush=True)
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= patience:
@@ -1596,3 +1720,149 @@ def test_encoders_visual(
         print(f"EXC -> upload zip ricostruzioni: {e}", flush=True)
  
     return "TERMINATO"
+
+
+import os
+import shutil
+import zipfile
+from glob import glob
+
+
+def _write_cache_parts(cache_dir, local_root, modality_label, max_part_bytes):
+    """
+    Scrive il contenuto di cache_dir in piu' zip da al massimo max_part_bytes
+    (calcolato sulla dimensione grezza dei .npy sorgente, quindi la dimensione
+    reale di ogni zip compresso sara' sempre <= a questo budget), salvati sotto
+    local_root/{modality_label}/partNN.zip.
+
+    I .npy sorgente vengono cancellati via via (streaming) per non raddoppiare
+    lo spazio mentre si costruisce lo zip corrente. Le PARTI risultanti pero'
+    restano sul disco fino alla fine: servono tutte insieme per il singolo
+    upload finale dell'intera cartella come un solo artifact.
+    """
+    modality_dir = os.path.join(local_root, modality_label)
+    os.makedirs(modality_dir, exist_ok=True)
+
+    part_num = 1
+    current_zip = None
+    current_path = None
+    current_size = 0
+
+    def _open_new_part():
+        nonlocal current_zip, current_path, current_size
+        current_path = os.path.join(modality_dir, f"part{part_num:02d}.zip")
+        current_zip = zipfile.ZipFile(current_path, 'w', zipfile.ZIP_DEFLATED)
+        current_size = 0
+
+    def _close_part():
+        nonlocal current_zip, part_num
+        current_zip.close()
+        size_gb = os.path.getsize(current_path) / 1e9
+        print(f"OK -> {modality_label} parte {part_num} pronta ({size_gb:.2f} GB)", flush=True)
+        part_num += 1
+
+    _open_new_part()
+    for fname in os.listdir(cache_dir):
+        full_path = os.path.join(cache_dir, fname)
+        fsize = os.path.getsize(full_path)
+
+        # se aggiungere questo file sfora il budget, chiudo la parte corrente e ne apro una nuova
+        if current_size > 0 and current_size + fsize > max_part_bytes:
+            _close_part()
+            _open_new_part()
+
+        current_zip.write(full_path, arcname=fname)
+        current_size += fsize
+        os.remove(full_path)  # libera spazio .npy subito, file per file
+
+    _close_part()
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    print(f"OK -> {modality_label} completato, {part_num - 1} parti scritte localmente", flush=True)
+
+
+@handler()
+def crop_norm_artifact(
+    dataset: str = "Standard",
+    patch_size: int = 256,
+    n_images1: int = 4, n_channels1: int = 2,   # SAR
+    n_images2: int = 4, n_channels2: int = 10,  # OPT
+    max_part_gb: float = 15.0,  # sotto ai 15.8GB del SAR_N.zip piu' pesante, gia' confermato funzionante
+):
+    project_data = dh.get_project("datasets")
+    max_part_bytes = int(max_part_gb * 1024 ** 3)
+
+    local_root = "/data/floods_cache_upload"
+    os.makedirs(local_root, exist_ok=True)
+
+    print(f"Download: {dataset}", flush=True)
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
+    print("OK -> Download terminato", flush=True)
+
+    try:
+        # ---------------- SAR ----------------
+        s1_dir = os.path.join(dataset_path, "SAR")
+        sar_zip_map = {}
+        for zip_file in sorted(glob(os.path.join(s1_dir, "SAR_*.zip"))):
+            with zipfile.ZipFile(zip_file, 'r') as z:
+                for n in z.namelist():
+                    if n.lower().endswith('.tif'):
+                        ID = os.path.basename(n).split('_SAR_')[0]
+                        sar_zip_map[ID] = zip_file
+        print(f"{len(sar_zip_map)} serie SAR trovate", flush=True)
+
+        # costruisce /data/cache_SAR/{ID}.npy per ogni serie (ritaglio+normalizzazione)
+        datasetS1 = Singlemodal_Loader(
+            listIDs=list(sar_zip_map.keys()), root=dataset_path, zip_map=sar_zip_map,
+            transform=None, patch_size=patch_size, n_images=n_images1,
+            n_channels=n_channels1, data_type='SAR'
+        )
+
+        for zip_path in set(sar_zip_map.values()):
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        print("OK -> ZIP SAR grezzi eliminati", flush=True)
+
+        _write_cache_parts(datasetS1.cache_dir, local_root, "SAR", max_part_bytes)
+
+        # ---------------- OPT ----------------
+        s2_dir = os.path.join(dataset_path, "OPT")
+        opt_zip_map = {}
+        for zip_file in sorted(glob(os.path.join(s2_dir, "OPT_*.zip"))):
+            with zipfile.ZipFile(zip_file, 'r') as z:
+                for n in z.namelist():
+                    if n.lower().endswith('.tif'):
+                        ID = os.path.basename(n).split('_OPT_')[0]
+                        opt_zip_map[ID] = zip_file
+        print(f"{len(opt_zip_map)} serie OPT trovate", flush=True)
+
+        datasetS2 = Singlemodal_Loader(
+            listIDs=list(opt_zip_map.keys()), root=dataset_path, zip_map=opt_zip_map,
+            transform=None, patch_size=patch_size, n_images=n_images2,
+            n_channels=n_channels2, data_type='OPT'
+        )
+
+        for zip_path in set(opt_zip_map.values()):
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        print("OK -> ZIP OPT grezzi eliminati", flush=True)
+
+        _write_cache_parts(datasetS2.cache_dir, local_root, "OPT", max_part_bytes)
+
+        # ---------------- upload unico ----------------
+        print("Upload dell'intera cartella come artifact unico...", flush=True)
+        project_data.log_artifact(
+            name=f"Floods_{dataset}_crop_norm",
+            kind='artifact',
+            source=local_root,  # directory locale -> un solo artifact, struttura SAR/ e OPT/ preservata
+        )
+        print("OK -> artifact unico caricato (sottocartelle SAR/ e OPT/)", flush=True)
+
+        shutil.rmtree(local_root, ignore_errors=True)
+        print("OK -> pulizia locale completata", flush=True)
+
+    except Exception as e:
+        print(f"EXC -> costruzione cache fallita: {e}", flush=True)
+
+    return "TERMINATO -> cache precalcolata caricata come artifact unico (SAR/, OPT/)"
+
+

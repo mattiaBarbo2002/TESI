@@ -117,16 +117,21 @@ class Singlemodal_Loader(Dataset):
             img_channels = min(self.n_channels, img.shape[0])
             cropped.append(img[:img_channels, start_y:start_y+self.patch_size, start_x:start_x+self.patch_size])
 
-        # normalizzazione nuova percentile su serie (canali + 4 istanti)
-        serie_to_array = np.stack(cropped, axis=1)  # array dim 1 (axis=1) = 4t*c*h*w
-        p_low = np.percentile(serie_to_array, 1)
-        p_high = np.percentile(serie_to_array, 99)
+        # normalizzazione nuova percentile su serie -> array dim 1 (axis=1) = 4t*c*h*w
+        serie_to_array = np.stack(cropped, axis=1) 
+        p_low = np.percentile(serie_to_array, 2)
+        p_high = np.percentile(serie_to_array, 98)
         scale = p_high - p_low if (p_high - p_low) > 1e-6 else 1.0
 
         im = np.zeros((self.n_channels, self.n_images, self.patch_size, self.patch_size), dtype=np.float32)
+
         for t in range(self.n_images):
+
+            # normalizzazione 
             img_norm = (cropped[t] - p_low) / scale
             img_norm = np.clip(img_norm, 0.0, 1.0)
+
+            # costruzione img numpy
             img_channels = cropped[t].shape[0]
             if pad_y > 0 or pad_x > 0:
                 img_norm = np.pad(img_norm, ((0, 0), (0, pad_y), (0, pad_x)), mode='constant', constant_values=0.0)
@@ -140,7 +145,7 @@ class Singlemodal_Loader(Dataset):
         save_path = os.path.join(self.cache_dir, f"{ID}.npy")
 
         im = np.load(save_path, mmap_mode='r')
-        im = torch.from_numpy(im.copy())
+        im = torch.from_numpy(im.copy())        # diventa tipo dato torch.Tensor
 
         if self.transform is not None:
             im = self.transform(im)
@@ -223,8 +228,8 @@ class MoCo2encodersLoader(Dataset):
 
         # nuova normalizzazione percentile su tutta la serie (canali + istanti insieme), come encoder
         serie_to_array = np.stack(cropped, axis=1)
-        p_low = np.percentile(serie_to_array, 1)
-        p_high = np.percentile(serie_to_array, 99)
+        p_low = np.percentile(serie_to_array, 2)
+        p_high = np.percentile(serie_to_array, 98)
         scale = p_high - p_low if (p_high - p_low) > 1e-6 else 1.0
 
         im = np.zeros((n_channels, n_images, self.patch_size, self.patch_size), dtype=np.float32)

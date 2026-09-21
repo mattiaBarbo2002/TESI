@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from convlstm import ConvLSTM
 from ltae import LTAE2d
+from ltae import PositionalEncoder
 # from mambapy.mamba import MambaConfig, Mamba
 
 class ConvBlock(nn.Module):
@@ -544,11 +545,12 @@ class MaskedAutoEncoder(nn.Module):
 # output non piu vettore 1d ma mappa feature 8 o 16 canali
 
 class Singlemodal_Encoder_2d(nn.Module):
-    def __init__(self, input_dim=2, output_dim=16, n_images=4, n_head=8, d_k=8):
+    def __init__(self, input_dim=2, output_dim=16, n_images=4, n_head=8, d_k=8, ltae=False):
         super(Singlemodal_Encoder_2d, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.n_images = n_images
+        self.ltae = ltae
 
         # Uguale a Singlemodal_Encoder
         # stage 0: scansione (1x7x7) considera un t alla volta
@@ -575,16 +577,20 @@ class Singlemodal_Encoder_2d(nn.Module):
                                      CBAM(n_images, reduction_ratio=1))
 
         # Ltae : attention e fusione 4 istanti, output canali = output_dim
-        self.temporal_attn = LTAE2d(
-            in_channels=256,
-            n_head=n_head,
-            d_k=d_k,
-            mlp=[256, output_dim],
-            d_model=256,
-            T=1000,
-            return_att=False,
-            positional_encoding=True,
-        )
+        if self.ltae:
+            self.temporal_attn = LTAE2d(
+                in_channels=256,
+                n_head=n_head,
+                d_k=d_k,
+                mlp=[256, output_dim],
+                d_model=256,
+                T=1000,
+                return_att=False,
+                positional_encoding=True,
+            )
+        else:
+            self.conv_lstm = ConvLSTM(input_dim=256, hidden_dim=output_dim, kernel_size=(3, 3),
+                                       num_layers=1, batch_first=True, bias=True, return_all_layers=False)
 
     def forward(self, x):
         x = self.conv1(x.float())
@@ -596,20 +602,31 @@ class Singlemodal_Encoder_2d(nn.Module):
         x = self.stage6(x)
         x = x.permute(0, 2, 1, 3, 4)  # (batch, channels, time, H, W) -> (batch, time, channels, H, W)
 
-        batch_positions = torch.arange(self.n_images, device=x.device).float().unsqueeze(0).expand(x.size(0), -1)   # necessario per passare gli istanti corretti di ogni serie nello stesso batch
-        x = self.temporal_attn(x, batch_positions=batch_positions)  # (batch, output_dim, 64, 64)
+        if self.ltae:   
+            batch_positions = torch.arange(self.n_images, device=x.device).float().unsqueeze(0).expand(x.size(0), -1)   # necessario per passare gli istanti corretti di ogni serie nello stesso batch
+            x = self.temporal_attn(x, batch_positions=batch_positions)  # (batch, output_dim, 64, 64)
+        else:
+            _, last_states = self.conv_lstm(x)
+            x = last_states[0][0]  # stato nascosto finale del layer 0 -> (batch, output_dim, 64, 64)
+
         return x
 
 
 
 class Singlemodal_CAE_2d(nn.Module):
-    def __init__(self, input_dim=2, output_dim=16, n_images=4, n_head=8, d_k=8):
+    def __init__(self, input_dim=2, output_dim=16, n_images=4, n_head=8, d_k=8, ltae=False):
         super(Singlemodal_CAE_2d, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.n_images = n_images
         self.encoder = Singlemodal_Encoder_2d(input_dim=input_dim, output_dim=output_dim,
-                                            n_images=n_images, n_head=n_head, d_k=d_k)
+                                            n_images=n_images, n_head=n_head, d_k=d_k, ltae=ltae)
+
+        
+        if self.ltae:  
+            self.decoder_pos_encoder = PositionalEncoder(d=self.output_dim, T=1000, repeat=None)
+        else:
+            None
 
         # ConvLSTM per ricreare dimensione temporale iniziale:
         # stesso input ripetuto 4 volte (output encoder), hidden state prende genera istante 1, poi aggiorna il suo stato -> istante 2 è diverso anche se input è lo stesso
@@ -618,22 +635,22 @@ class Singlemodal_CAE_2d(nn.Module):
                                    num_layers=1, batch_first=True, bias=True, return_all_layers=False)
 
         # stage 1-4: solo canali, dim spaziale (64x64) 
-        self.stage1 = nn.Sequential(DeconvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)),
+        self.stage1 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)),
                                      CBAM(n_images, reduction_ratio=1))
         
-        self.stage2 = nn.Sequential(DeconvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)),
+        self.stage2 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)),
                                      CBAM(n_images, reduction_ratio=1))
         
-        self.stage3 = nn.Sequential(DeconvBlock(256, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)),
+        self.stage3 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)),
                                      CBAM(n_images, reduction_ratio=1))
         
-        self.stage4 = nn.Sequential(DeconvBlock(128, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)),
+        self.stage4 = nn.Sequential(NewDeconvBlock(128, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)),
                                      CBAM(n_images, reduction_ratio=1))
         
         # stage 5-6: dim spaziale 64 -> 128 -> 256 
-        self.stage5 = nn.Sequential(DeconvBlock(128, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)),
+        self.stage5 = nn.Sequential(NewDeconvBlock(128, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)),
                                      CBAM(n_images, reduction_ratio=1))
-        self.stage6 = nn.Sequential(DeconvBlock(64, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)),
+        self.stage6 = nn.Sequential(NewDeconvBlock(64, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)),
                                      CBAM(n_images, reduction_ratio=1))
         self.conv1 = nn.Conv3d(64, input_dim, kernel_size=(1, 7, 7), padding='same', stride=(1, 1, 1))
 
@@ -642,6 +659,13 @@ class Singlemodal_CAE_2d(nn.Module):
         x = self.encoder(x)                                         # (batch, output_dim, 64, 64) 
 
         x = x.unsqueeze(1).expand(-1, self.n_images, -1, -1, -1)    # stesso input 4 volte -> (batch, 4, output_dim, 64, 64)
+
+        if self.ltae:
+            batch_positions = torch.arange(self.n_images, device=x.device).float().unsqueeze(0)   # (1, 4)
+            pos = self.decoder_pos_encoder(batch_positions)           # (1, 4, output_dim)
+            pos = pos.unsqueeze(-1).unsqueeze(-1)                      # (1, 4, output_dim, 1, 1)
+            x = x + pos                                                # broadcasting su batch, H, W
+
         x, _ = self.conv_lstm(x)
         x = x[0]                                                    # (batch, 4, 256, 64, 64)
 
@@ -651,9 +675,9 @@ class Singlemodal_CAE_2d(nn.Module):
         x = self.stage3(x)
         x = self.stage4(x)
         x = self.stage5(x)
-        x = self.stage6(x)                                          # (batch, input dim, 4, 256, 256)
+        x = self.stage6(x)                                          # (batch, 64, 4, 256, 256)
         x = self.conv1(x)       
-        return x                                                    
+        return x                                                 
 
 
 # DOMANDE

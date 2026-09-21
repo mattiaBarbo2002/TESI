@@ -175,6 +175,15 @@ class PositionalEncoder(nn.Module):
 
         return sinusoid_table
 
+"""
+    d_model = 256 -> passo direttamente i canali
+    T = 1000
+    offset = 0
+
+    
+
+"""
+
 
 
 class MultiHeadAttention(nn.Module):
