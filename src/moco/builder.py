@@ -231,6 +231,310 @@ class MoCo2encoders(nn.Module):
         return loss
 
 
+class MoCo2encoders_2d(nn.Module):
+    """
+    Build a MoCo model with: a query encoder, a key encoder, and a queue
+    https://arxiv.org/abs/1911.05722
+    """
+
+    def __init__(
+        self,
+        base_encoder_q,
+        base_encoder_k,
+        dim: int = 128,             # dim vettore output
+        K: int = 65536,             # queue size, k negativi
+        m: float = 0.999,           # momentum
+        T: float = 0.07,            # softmax temperature
+        symmetric: bool = False,
+        hidden_channels_dim: int = 64,
+        simple_proj: bool = True,
+        attn: bool = False,
+        device='cuda',
+    ) -> None:
+        
+        super(MoCo2encoders, self).__init__()
+
+        self.K = K
+        self.m = m
+        self.T = T
+
+        # due encoder diversi, non più uguali
+        self.encoder_q = base_encoder_q             # self.encoder_q = base_encoder(output_dim=dim, device=device)
+        self.encoder_k = base_encoder_k             # self.encoder_k = base_encoder(output_dim=dim, device=device)
+        self.symmetric = symmetric
+
+        # pesi encoder congelati, entrambi false, alleno solo MLP
+        for param_q, param_k in zip(
+            self.encoder_q.parameters(), self.encoder_k.parameters()
+        ):
+            param_q.requires_grad = False
+            param_k.requires_grad = False  
+
+        # dimensione spazio latente 2D
+        encoder_q_dim = self.encoder_q.output_dim
+        encoder_k_dim = self.encoder_k.output_dim
+
+        if simple_proj:
+            # pooling (batch, channels, 64, 64) -> (batch, channels, 1, 1) e flatten in contrastive loss
+            self.pool_q = nn.AdaptiveAvgPool2d(1)
+            self.pool_k = nn.AdaptiveAvgPool2d(1)
+
+            self.proj_q = nn.Sequential(
+                        nn.Linear(encoder_q_dim, dim),
+                        nn.ReLU(),
+                        nn.Linear(dim, dim),
+                    )
+            
+            self.proj_k = nn.Sequential(
+                nn.Linear(encoder_k_dim, dim),
+                nn.ReLU(),
+                nn.Linear(dim, dim),
+            )
+
+            # inizializzazione MLP q (predefinita pytorch), e copia pesi per k
+            for param_proj_q, param_proj_k in zip(self.proj_q.parameters(), self.proj_k.parameters()):
+                param_proj_k.data.copy_(param_proj_q.data)  # initialize
+                param_proj_k.requires_grad = False  # not update by gradient
+
+        else:
+            #
+            self.conv_q = nn.Sequential(
+                nn.Conv2d(encoder_q_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),  # 64->32
+                nn.BatchNorm2d(hidden_channels_dim),
+                nn.ReLU(),
+                
+                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),          # 32->16
+                nn.BatchNorm2d(hidden_channels_dim),
+                nn.ReLU(),
+            )
+            self.conv_k = nn.Sequential(
+                nn.Conv2d(encoder_k_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(hidden_channels_dim),
+                nn.ReLU(),
+                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(hidden_channels_dim),
+                nn.ReLU(),
+            )
+
+            # attention tipo CBAM, in più non so se serve
+            if attn:
+                self.attn_q = nn.Conv2d(hidden_channels_dim, 1, kernel_size=1)
+                self.attn_k = nn.Conv2d(hidden_channels_dim, 1, kernel_size=1)
+
+            self.proj_q = nn.Sequential(
+                nn.Linear(hidden_channels_dim, dim),
+                nn.ReLU(),
+                nn.Linear(dim, dim),
+            )
+            self.proj_k = nn.Sequential(
+                nn.Linear(hidden_channels_dim, dim),
+                nn.ReLU(),
+                nn.Linear(dim, dim),
+            )
+
+            for param_q, param_k in zip(self.conv_q.parameters(), self.conv_k.parameters()):
+                param_k.data.copy_(param_q.data)
+                param_k.requires_grad = False
+
+            if attn:
+                for param_q, param_k in zip(self.attn_q.parameters(), self.attn_k.parameters()):
+                    param_k.data.copy_(param_q.data)
+                    param_k.requires_grad = False
+
+            for param_q, param_k in zip(self.proj_q.parameters(), self.proj_k.parameters()):
+                param_k.data.copy_(param_q.data)
+                param_k.requires_grad = False
+
+        
+        # coda e indice
+        # coda inizializzata con valore randomici distribuzione normale
+        self.register_buffer("queue", torch.randn(dim, K))
+        self.queue = nn.functional.normalize(self.queue, dim=0)                     # normalizzazione, ogni vettore = norma unitaria
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+    # @no_grad: blocco che non calcola i gradienti, risparmio memoria
+    # peso(k) = peso(k)*m + peso(q)*(1-m)
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self, simple_proj, attn) -> None:
+        """
+        Momentum update of the key encoder
+        """
+        if simple_proj:
+            for param_q, param_k in zip(
+                self.proj_q.parameters(), self.proj_k.parameters()
+            ):
+                param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+
+        else:
+            for param_q, param_k in zip(self.conv_q.parameters(), self.conv_k.parameters()):
+                param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+
+            if attn:
+                for param_q, param_k in zip(self.attn_q.parameters(), self.attn_k.parameters()):
+                    param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+
+            for param_q, param_k in zip(self.proj_q.parameters(), self.proj_k.parameters()):
+                param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+
+    # aggiornamento coda con nuovi valori calcolati da momentum_encoder
+    # la matrice dim*K non viene mai cancellata ma sovrascritta
+    # se batch = 32 sovrascrivo i 32 vettori più vecchi della matrice
+    # si sovrascrive da dove dice ptr
+    # ptr = (ptr + batch_size) % self.K se la matrice finisce ptr torna a 0 -> coda circolare
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys) -> None:
+        
+        batch_size = keys.shape[0]
+
+        ptr = int(self.queue_ptr)
+        assert self.K % batch_size == 0 
+
+        self.queue[:, ptr : ptr + batch_size] = keys.T
+        # move pointer
+        ptr = (ptr + batch_size) % self.K  
+
+        self.queue_ptr[0] = ptr
+
+    # disordino ordine chiavi k per non far barare batch_normalization
+    # l'estrazione del dizionario viene gestito in loader.py in get_item
+    # su una sola gpu non serve, di solito distribuisco il batch k su gpu diverse rispetto alla distribuzione del batch q
+    @torch.no_grad()
+    def _batch_shuffle_single_gpu(self, x):
+    
+        # idx_shuffle = torch.randperm(x.shape[0]).cuda()
+        # idx_shuffle = torch.randperm(x['im1'].shape[0]).to(device=device)
+        idx_shuffle = torch.randperm(x.shape[0]).to(device=device)
+
+        # index for restoring
+        idx_unshuffle = torch.argsort(idx_shuffle)
+
+        x = x[idx_shuffle]
+        # x['im2'] = x['im2'][idx_shuffle]
+
+        return x, idx_unshuffle
+
+    # riordine vettori, altrimenti non so confrontare coppie positive
+    @torch.no_grad()
+    def _batch_unshuffle_single_gpu(self, x, idx_unshuffle):
+        
+        return x[idx_unshuffle]
+
+    # apprendimento
+    # im_q, im_k = tensori 5D
+    # q = matrice [dim_batch x dim (128)] di vettori del batch im_q processati da q_encoder
+    def contrastive_loss(self, im_q, im_k, simple_proj, attn):
+        
+        #print("im_q.type: ", type(im_q))
+        # blocco no.grad non salvo valori per backpropagation
+        with torch.no_grad():
+            q = self.encoder_q(im_q)  
+
+        if simple_proj:
+            q = self.pool_q(q).flatten(1)
+        else:
+            q = self.conv_q(q) 
+            if attn:                                                                    # (batch, hidden_channels_dim, 16, 16)
+                q_scores = self.attn_q(q).flatten(2).softmax(dim=-1)                    # (batch, 1, 256)
+                q = torch.einsum('bcn,bkn->bck', q.flatten(2), q_scores).squeeze(-1)    # (batch, hidden_channels_dim)
+            else:
+                q = self.pool_q(q).flatten(1)
+
+        q = nn.functional.normalize(self.proj_q(q), dim=1)  
+        #print("contrastive_loss: q.shape:", q.shape)    
+
+        # encoder_k mescola chiavi, processa batch, riordina chiavi 
+        # no gradient
+        with torch.no_grad():  
+            
+            im_k_, idx_unshuffle = self._batch_shuffle_single_gpu(im_k)
+            k = self.encoder_k(im_k_) 
+
+            if simple_proj:
+                k = self.pool_k(k).flatten(1) 
+            else:   
+                k = self.conv_k(k)   
+                if attn:                                           
+                    k_scores = self.attn_k(k).flatten(2).softmax(dim=-1)
+                    k = torch.einsum('bcn,bkn->bck', k.flatten(2), k_scores).squeeze(-1) 
+                else:
+                    k = self.pool_k(k).flatten(1)
+
+            k = nn.functional.normalize(self.proj_k(k), dim=1) 
+
+            # riordina
+            k = self._batch_unshuffle_single_gpu(k, idx_unshuffle)
+
+        #print("contrastive_loss: k.shape:", k.shape)  
+
+        # CALCOLO COSINE SIMILARITY
+        # similarità positiva: moltiplica matrice q per colonna corretta k
+        # vettori normalizzati quindi prodotto [-1,1]
+        # output colonna dim_batch*1, ogni riga è il singolo punteggio della serie
+        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+        
+        # similarità negativa: moltiplica la matrice q per la coda
+        # output matrice dim_batch*dim_coda
+        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+
+        # CALCOLO INFONCE
+        # aggiunge colonna positiva all'inizio della matrice negativa
+        # output matrice dim_batch*(dim_coda+1)
+        # divide per temperatura softmax, differenze minime esplodono
+        logits = torch.cat([l_pos, l_neg], dim=1)
+        logits /= self.T
+        del l_pos, l_neg
+
+        # labels = lista di 0 di dim_batch, indica che per ogni serie nel batch la coppia positiva è la prima colonna
+        # si calcola loss tra matrice e vettore labels
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(device=device)
+        loss = nn.CrossEntropyLoss().to(device=device)(logits, labels)
+        del logits, labels
+
+        """
+        fromn moco-paper: 
+            'we encode the queries and their corresponding keys, which form the positive sample pairs. 
+            The negative samples are from the queue'
+        """
+        #print("contrastive_loss()", "minibatch loss value", loss)
+
+        return loss, q, k
+
+    def forward(self, im1, im2, simple_proj, attn):
+        # forward -> scorrono i dati in avanti, no backpropagation qui
+        """
+        Input:
+            im_q: a batch of query images
+            im_k: a batch of key images
+        Output:
+            loss
+        """
+        # print("ModelMoCoDeeplab forward:", type(im1))
+        # print("ModelMoCoDeeplab forward:", im1.shape)
+
+        # 1. aggiornamento pesi encoder_k
+        with torch.no_grad():  # no gradient to keys
+            self._momentum_update_key_encoder(simple_proj=simple_proj, attn=attn)
+
+        # 2. contrastive loss: im_q e im_k passati agli encoder    
+        # caso simmetrico: somma loss sar->ottico e ottico->sar
+        if self.symmetric:  
+            loss_12, q1, k2 = self.contrastive_loss(im1, im2, simple_proj, attn)
+            loss_21, q2, k1 = self.contrastive_loss(im2, im1, simple_proj, attn)
+            loss = loss_12 + loss_21
+            k = torch.cat([k1, k2], dim=0)
+
+        # caso standard loss sar->ottico
+        else:  
+            loss, q, k = self.contrastive_loss(im1, im2)
+
+        # 3. inserimento nuovi vettori in coda
+        self._dequeue_and_enqueue(k)
+
+        print("ModelMoCoUnet(nn.Module)", "minibatch loss value", loss)
+
+        return loss    
+
+
 # ALTRE CLASSI E FUNZIONI MAI USATE
 
 """

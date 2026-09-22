@@ -146,8 +146,6 @@ def recalibrate_batchnorm(model, dataloader, num_batches=None, device=None):
     print(f"OK -> BatchNorm ricalibrato su {n} batch", flush=True)
 
 
-
-
 def log_artifact_safe(project, name, source, kind="artifact", retries=3, delay=5):
    
     for attempt in range(1, retries + 1):
@@ -652,7 +650,6 @@ def train_autoencoders_2D(
                     with zipfile.ZipFile(part_path, 'r') as z:
                         z.extractall("/data/cache_SAR")
                 train_data_SAR_IDS = [f[:-4] for f in os.listdir("/data/cache_SAR") if f.endswith('.npy')]
-                sar_cache_ready = True
                 print(f"OK -> SAR caricato: {len(train_data_SAR_IDS)} serie", flush=True)
         except Exception as e:
             print(f"EXC -> caricamento SAR: {e}", flush=True)
@@ -666,7 +663,6 @@ def train_autoencoders_2D(
                     with zipfile.ZipFile(part_path, 'r') as z:
                         z.extractall("/data/cache_OPT")
                 train_data_OPT_IDS = [f[:-4] for f in os.listdir("/data/cache_OPT") if f.endswith('.npy')]
-                opt_cache_ready = True
                 print(f"OK -> OPT caricato: {len(train_data_OPT_IDS)} serie", flush=True)
         except Exception as e:
             print(f"EXC -> caricamento OPT: {e}", flush=True)
@@ -1562,6 +1558,8 @@ def test_encoders_visual(
     weights_s1: str = "weights_s1",
     weights_s2: str = "weights_s2",
     n_samples: int = 10,
+    job_name: str = "nome",
+    monodimensional: bool = False,
     recon_channels: list | None = None,
     save_dir: str = "/data/debug_recon",
 ):
@@ -1572,15 +1570,24 @@ def test_encoders_visual(
  
     torch.backends.cudnn.benchmark = True
  
+    # progetti digital hub
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
+    
+    sar_zip_map = {}
+    opt_zip_map = {}
+    train_data_SAR_IDS = []
+    train_data_OPT_IDS = []
+    
  
     print(f"Download: {dataset}", flush=True)
-    dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}_crop_norm").download("/data/dataset_floods")
     print("OK -> Download terminato", flush=True)
- 
+
+    save_dir = save_dir + {"_"} + job_name
     os.makedirs(save_dir, exist_ok=True)
- 
+
+
     try:
         if test_sar:
             s1_dir = os.path.join(dataset_path, "SAR")
@@ -1638,12 +1645,13 @@ def test_encoders_visual(
             with torch.no_grad():
                 for i, im in enumerate(loaderS1):
                     im = im.to(device)
- 
-                    try:
-                        latent_vector = modelS1.encoder(im)
-                    except AttributeError as e:
-                        print(f"EXC -> nome encoder s1: {e}", flush=True)
-                        break
+
+                    if monodimensional:
+                        try:
+                            latent_vector = modelS1.encoder(im)
+                        except AttributeError as e:
+                            print(f"EXC -> nome encoder s1: {e}", flush=True)
+                            break    
  
                     vector = latent_vector.cpu().numpy().flatten()
                     print(f"ID {i}: {random_sar_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
@@ -1685,12 +1693,13 @@ def test_encoders_visual(
             with torch.no_grad():
                 for i, im in enumerate(loaderS2):
                     im = im.to(device)
- 
-                    try:
-                        latent_vector = modelS2.encoder(im)
-                    except AttributeError as e:
-                        print(f"EXC -> nome encoder s2: {e}", flush=True)
-                        break
+
+                    if monodimensional:
+                        try:
+                            latent_vector = modelS2.encoder(im)
+                        except AttributeError as e:
+                            print(f"EXC -> nome encoder s2: {e}", flush=True)
+                            break
  
                     vector = latent_vector.cpu().numpy().flatten()
                     print(f"ID {i}: {random_opt_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
@@ -1705,13 +1714,13 @@ def test_encoders_visual(
             del modelS2
             torch.cuda.empty_cache()
  
-    # zippo tutti i PNG e li carico come artifact, altrimenti spariscono col container del job
+    # zip png, upload artifact
     zip_base = save_dir.rstrip("/")
     zip_path = f"{zip_base}.zip"
     try:
         shutil.make_archive(zip_base, 'zip', save_dir)
         project_work.log_artifact(
-            name=f"test-encoders-reconstructions_{dataset}",
+            name=f"test-encoders-reconstructions_{dataset}_{job_name}",
             kind="artifact",
             source=zip_path
         )

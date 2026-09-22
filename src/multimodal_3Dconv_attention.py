@@ -619,6 +619,7 @@ class Singlemodal_CAE_2d(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.n_images = n_images
+        self.ltae = ltae
         self.encoder = Singlemodal_Encoder_2d(input_dim=input_dim, output_dim=output_dim,
                                             n_images=n_images, n_head=n_head, d_k=d_k, ltae=ltae)
 
