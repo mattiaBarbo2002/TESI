@@ -172,8 +172,8 @@ class MoCo2encodersLoader(Dataset):
         self.n_images2 = n_images2
         self.n_channels2 = n_channels2
 
-        self.cache_dir_sar = "/data/cache_moco_SAR"
-        self.cache_dir_opt = "/data/cache_moco_OPT"
+        self.cache_dir_sar = "/data/cache_SAR"
+        self.cache_dir_opt = "/data/cache_OPT"
         os.makedirs(self.cache_dir_sar, exist_ok=True)
         os.makedirs(self.cache_dir_opt, exist_ok=True)
 

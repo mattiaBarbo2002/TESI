@@ -28,10 +28,12 @@ from multimodal_3Dconv_attention import Singlemodal_CAE_2d
 from multimodal_3Dconv_attention import MaskedAutoEncoder
 
 from moco.loader import Singlemodal_Loader
+
 from moco.loader import MoCo2encodersLoader
 from moco.loader import PairsLoader
 
 from moco.builder import MoCo2encoders
+from moco.builder import MoCo2encoders_2d
 
 
 import numpy as np
@@ -1025,7 +1027,7 @@ def train_autoencoders_2D(
 # valori uguali al codice originale tranne coda moco_k
 
 handler()
-def train_moco(
+def train_moco_1D(
     epochs: int = 200,
     batch_size: int = 16,
     lr: float = 0.03,
@@ -1057,7 +1059,7 @@ def train_moco(
     project_data = dh.get_project("datasets")
 
     print(f"Download dataset: {dataset}", flush=True)
-    dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}_crop_norm").download("/data/dataset_floods")
     print("OK -> Download terminato")
 
     # creazione lista immagini SAR e OPT
@@ -1220,24 +1222,20 @@ def train_moco(
                 im_q = im_q.to(non_blocking=True, device=device)
                 im_k = im_k.to(non_blocking=True, device=device)
 
-                # --- INIZIO BLOCCO DI DEBUG ---
+                # stampa debug
                 if epoch == 1 and total_num == 0:
-                    print("\n" + "="*40, flush=True)
-                    print("DIAGNOSTICA STEP 0 - CONTROLLO COLLASSO", flush=True)
                     
-                    # 1. Controllo Dataloader (Input)
+                    # input dataloader
                     print(f"INPUT im_q (SAR) - min: {im_q.min().item():.4f}, max: {im_q.max().item():.4f}, std: {im_q.float().std().item():.4f}", flush=True)
                     print(f"INPUT im_k (OPT) - min: {im_k.min().item():.4f}, max: {im_k.max().item():.4f}, std: {im_k.float().std().item():.4f}", flush=True)
                     
-                    # 2. Controllo Encoder (Output pre-MLP)
+                    # output encoders
                     with torch.no_grad():
                         out_q = model.encoder_q(im_q)
                         out_k = model.encoder_k(im_k)
                         
                     print(f"ENCODER q_out - std: {out_q.std().item():.6f}, val unici: {len(torch.unique(out_q))}", flush=True)
                     print(f"ENCODER k_out - std: {out_k.std().item():.6f}, val unici: {len(torch.unique(out_k))}", flush=True)
-                    print("="*40 + "\n", flush=True)
-                # --- FINE BLOCCO DI DEBUG ---
 
                 if time_debug:
                     torch.cuda.synchronize()
@@ -1301,6 +1299,315 @@ def train_moco(
         print(f"EXC -> Eccezione in MoCo train: {e}", flush=True)
 
     print(f"OK -> training MoCo finito, LOSS (InfoNCE): {best_loss_moco}", flush=True)
+    
+    return "TERMINATO -> MoCo training finito"
+
+
+@handler()
+def train_moco_2D(
+    epochs: int = 200,
+    batch_size: int = 16,
+    lr: float = 0.03,
+    weight_decay: float = 1e-4,
+    momentum: float = 0.9,
+    patch_size: int = 256,
+    n_images1: int = 4, n_channels1: int = 2,       # sar
+    n_images2: int = 4, n_channels2: int = 10,      # ottico
+    moco_dim: int = 128,
+    moco_k: int = 1024,
+    moco_m: float = 0.999,
+    moco_t: float = 0.07,
+    symmetric: bool = False,
+    workers: int = 0,
+    job_name: str = "nome_job",
+    dataset: str = "Test",
+    weights_encoder_sar: str = "train_sar_1D_v1_Standard_200",
+    weights_encoder_opt: str = "train_opt_1D_v1_Standard_200",
+    patience: int = 20,
+    hidden_channels_dim: int = 64,
+    simple_proj: bool = True,
+    attn: bool = False,
+    min_delta: float = 1e-4,
+    resume: bool = False,  
+    time_debug: bool = False
+):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device, "\n", flush=True)
+
+    n_gpus = torch.cuda.device_count()
+    print(f"GPU: {n_gpus}", flush=True)
+
+    torch.backends.cudnn.benchmark = True
+
+    project_work = dh.get_project("floods")
+    project_data = dh.get_project("datasets")
+
+    sar_zip_map = {}
+    opt_zip_map = {}
+    train_data_SAR_IDS = []
+    train_data_OPT_IDS = []
+
+    print(f"Download dataset: {dataset}", flush=True)
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}_crop_norm").download("/data/dataset_floods")
+    print("OK -> Download terminato")
+
+    try:
+        os.makedirs("/data/cache_SAR", exist_ok=True)
+        part_files = sorted(glob(os.path.join(dataset_path, "SAR", "part*.zip")))
+        if part_files:
+            for part_path in part_files:
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    z.extractall("/data/cache_SAR")
+            train_data_SAR_IDS = [f[:-4] for f in os.listdir("/data/cache_SAR") if f.endswith('.npy')]
+            print(f"OK -> SAR caricato: {len(train_data_SAR_IDS)} serie", flush=True)
+    except Exception as e:
+        print(f"EXC -> caricamento SAR: {e}", flush=True)
+
+
+    try:
+        os.makedirs("/data/cache_OPT", exist_ok=True)
+        part_files = sorted(glob(os.path.join(dataset_path, "OPT", "part*.zip")))
+        if part_files:
+            for part_path in part_files:
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    z.extractall("/data/cache_OPT")
+            train_data_OPT_IDS = [f[:-4] for f in os.listdir("/data/cache_OPT") if f.endswith('.npy')]
+            print(f"OK -> OPT caricato: {len(train_data_OPT_IDS)} serie", flush=True)
+    except Exception as e:
+        print(f"EXC -> caricamento OPT: {e}", flush=True)
+
+    # ordinamento, nel 80% train devo avere stesse serie SAR e OPT
+    train_data_IDS = sorted(set(train_data_SAR_IDS) & set(train_data_OPT_IDS))
+    print(f"{len(train_data_IDS)} serie complete SAR e OPT", flush=True)
+
+    # split 80/20
+    random.seed(42)
+    shuffled_ids = train_data_IDS.copy()
+    random.shuffle(shuffled_ids)
+    split_idx = int(len(shuffled_ids) * 0.8)
+    train_ids = shuffled_ids[:split_idx]
+    held_out_ids = shuffled_ids[split_idx:]
+    print(f"{len(train_ids)} serie dataset train (80%)", flush=True)
+    print(f"{len(held_out_ids)} serie dataset test (20%)", flush=True)
+
+
+    # salvataggio log liste train e test
+    with open(f'train_ids_{job_name}_{dataset}_{epochs}.json', 'w') as f:
+        json.dump(train_ids, f)
+    try:
+        project_work.log_artifact(name=f"moco-train-ids_{job_name}_{dataset}_{epochs}", source=f'train_ids_{job_name}_{dataset}_{epochs}.json', kind='artifact')
+    except Exception as e:
+        print(f"EXC -> upload train ids fallito: {e}", flush=True)
+
+    with open(f'test_ids_{job_name}_{dataset}_{epochs}.json', 'w') as f:
+        json.dump(held_out_ids, f)
+    try:
+        project_work.log_artifact(name=f"moco-test-ids_{job_name}_{dataset}_{epochs}", source=f'test_ids_{job_name}_{dataset}_{epochs}.json', kind='artifact')
+    except Exception as e:
+        print(f"EXC -> upload held-out ids fallito: {e}", flush=True)
+
+    # caricamento pesi encoders
+    print("Caricamento pesi Encoders", flush=True)
+    path_s1 = project_work.get_artifact(f"encoder-s1-weights_{weights_encoder_sar}").download(f"modelS1_best_{weights_encoder_sar}.pth")
+    path_s2 = project_work.get_artifact(f"encoder-s2-weights_{weights_encoder_opt}").download(f"modelS2_best_{weights_encoder_opt}.pth")
+
+    modelS1 = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=attn).to(device)
+    modelS1.load_state_dict(torch.load(path_s1, map_location=device))
+
+    modelS2 = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=attn).to(device)
+    modelS2.load_state_dict(torch.load(path_s2, map_location=device))
+    print("OK -> Pesi Encoders caricati", flush=True)
+
+    model = MoCo2encoders_2d(
+        base_encoder_q=modelS2.encoder,
+        base_encoder_k=modelS1.encoder,
+        dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+        symmetric=symmetric, device=device,
+        hidden_channels_dim=hidden_channels_dim,
+        simple_proj=simple_proj,
+        attn=attn
+    ).to(device)
+
+    results = {'lr': [], 'train_loss': []}
+    best_loss = float('inf')
+    epochs_no_improve = 0
+    start_epoch = 1
+    queue_restored = False
+
+    if resume:
+        try:
+            w_path = project_work.get_artifact(f"moco-weights_{job_name}_{dataset}_{epochs}").download("/data")
+            state_dict = torch.load(w_path, map_location=device)
+            model.load_state_dict(state_dict)
+            queue_restored = True
+            print("OK -> pesi MoCo caricati", flush=True)
+        except Exception as e:
+            print(f"EXC -> nessun peso MoCo trovato, inizializzazione 0: {e}", flush=True)
+
+        try:
+            m_path = project_work.get_artifact(f"moco-metrics_{job_name}_{dataset}_{epochs}").download("/data")
+            prev_df = pd.read_csv(m_path)
+            best_loss = prev_df['train_loss'].min()
+            results = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
+            start_epoch = len(prev_df) + 1
+            print(f"OK -> metriche MoCo caricate, best_loss={best_loss}, riparto da epoca {start_epoch}", flush=True)
+        except Exception as e:
+            print(f"EXC -> nessuna metrica MoCo trovata: {e}", flush=True)
+
+    optimizer = torch.optim.SGD(model.parameters(), lr, momentum=momentum, weight_decay=weight_decay)
+    scaler = torch.cuda.amp.GradScaler()
+
+    try:
+        train_dataset = MoCo2encodersLoader(
+            listIDs=train_ids,
+            sar_map=sar_zip_map,
+            opt_map=opt_zip_map,
+            transform=None,
+            patch_size=patch_size,
+            n_images1=n_images1, n_channels1=n_channels1,
+            n_images2=n_images2, n_channels2=n_channels2,
+        )
+    except Exception as e:
+        print(f"EXC -> Eccezione MoCo2encodersLoader: {e}", flush=True)
+
+    try:
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=workers, pin_memory=True, drop_last=True,
+        )
+    except Exception as e:
+        print(f"EXC -> Eccezione DataLoader: {e}", flush=True)
+
+    try:
+        for epoch in range(start_epoch, epochs + 1):  
+            model.train()
+            model.encoder_q.eval()
+            model.encoder_k.eval()
+
+            total_loss, total_num, train_bar = 0.0, 0, tqdm(train_loader)
+
+            if time_debug:
+                t_prev = time.time()
+
+            for im_q, im_k in train_bar:
+                if time_debug:
+                    torch.cuda.synchronize()
+                    t_data = time.time()
+
+                im_q = im_q.to(non_blocking=True, device=device)
+                im_k = im_k.to(non_blocking=True, device=device)
+
+                if epoch == start_epoch and total_num == 0:  
+                    
+                    print(f"INPUT im_q (SAR) - min: {im_q.min().item():.4f}, max: {im_q.max().item():.4f}, std: {im_q.float().std().item():.4f}", flush=True)
+                    print(f"INPUT im_k (OPT) - min: {im_k.min().item():.4f}, max: {im_k.max().item():.4f}, std: {im_k.float().std().item():.4f}", flush=True)
+                    
+                    with torch.no_grad():
+                        out_q = model.encoder_q(im_q)
+                        out_k = model.encoder_k(im_k)
+                        
+                    print(f"ENCODER q_out - std: {out_q.std().item():.6f}, val unici: {len(torch.unique(out_q))}", flush=True)
+                    print(f"ENCODER k_out - std: {out_k.std().item():.6f}, val unici: {len(torch.unique(out_k))}", flush=True)
+
+                if time_debug:
+                    torch.cuda.synchronize()
+                    t_transfer = time.time()
+
+                with torch.cuda.amp.autocast():
+                    loss = model(im_q, im_k)
+
+                if time_debug:
+                    torch.cuda.synchronize()
+                    t_forward = time.time()    
+
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                if time_debug:
+                    torch.cuda.synchronize()
+                    t_backward = time.time()
+                    print(f"dati: {t_data-t_prev:.3f}s | trasferimento: {t_transfer-t_data:.3f}s | "
+                        f"forward: {t_forward-t_transfer:.3f}s | backward: {t_backward-t_forward:.3f}s", flush=True)
+                    t_prev = time.time()
+
+                total_num += batch_size
+                total_loss += loss.item() * batch_size
+                train_bar.set_description(f'MoCo Epoch: [{epoch}/{epochs}], Loss: {loss.item():.4f}')
+
+            epoch_loss = total_loss / total_num
+            results['lr'].append(optimizer.param_groups[0]['lr'])
+            results['train_loss'].append(epoch_loss)
+
+            pd.DataFrame(results).to_csv(f'log_moco_{job_name}_{dataset}_{epochs}.csv', index_label='epoch')
+
+            try:
+                project_work.log_artifact(name=f"moco-metrics_{job_name}_{dataset}_{epochs}", source=f'log_moco_{job_name}_{dataset}_{epochs}.csv', kind='artifact')
+                print(f"OK -> metriche salvate", flush=True)
+            except Exception as e:
+                print(f"EXC -> upload metriche MoCo: {e}", flush=True)
+
+            skip_first_epoch = (epoch == start_epoch) and (not queue_restored)
+
+            if skip_first_epoch:
+                torch.save(model.state_dict(), f'moco_best_{job_name}_{dataset}_{epochs}.pth')
+
+                try:
+                    dh.refresh_token()
+                    print("OK -> refresh token")
+                except Exception as e:
+                    print(f"EXC -> refresh token: {e}", flush=True)
+
+                try:
+                    project_work = dh.get_project("floods")
+                    print("OK -> get project")
+                except Exception as e:
+                    print(f"EXC -> get project: {e}", flush=True)
+
+                try:
+                    project_work.log_artifact(name=f"moco-weights_{job_name}_{dataset}_{epochs}", source=f'moco_best_{job_name}_{dataset}_{epochs}.pth', kind='artifact')
+                    print(f"OK -> pesi salvati", flush=True)
+                except Exception as e:
+                    print(f"EXC -> upload pesi MoCo: {e}", flush=True)
+
+            elif epoch_loss < best_loss - min_delta:
+                torch.save(model.state_dict(), f'moco_best_{job_name}_{dataset}_{epochs}.pth')
+                best_loss = epoch_loss
+                epochs_no_improve = 0
+                print(f"best loss epoch {epoch} (new): {best_loss}", flush=True)
+
+                # evitare scadenza token auth
+                try:
+                    dh.refresh_token()
+                    print("OK -> refresh token")
+                except Exception as e:
+                    print(f"EXC -> refresh token: {e}", flush=True)
+
+                try:
+                    project_work = dh.get_project("floods")
+                    print("OK -> get project")
+                except Exception as e:
+                    print(f"EXC -> get project: {e}", flush=True)
+
+                try:
+                    project_work.log_artifact(name=f"moco-weights_{job_name}_{dataset}_{epochs}", source=f'moco_best_{job_name}_{dataset}_{epochs}.pth', kind='artifact')
+                    print(f"OK -> pesi salvati", flush=True)
+                except Exception as e:
+                    print(f"EXC -> upload pesi MoCo: {e}", flush=True)
+
+            else:
+                epochs_no_improve += 1
+                print(f"best loss epoch {epoch} (old): {best_loss}", flush=True)
+
+                if epochs_no_improve >= patience:
+                    print(f"Early Stopping MoCo: epoch {epoch}, best loss: {best_loss}")
+                    break
+
+    except Exception as e:
+        print(f"EXC -> Eccezione in MoCo train: {e}", flush=True)
+
+    print(f"OK -> training MoCo finito, LOSS (InfoNCE): {best_loss}", flush=True)
     
     return "TERMINATO -> MoCo training finito"
 
@@ -1559,6 +1866,7 @@ def test_encoders_visual(
     weights_s2: str = "weights_s2",
     n_samples: int = 10,
     job_name: str = "nome",
+    ltae: bool = False,
     monodimensional: bool = False,
     recon_channels: list | None = None,
     save_dir: str = "/data/debug_recon",
@@ -1581,10 +1889,10 @@ def test_encoders_visual(
     
  
     print(f"Download: {dataset}", flush=True)
-    dataset_path = project_data.get_artifact(f"Floods_{dataset}_crop_norm").download("/data/dataset_floods")
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
     print("OK -> Download terminato", flush=True)
 
-    save_dir = save_dir + {"_"} + job_name
+    save_dir = save_dir + "_" + job_name
     os.makedirs(save_dir, exist_ok=True)
 
 
@@ -1626,8 +1934,13 @@ def test_encoders_visual(
             s1_path = None
  
         if s1_path:
-            modelS1 = Singlemodal_CAE(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, mamba=mamba).to(device)
- 
+            if monodimensional:
+                modelS1 = Singlemodal_CAE(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, mamba=mamba).to(device)
+
+            else:
+                modelS1 = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, n_head=8, d_k=8, ltae=ltae).to(device)
+
+
             state_dict = torch.load(s1_path, map_location=device)
             if all(k.startswith('module.') for k in state_dict.keys()):
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
@@ -1653,9 +1966,9 @@ def test_encoders_visual(
                             print(f"EXC -> nome encoder s1: {e}", flush=True)
                             break    
  
-                    vector = latent_vector.cpu().numpy().flatten()
-                    print(f"ID {i}: {random_sar_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
-                    print(f"VEC: {np.round(vector, 4)}\n", flush=True)
+                        vector = latent_vector.cpu().numpy().flatten()
+                        print(f"ID {i}: {random_sar_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
+                        print(f"VEC: {np.round(vector, 4)}\n", flush=True)
  
                     save_reconstruction_pngs(
                         modelS1, im, save_dir=save_dir,
@@ -1674,7 +1987,12 @@ def test_encoders_visual(
             s2_path = None
  
         if s2_path:
-            modelS2 = Singlemodal_CAE(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, mamba=mamba).to(device)
+
+            if monodimensional:
+                modelS2 = Singlemodal_CAE(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, mamba=mamba).to(device)
+
+            else:
+                modelS2 = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, n_head=8, d_k=8, ltae=ltae).to(device)    
  
             state_dict = torch.load(s2_path, map_location=device)
             if all(k.startswith('module.') for k in state_dict.keys()):
@@ -1701,9 +2019,9 @@ def test_encoders_visual(
                             print(f"EXC -> nome encoder s2: {e}", flush=True)
                             break
  
-                    vector = latent_vector.cpu().numpy().flatten()
-                    print(f"ID {i}: {random_opt_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
-                    print(f"VEC: {np.round(vector, 4)}\n", flush=True)
+                        vector = latent_vector.cpu().numpy().flatten()
+                        print(f"ID {i}: {random_opt_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
+                        print(f"VEC: {np.round(vector, 4)}\n", flush=True)
  
                     save_reconstruction_pngs(
                         modelS2, im, save_dir=save_dir,
