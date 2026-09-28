@@ -181,6 +181,7 @@ class MoCo2encodersLoader(Dataset):
         for ID in self.listIDs:
             save_path = os.path.join(self.cache_dir_sar, f"{ID}.npy")
             if not os.path.exists(save_path):
+                print(f"MCL sar -> {ID}")
                 im = self._load_and_process(ID, self.sar_map, 'SAR', self.n_images1, self.n_channels1)
                 np.save(save_path, im)
         print("Precalcolo SAR completato", flush=True)
@@ -194,6 +195,7 @@ class MoCo2encodersLoader(Dataset):
         for ID in self.listIDs:
             save_path = os.path.join(self.cache_dir_opt, f"{ID}.npy")
             if not os.path.exists(save_path):
+                print(f"MCL opt -> {ID}")
                 im = self._load_and_process(ID, self.opt_map, 'OPT', self.n_images2, self.n_channels2)
                 np.save(save_path, im)
         print("Precalcolo OPT completato", flush=True)

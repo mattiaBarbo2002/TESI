@@ -21,4 +21,15 @@ PESI
     pesi vect -> [-0.0156, +0.0156]
 
 
+moco_Floods_Standard_moco_2D_convLstm_net_v4_200
+
+encoders-Floods_train_sar_2D_convLstm_v1_Standard_200
+encoders-Floods_train_opt_2D_convLstm_v1_Standard_200
+
+encoders-Floods_train_sar_1D_v1_Standard_200
+encoders-Floods_train_opt_1D_v1_Standard_200
+
+
+
+
 

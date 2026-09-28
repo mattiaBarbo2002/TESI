@@ -1444,8 +1444,8 @@ def train_moco_2D(
 
     # caricamento pesi encoders
     try:
-        path_sar = project_work.get_artifact(f"autoencoder2D_SAR_weights_{weights_encoder_sar}").download(f"autoencoder2D_SAR_model_best_{weights_encoder_sar}.pth")
-        path_opt = project_work.get_artifact(f"autoencoder2D_OPT_weights_{weights_encoder_opt}").download(f"autoencoder2D_OPT_model_best_{weights_encoder_opt}.pth")
+        path_sar = project_work.get_artifact(f"encoder-s1-weights_{weights_encoder_sar}").download(f"modelS1_best_{weights_encoder_sar}.pth")
+        path_opt = project_work.get_artifact(f"encoder-s2-weights_{weights_encoder_opt}").download(f"modelS2_best_{weights_encoder_opt}.pth")
 
         modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=attn).to(device)
         modelSAR.load_state_dict(torch.load(path_sar, map_location=device))
@@ -1481,7 +1481,7 @@ def train_moco_2D(
     # resume = True -> carico pesi vecchi di moco e coda già inzializzata
     if resume:
         try:
-            w_path = project_work.get_artifact(f"moco2D_weights_{job_name}").download("/data")
+            w_path = project_work.get_artifact(f"moco-weights_{job_name}_{dataset}_{epochs}").download("/data")
             state_dict = torch.load(w_path, map_location=device)
             model.load_state_dict(state_dict)
             queue_restored = True
@@ -1490,7 +1490,7 @@ def train_moco_2D(
             print(f"EXC -> no pesi MoCo vecchi, inizializzazione casuale: {e}", flush=True)
  
         try:
-            m_path = project_work.get_artifact(f"moco2D_metrics_{job_name}").download("/data")
+            m_path = project_work.get_artifact(f"moco-metrics_{job_name}_{dataset}_{epochs}").download("/data")
             prev_df = pd.read_csv(m_path)
             best_loss = prev_df['train_loss'].min()
             results = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
