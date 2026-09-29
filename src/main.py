@@ -17,7 +17,11 @@ import json
 import time
 import zipfile
 import torchvision.transforms as transforms
+import math
 import re
+import xarray as xr
+import zarr
+import tarfile
 from glob import glob
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
@@ -850,9 +854,12 @@ def train_moco_2D(
     hidden_channels_dim: int = 64,
     simple_proj: bool = True,
     attn: bool = False,
+    pool_grid: int = 1,
     resume: bool = True,  
+    lr_min: float = 0.0003,   
+    cosine: bool = False,    
     time_debug: bool = False,
-
+ 
     epochs: int = 200,
     batch_size: int = 16,
     lr: float = 0.03,
@@ -875,7 +882,7 @@ def train_moco_2D(
     print('Using device:', device, "\n", flush=True)
   
     torch.backends.cudnn.benchmark = True
-
+ 
     # progetti digital hub
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
@@ -923,11 +930,11 @@ def train_moco_2D(
     random.seed(42)
     shuffled_ids = train_data_IDS.copy()
     random.shuffle(shuffled_ids)
-
+ 
     split_idx = int(len(shuffled_ids) * 0.8)
     train_ids = shuffled_ids[:split_idx]
     test_ids = shuffled_ids[split_idx:]
-
+ 
     print(f"serie train 80%: {len(train_ids)}", flush=True)
     print(f"serie train 20%: {len(test_ids)} ", "\n", flush=True)
  
@@ -939,29 +946,29 @@ def train_moco_2D(
         project_work.log_artifact(name=f"moco_2D_trainIdsList_{job_name}", source=f'train_ids_{job_name}.json', kind='artifact')
     except Exception as e:
         print(f"EXC -> upload train_ids: {e}", flush=True)
-
+ 
     with open(f'test_ids_{job_name}.json', 'w') as f:
         json.dump(test_ids, f)
     try:
         project_work.log_artifact(name=f"moco_2D_testIdsList_{job_name}", source=f'test_ids_{job_name}.json', kind='artifact')
     except Exception as e:
         print(f"EXC -> upload test: {e}", flush=True)
-
+ 
     # caricamento pesi encoders
     try:
         path_sar = project_work.get_artifact(weights_encoder_sar).download(f"{weights_encoder_sar}.pth")
         path_opt = project_work.get_artifact(weights_encoder_opt).download(f"{weights_encoder_opt}.pth")
-
+ 
         modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=attn).to(device)
         modelSAR.load_state_dict(torch.load(path_sar, map_location=device))
-
+ 
         modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=attn).to(device)
         modelOPT.load_state_dict(torch.load(path_opt, map_location=device))
         print(f"OK -> Pesi encoders caricati: {weights_encoder_sar}, {weights_encoder_opt}", "\n", flush=True)
     except Exception as e:
         print(f"EXC -> upload pesi encoders: {e}", "\n", flush=True)  
-
-
+ 
+ 
     # TRAINING MOCO 2D
     
     print("--- Training MoCo 2D ---")
@@ -971,6 +978,7 @@ def train_moco_2D(
         dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
         symmetric=symmetric, device=device,
         hidden_channels_dim=hidden_channels_dim,
+        pool_grid=pool_grid,
         simple_proj=simple_proj,
         attn=attn
     ).to(device)
@@ -978,11 +986,11 @@ def train_moco_2D(
     results = {'lr': [], 'train_loss': []}
     best_loss = float('inf')
     epochs_no_improve = 0
-
+ 
     # variabili per caricamento pesi
     start_epoch = 1
     queue_restored = False
-
+ 
     # resume = True -> carico pesi vecchi di moco e coda già inzializzata
     if resume:
         try:
@@ -999,12 +1007,12 @@ def train_moco_2D(
             prev_df = pd.read_csv(m_path)
             best_loss = prev_df['train_loss'].min()
             results = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
-
+ 
             # se carico pesi conteggio riparte da ultima epoca, best loss esclude riga 0 del csv
             start_epoch = len(prev_df) + 1
             valid_losses = prev_df['train_loss'].iloc[1:]
             best_loss = valid_losses.min() if len(valid_losses) > 0 else float('inf')
-
+ 
             print(f"OK -> metriche MoCo caricate, best_loss={best_loss}", flush=True)
         except Exception as e:
             print(f"EXC -> nessuna metrica MoCo trovata: {e}", flush=True)
@@ -1016,8 +1024,9 @@ def train_moco_2D(
     # lr parte da 0 e poi si stabilizza al valore fissato
     # con batch size = 16 e coda (moco_k) = 4096, la coda si riempie con 256 batch
     # una epoca contiene 1243 batch
-
+ 
     epoch_lenght = None
+    steps_total = None   # NUOVO: step totali del run, serve al coseno
     base_lr = lr
     batch_step = 0
  
@@ -1040,10 +1049,13 @@ def train_moco_2D(
             num_workers=workers, pin_memory=True, drop_last=True,
         )
         # quanti batch stanno in un epoca, per Standard e barch size 16 = 1243
+        # quanti run farebbero se tutte le epoche vengono eseguite, no early stopping
         epoch_lenght = len(train_loader) if not queue_restored else None 
+        steps_total = (epochs - start_epoch + 1) * len(train_loader)
+
     except Exception as e:
         print(f"EXC -> DataLoader: {e}", flush=True)
-
+ 
     # libreria time utilizzata per debug, tempo training
     try:
         for epoch in range(start_epoch, epochs + 1):  
@@ -1057,12 +1069,20 @@ def train_moco_2D(
                 t_prev = time.time()
  
             for im_q, im_k in train_bar:
-
+ 
                 # lr sale da 0 a lr incrementalmente ad ogni batch della prima epoca
                 # quindi da 0 a 1243, da 1244 lr diventa il paramentro passato nel notebook
-
+                # cosine = True, dopo 1244 lr scende a coseno da lr a lr_min
+                # cosine = False, lr rimane parametro passato al notebook
+ 
                 if epoch_lenght is not None and batch_step < epoch_lenght:
                     batch_lr = base_lr * (batch_step + 1) / epoch_lenght
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = batch_lr
+                elif cosine and steps_total is not None:
+                    w = epoch_lenght or 0
+                    progress = (batch_step - w) / max(1, steps_total - w)
+                    batch_lr = lr_min + 0.5 * (base_lr - lr_min) * (1 + math.cos(math.pi * progress))
                     for pg in optimizer.param_groups:
                         pg['lr'] = batch_lr
                 batch_step += 1
@@ -1107,20 +1127,20 @@ def train_moco_2D(
  
             # loss migliorata -> salva metriche e pesi
             pd.DataFrame(results).to_csv(f'moco_2D_log_{job_name}.csv', index_label='epoch')
-
+ 
             # refresh token e progetto
             try:
                 dh.refresh_token()
                 print("OK -> refresh token", flush=True)
             except Exception as e:
                 print(f"EXC -> refresh token: {e}", flush=True)
-
+ 
             try:
                 project_work = dh.get_project("floods")
                 print("OK -> get project\n", flush=True)
             except Exception as e:
                 print(f"EXC -> get project: {e}", "\n", flush=True)            
-
+ 
             try:
                 project_work.log_artifact(name=f"moco_2D_metrics_{job_name}", source=f'moco_2D_log_{job_name}.csv', kind='artifact')
                 print(f"OK -> metriche MoCo salvate", flush=True)
@@ -1170,6 +1190,7 @@ def train_moco_2D(
     return "TERMINATO -> training moco 2D"
 
 
+
 @handler()
 def rename_artifact(
     old_metrics: str = "old_metrics",
@@ -1191,7 +1212,7 @@ def rename_artifact(
 
 @handler()
 def eval_moco_retrieval(
-    job_name: str = "nome_job",          
+    job_name: str = "nome_job",         
     dataset: str = "Standard",
     simple_proj: bool = False,           
     attn: bool = False,                  
@@ -1201,9 +1222,9 @@ def eval_moco_retrieval(
     moco_m: float = 0.999,
     moco_t: float = 0.07,
     patch_size: int = 256,
-    n_images1: int = 4, n_channels1: int = 2,       # sar
-    n_images2: int = 4, n_channels2: int = 10,      # ottico
-    max_series: int = 0,                 
+    pool_grid: int = 1,
+    n_images1: int = 4, n_channels1: int = 2,
+    n_images2: int = 4, n_channels2: int = 10,     
     tile_size_m: float = 2560.0,         
     batch_size: int = 32,
     workers: int = 0,
@@ -1214,19 +1235,14 @@ def eval_moco_retrieval(
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
  
+ 
     try:
         ids_path = project_work.get_artifact(f"moco_2D_testIdsList_{job_name}").download("/data/eval_test_ids.json", overwrite=True)
         with open(ids_path, 'r') as f:
             eval_ids = json.load(f)
-        print(f"OK -> {len(eval_ids)} serie held-out caricate", flush=True)
+        print(f"OK -> {len(eval_ids)} serie testIdsList caricate", flush=True)
     except Exception as e:
-        print(f"EXC -> caricamento lista held-out: {e}", flush=True)
-        return "TERMINATO -> lista held-out non trovata"
- 
-    if max_series > 0 and len(eval_ids) > max_series:
-        random.seed(0)
-        eval_ids = random.sample(eval_ids, max_series)
-        print(f"sottocampionate a {len(eval_ids)} serie", flush=True)
+        print(f"EXC -> caricamento lista testIdsList: {e}", flush=True) 
  
     print(f"Download dataset: {dataset}", flush=True)
     dataset_path = project_data.get_artifact(f"Floods_{dataset}_crop_norm").download("/data/dataset_floods")
@@ -1241,15 +1257,13 @@ def eval_moco_retrieval(
                 for name in z.namelist():
                     if name in needed:
                         z.extract(name, cache_dir)
-            os.remove(part_path)  
-        print(f"OK -> {modality}: serie held-out estratte da {len(part_files)} parti", flush=True)
+            os.remove(part_path) 
+        print(f"OK -> {modality}: serie testIdsList estratte", flush=True)
  
     eval_ids = [ID for ID in eval_ids
                 if os.path.exists(f"/data/cache_SAR/{ID}.npy") and os.path.exists(f"/data/cache_OPT/{ID}.npy")]
     N = len(eval_ids)
-    print(f"{N} serie disponibili in entrambe le modalita'", flush=True)
-    if N < 10:
-        return "TERMINATO -> troppe poche serie per il retrieval"
+    print(f"{N} serie disponibili sar-opt", flush=True)
  
     try:
         encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=attn).to(device)
@@ -1262,6 +1276,7 @@ def eval_moco_retrieval(
             symmetric=False, device=device,
             hidden_channels_dim=hidden_channels_dim,
             simple_proj=simple_proj,
+            pool_grid=pool_grid,
             attn=attn
         ).to(device)
  
@@ -1270,10 +1285,9 @@ def eval_moco_retrieval(
         state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
         model.load_state_dict(state_dict)
         model.eval()
-        print("OK -> modello MoCo caricato", flush=True)
+        print("OK -> pesi MoCo caricato", flush=True)
     except Exception as e:
-        print(f"EXC -> caricamento modello MoCo: {e}", flush=True)
-        return "TERMINATO -> modello MoCo non caricato"
+        print(f"EXC -> caricamento pesi MoCo: {e}", flush=True)
  
     eval_dataset = MoCo2encodersLoader(
         listIDs=eval_ids, sar_map={}, opt_map={}, transform=None,
@@ -1289,68 +1303,37 @@ def eval_moco_retrieval(
             im_q = im_q.to(device)
             im_k = im_k.to(device)
  
-            q = model.encoder_q(im_q)
-            if simple_proj:
-                q = model.pool_q(q).flatten(1)
-            else:
-                q = model.conv_q(q)
-                if attn:
-                    q_scores = model.attn_q(q).flatten(2).softmax(dim=-1)
-                    q = torch.einsum('bcn,bkn->bck', q.flatten(2), q_scores).squeeze(-1)
-                else:
-                    q = model.pool_q(q).flatten(1)
-            q = nn.functional.normalize(model.proj_q(q).float(), dim=1)
+            _, q, k = model.contrastive_loss(im_q, im_k)
  
-            k = model.encoder_k(im_k)
-            if simple_proj:
-                k = model.pool_k(k).flatten(1)
-            else:
-                k = model.conv_k(k)
-                if attn:
-                    k_scores = model.attn_k(k).flatten(2).softmax(dim=-1)
-                    k = torch.einsum('bcn,bkn->bck', k.flatten(2), k_scores).squeeze(-1)
-                else:
-                    k = model.pool_k(k).flatten(1)
-            k = nn.functional.normalize(model.proj_k(k).float(), dim=1)
+            all_q.append(q.float().cpu())
+            all_k.append(k.float().cpu())
  
-            all_q.append(q.cpu())
-            all_k.append(k.cpu())
+    Q = torch.cat(all_q).to(device)   
+    K = torch.cat(all_k).to(device)    
  
-    Q = torch.cat(all_q).to(device)    
-    K = torch.cat(all_k).to(device)   
  
     S = Q @ K.T
-    diag = S.diag().unsqueeze(1)                 
- 
+    diag = S.diag().unsqueeze(1)               
+    
     rank_opt2sar = (S >= diag).sum(dim=1)        
-    rank_sar2opt = (S >= diag.T).sum(dim=0)      
  
+    r = rank_opt2sar.float()
     results = {
         "job_name": job_name,
         "n_series": N,
         "sim_media_coppie_giuste": diag.mean().item(),
         "sim_media_tutte_le_coppie": S.mean().item(),
-        "chance_top1": 1.0 / N,
-        "chance_top5": 5.0 / N,
-        "chance_top10": 10.0 / N,
-        "chance_median_rank": (N + 1) / 2,
-    }
- 
-    print("\n" + "=" * 50, flush=True)
-    print(f"RETRIEVAL su {N} serie held-out", flush=True)
-    print(f"sim media coppie giuste: {results['sim_media_coppie_giuste']:.4f} | sim media tutte le coppie: {results['sim_media_tutte_le_coppie']:.4f}", flush=True)
-    print(f"caso random -> top1: {100 * results['chance_top1']:.3f}% | top5: {100 * results['chance_top5']:.3f}% | top10: {100 * results['chance_top10']:.3f}% | median rank: {results['chance_median_rank']:.0f}", flush=True)
- 
-    for name, rank in [("OPT->SAR", rank_opt2sar), ("SAR->OPT", rank_sar2opt)]:
-        r = rank.float()
-        results[name] = {
+        "globale": {
             "top1": (r <= 1).float().mean().item(),
             "top5": (r <= 5).float().mean().item(),
             "top10": (r <= 10).float().mean().item(),
-            "median_rank": r.median().item(),
-        }
-        print(f"{name} -> top1: {100 * results[name]['top1']:.2f}% | top5: {100 * results[name]['top5']:.2f}% | top10: {100 * results[name]['top10']:.2f}% | median rank: {results[name]['median_rank']:.0f}", flush=True)
-    print("=" * 50 + "\n", flush=True)
+            "chance_top1": 1.0 / N,
+            "chance_top5": 5.0 / N,
+            "chance_top10": 10.0 / N,
+            "chance_median_rank": (N + 1) / 2,
+        },
+    }
+ 
  
     id_pattern = re.compile(r"^(?P<event>.+)_(?P<zone>\d{1,2})[A-Z]{3}_x(?P<x>-?\d+)_y(?P<y>-?\d+)$")
     xs, ys, gids, group_map, n_unparsed = [], [], [], {}, 0
@@ -1361,104 +1344,627 @@ def eval_moco_retrieval(
             n_unparsed += 1
             xs.append(0.0)
             ys.append(0.0)
-            gids.append(-n_unparsed)     
+            gids.append(-n_unparsed)   
             ev_ids.append(-n_unparsed)
             continue
-        
+       
         key = f"{m.group('event')}_{m.group('zone')}"
         gids.append(group_map.setdefault(key, len(group_map)))
-        
+       
         ev_ids.append(event_map.setdefault(m.group('event'), len(event_map)))
         xs.append(float(m.group('x')))
         ys.append(float(m.group('y')))
  
-    print(f"ANALISI SPAZIALE: {N - n_unparsed}/{N} ID con coordinate, {len(event_map)} eventi (attivazione+AOI), {len(group_map)} gruppi evento/zona", flush=True)
+    parsed_ok = n_unparsed <= N // 2
  
-    if n_unparsed > N // 2:
-        print("EXC -> troppi ID senza coordinate nel formato atteso, analisi spaziale saltata", flush=True)
+    ingroup = None
+    if parsed_ok:
+        gid_ev = torch.tensor(ev_ids, device=device)
+        same = gid_ev[:, None] == gid_ev[None, :]           
+        n_g = same.sum(dim=1)                               
+        ok = n_g >= 2                                       
+        rank_g = ((S >= diag) & same).sum(dim=1)[ok].float()   
+        n = n_g[ok].float()
+        ingroup = {
+            "n_serie": ok.sum().item(),
+            "dimensione_gruppo_mediana": n.median().item(),
+            "dimensione_gruppo_max": n.max().item(),
+            "top1": (rank_g <= 1).float().mean().item(),
+            "top5": (rank_g <= 5).float().mean().item(),
+            "top10": (rank_g <= 10).float().mean().item(),
+        
+            "chance_top1": (1.0 / n).mean().item(),
+            "chance_top5": (torch.clamp(n, max=5) / n).mean().item(),
+            "chance_top10": (torch.clamp(n, max=10) / n).mean().item(),
+            "rank_normalizzato_mediano": ((rank_g - 1) / (n - 1)).median().item(),  
+        }
+        results["gruppo"] = ingroup
+ 
+ 
+    g = results["globale"]
+    W = 42
+    print(f"mean cosine sim positive: {results['sim_media_coppie_giuste']:.4f} | mean cosine sim all: {results['sim_media_tutte_le_coppie']:.4f}", flush=True)
+    print(f"{'':{W}s}{'top1':>9s}{'top5':>9s}{'top10':>9s}", flush=True)
+    print(f"{f'global':{W}s}{100 * g['top1']:8.2f}%{100 * g['top5']:8.2f}%{100 * g['top10']:8.2f}%", flush=True)
+    print(f"{'random':{W}s}{100 * g['chance_top1']:8.3f}%{100 * g['chance_top5']:8.3f}%{100 * g['chance_top10']:8.3f}%", flush=True)
+    if ingroup is not None:
+        label = f"local"
+        print(f"{label:{W}s}{100 * ingroup['top1']:8.2f}%{100 * ingroup['top5']:8.2f}%{100 * ingroup['top10']:8.2f}%", flush=True)
+        print(f"{'random':{W}s}{100 * ingroup['chance_top1']:8.3f}%{100 * ingroup['chance_top5']:8.3f}%{100 * ingroup['chance_top10']:8.3f}%", flush=True)
+    print("=" * 69 + "\n", flush=True)
+ 
+    if not parsed_ok:
+        print("EXC -> troppi ID senza coordinate nel formato atteso, retrieval nel gruppo e analisi spaziale saltati", flush=True)
     else:
         x = torch.tensor(xs, device=device)
         y = torch.tensor(ys, device=device)
         gid = torch.tensor(gids, device=device)             
-        gid_ev = torch.tensor(ev_ids, device=device)        
-        valid = gid >= 0                                    
+        valid = gid >= 0                                  
         idx = torch.arange(N, device=device)
  
-        
         D = torch.sqrt((x[:, None] - x[None, :]) ** 2 + (y[:, None] - y[None, :]) ** 2) / tile_size_m
         D = torch.where(gid[:, None] == gid[None, :], D, torch.full_like(D, float('inf')))
  
-        
         S_wrong = S.clone()
         S_wrong.fill_diagonal_(float('-inf'))
         d_opt2sar = D[idx, S_wrong.argmax(dim=1)][valid]    
-        d_sar2opt = D[S_wrong.argmax(dim=0), idx][valid]    
  
-        
         Dv = D[valid][:, valid]
         d_random = Dv[~torch.eye(Dv.shape[0], dtype=torch.bool, device=device)]
  
         spatial = {}
-        print(f"tile = {tile_size_m:.0f} m | adiacente <=1.5 tile | vicino <=5 tile (~{5 * tile_size_m / 1000:.0f} km) | medio <=20 tile (~{20 * tile_size_m / 1000:.0f} km) | lontano >20 tile", flush=True)
+        print(f"tile = {tile_size_m:.0f} m | <=2 tile (~{2 * tile_size_m / 1000:.0f} km) | <=5 tile (~{5 * tile_size_m / 1000:.0f} km) | <=20 tile (~{20 * tile_size_m / 1000:.0f} km) | >20 tile", flush=True)
         print(f"{'':30s}{'adiacente':>11s}{'vicino':>9s}{'medio':>8s}{'lontano':>9s}{'altro ev.':>11s}{'mediana km':>12s}", flush=True)
-        for key, label, d in [("opt2sar", "OPT->SAR (miglior errore)", d_opt2sar),
-                              ("sar2opt", "SAR->OPT (miglior errore)", d_sar2opt),
-                              ("caso", "caso (coppie a caso)", d_random)]:
+        for key, label, d in [("opt2sar", "opt->sar", d_opt2sar),
+                              ("random", "random", d_random)]:
             finite = torch.isfinite(d)
             spatial[key] = {
-                "adiacente": (d <= 1.5).float().mean().item(),
-                "vicino": ((d > 1.5) & (d <= 5)).float().mean().item(),
+                "adiacente": (d <= 2).float().mean().item(),
+                "vicino": ((d > 2) & (d <= 5)).float().mean().item(),
                 "medio": ((d > 5) & (d <= 20)).float().mean().item(),
                 "lontano": (finite & (d > 20)).float().mean().item(),
                 "altro_evento": (~finite).float().mean().item(),
-                "mediana_km": (d[finite].median() * tile_size_m / 1000).item() if finite.any() else float('nan'),
+ 
             }
-            r = spatial[key]
-            print(f"{label:30s}{100 * r['adiacente']:10.2f}%{100 * r['vicino']:8.2f}%{100 * r['medio']:7.2f}%{100 * r['lontano']:8.2f}%{100 * r['altro_evento']:10.2f}%{r['mediana_km']:12.1f}", flush=True)
+            rr = spatial[key]
+            print(f"{label:30s}{100 * rr['adiacente']:10.2f}%{100 * rr['vicino']:8.2f}%{100 * rr['medio']:7.2f}%{100 * rr['lontano']:8.2f}%{100 * rr['altro_evento']:10.2f}%", flush=True)
  
-        for key in ["opt2sar", "sar2opt"]:
-            enrich = spatial[key]["adiacente"] / max(spatial["caso"]["adiacente"], 1e-9)
-            spatial[key]["adiacenti_vs_caso"] = enrich
-            print(f"{key}: le tile adiacenti sono il miglior errore {enrich:.0f} volte piu' spesso del caso", flush=True)
-        
-        same = gid_ev[:, None] == gid_ev[None, :]           
-        n_g = same.sum(dim=1)                               
-        ok = n_g >= 2                                       
-        rank_g = {
-            "OPT->SAR": ((S >= diag) & same).sum(dim=1),    
-            "SAR->OPT": ((S >= diag.T) & same).sum(dim=0),  
-        }
-        n_ok = ok.sum().item()
-        print(f"\nRETRIEVAL NEL GRUPPO: {n_ok}/{N} serie con almeno un altro candidato nel gruppo | dimensione gruppo mediana {n_g[ok].float().median().item():.0f}, max {n_g[ok].max().item()}", flush=True)
-        ingroup = {"n_serie": n_ok}
-        for name, rank in rank_g.items():
-            r = rank[ok].float()
-            n = n_g[ok].float()
-            ingroup[name] = {
-                "top1": (r <= 1).float().mean().item(),
-                "chance_top1": (1.0 / n).mean().item(),
-                "top5": (r <= 5).float().mean().item(),
-                "chance_top5": (torch.clamp(n, max=5) / n).mean().item(),
-                "rank_normalizzato_mediano": ((r - 1) / (n - 1)).median().item(),   # 0 = sempre prima, ~0.5 = a caso
-            }
-            g = ingroup[name]
-            print(f"{name} -> top1: {100 * g['top1']:.2f}% (caso {100 * g['chance_top1']:.2f}%) | top5: {100 * g['top5']:.2f}% (caso {100 * g['chance_top5']:.2f}%) | rank normalizzato mediano: {g['rank_normalizzato_mediano']:.2f} (caso ~0.50)", flush=True)
-        results["retrieval_nel_gruppo"] = ingroup
+    return "TERMINATO -> retrieval MoCo 2D"
+
+
+@handler()
+def train_anomaly_detection(
+    job_name: str = "nome_job",          
+    dataset_standard: str = "Standard",
+    dataset_anomalies: str = "test",       
+    moco_version: str = "check_v1",
+    simple_proj: bool = False,           
+    attn: bool = False,                  
+    hidden_channels_dim: int = 64,
+    pool_grid: int = 1,
+    moco_dim: int = 128,
+    moco_k: int = 4096,
+    moco_m: float = 0.999,
+    moco_t: float = 0.07,
+    patch_size: int = 256,
+    n_images1: int = 4, n_channels1: int = 2,       # sar
+    n_images2: int = 4, n_channels2: int = 10,      # ottico
+    n_threshold_series: int = 2000,                 # serie normali per calcolo soglia
+    num_anomalies: int = 100,
+    n_std: float = 1.0,                             # quante +- deviazioni standard
+    batch_size: int = 32,
+    workers: int = 0,
+):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device, "\n", flush=True)
  
-        results["spaziale"] = spatial
-        print("=" * 50 + "\n", flush=True)
- 
-    out_path = f"moco_2D_retrieval_{job_name}.json"
-    with open(out_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(json.dumps(results, indent=2), flush=True)   # nel log, cosi' i numeri restano anche se l'upload fallisce (es. quota)
+    project_work = dh.get_project("floods")
+    project_data = dh.get_project("datasets")
+    
+    # ------------------------------------------------------------------
+
+    # import ids lits from moco training
     try:
-        project_work.log_artifact(name=f"moco_2D_retrieval_{job_name}", source=out_path, kind='artifact')
-        print("OK -> risultati salvati come artifact", flush=True)
+        p = project_work.get_artifact(f"moco_2D_trainIdsList_{moco_version}").download("/data/det_train_ids.json", overwrite=True)
+        with open(p, 'r') as f:
+            train_ids = json.load(f)
+        p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+        with open(p, 'r') as f:
+            test_ids = json.load(f)
+        print(f"OK -> liste normali caricate: {len(train_ids)} train, {len(test_ids)} test", flush=True)
+
+    except Exception as e:
+        print(f"EXC -> caricamento liste ID normali: {e}", flush=True)
+ 
+    random.seed(0)
+    normal_thr_ids = random.sample(train_ids, min(n_threshold_series, len(train_ids)))
+    normal_test_ids = random.sample(test_ids, len(test_ids))
+
+    # lettura serie normali
+    print(f"Lettura serie normali: Floods_{dataset_standard}_crop_norm", flush=True)
+    normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
+    ids_per_sensor_normal = {}
+    
+    for sensor in ("SAR", "OPT"):
+        ids = set()
+        for part_path in sorted(glob(os.path.join(normal_path, sensor, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+        ids_per_sensor_normal[sensor] = ids
+
+    normal_ids = ids_per_sensor_normal["SAR"] & ids_per_sensor_normal["OPT"]
+
+    normal_thr_ids = [ID for ID in normal_thr_ids if ID in normal_ids]
+    normal_test_ids = [ID for ID in normal_test_ids if ID in normal_ids]
+    print(f"OK -> {len(normal_thr_ids)} serie soglia, {len(normal_test_ids)} serie test normali", flush=True)
+
+    # lettura ids serie anomale
+    print(f"Lettura serie anomale: {dataset_anomalies}", flush=True)
+    anom_path = project_data.get_artifact(f"{dataset_anomalies}").download(f"/data/{dataset_anomalies}")
+    ids_per_sensor_anom = {}
+    
+    for sensor in ("SAR", "OPT"):
+        ids = set()
+        for part_path in sorted(glob(os.path.join(anom_path, sensor, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+        ids_per_sensor_anom[sensor] = ids
+        
+    anom_ids = ids_per_sensor_anom["SAR"] & ids_per_sensor_anom["OPT"]
+
+    anom_ids = sorted(anom_ids)
+    random.seed(1)
+    anom_ids = random.sample(anom_ids, num_anomalies)
+    print(f"OK -> {len(anom_ids)} serie anomale", flush=True)
+
+    # estrazione serie normal_ids, threshold_ids + test_ad_ids
+    sar_dir = "/data/cache_SAR"
+    opt_dir = "/data/cache_OPT"
+
+    os.makedirs(sar_dir, exist_ok=True)
+    os.makedirs(opt_dir, exist_ok=True)
+    wanted_names = {f"{ID}.npy" for ID in normal_ids}
+    for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
+        for part_path in sorted(glob(os.path.join(normal_path, modality, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                for name in z.namelist():
+                    if name in wanted_names:
+                        z.extract(name, cache_dir)
+
+    # caricamento pesi moco
+    try:
+        encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+        encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+ 
+        model = MoCo2encoders_2d(
+            base_encoder_q=encoderOPT.encoder,
+            base_encoder_k=encoderSAR.encoder,
+            dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+            symmetric=False, device=device,
+            hidden_channels_dim=hidden_channels_dim,
+            simple_proj=simple_proj,
+            pool_grid=pool_grid,
+            attn=attn
+        ).to(device)
+ 
+        w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+        checkpoint = torch.load(w_path, map_location=device)
+        state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+        model.load_state_dict(state_dict)
+        model.eval()
+        print("OK -> modello MoCo caricato", flush=True)
+    except Exception as e:
+        print(f"EXC -> caricamento modello MoCo: {e}", flush=True)
+
+    def _compute_similarities(ids):
+        dataset_pop = MoCo2encodersLoader(
+            listIDs=ids, sar_map={}, opt_map={}, transform=None,
+            patch_size=patch_size,
+            n_images1=n_images1, n_channels1=n_channels1,
+            n_images2=n_images2, n_channels2=n_channels2,
+        )
+        loader_pop = DataLoader(dataset_pop, batch_size=batch_size, shuffle=False, num_workers=workers)
+
+        out = []
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            for im_q, im_k in tqdm(loader_pop, mininterval=30.0):   # im_q = OPT, im_k = SAR
+                im_q = im_q.to(device)
+                im_k = im_k.to(device)
+                _, q, k = model.contrastive_loss(im_q, im_k)
+                out.append((q.float() * k.float()).sum(dim=1).cpu())
+        return torch.cat(out).numpy()
+         
+
+    # esecuzione moco pesi congelati -> calcolo soglia 
+    print("Cosine similarity: soglia", flush=True)
+    dataset_thr = MoCo2encodersLoader(
+            listIDs=normal_thr_ids, sar_map={}, opt_map={}, transform=None,
+            patch_size=patch_size,
+            n_images1=n_images1, n_channels1=n_channels1,
+            n_images2=n_images2, n_channels2=n_channels2,
+        )
+    loader_thr = DataLoader(dataset_thr, batch_size=batch_size, shuffle=False, num_workers=workers)
+
+    out = []
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        for im_q, im_k in tqdm(loader_thr, mininterval=30.0):   # im_q = OPT, im_k = SAR
+            im_q = im_q.to(device)
+            im_k = im_k.to(device)
+            _, q, k = model.contrastive_loss(im_q, im_k)
+            out.append((q.float() * k.float()).sum(dim=1).cpu())
+    cos_sim_thr = torch.cat(out).numpy()
+    print(f"OK -> soglia: {len(cos_sim_thr)} similarita' calcolate", flush=True)
+
+    # esecuzione moco pesi congelati -> calcolo cos sim serie normali
+    print("Cosine similarity: serie normali", flush=True)
+    dataset_normal = MoCo2encodersLoader(
+            listIDs=normal_test_ids, sar_map={}, opt_map={}, transform=None,
+            patch_size=patch_size,
+            n_images1=n_images1, n_channels1=n_channels1,
+            n_images2=n_images2, n_channels2=n_channels2,
+        )
+    loader_normal = DataLoader(dataset_normal, batch_size=batch_size, shuffle=False, num_workers=workers)
+
+    out = []
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        for im_q, im_k in tqdm(loader_normal, mininterval=30.0):   # im_q = OPT, im_k = SAR
+            im_q = im_q.to(device)
+            im_k = im_k.to(device)
+            _, q, k = model.contrastive_loss(im_q, im_k)
+            out.append((q.float() * k.float()).sum(dim=1).cpu())
+    cos_sim_normal = torch.cat(out).numpy()
+    print(f"OK -> serie normali: {len(cos_sim_normal)} similarita' calcolate", flush=True)
+
+    # esecuzione moco pesi congelati -> calcolo cos sim serie anomale
+    print("Cosine similarity: serie normali", flush=True)
+    dataset_anom = MoCo2encodersLoader(
+            listIDs=anom_ids, sar_map={}, opt_map={}, transform=None,
+            patch_size=patch_size,
+            n_images1=n_images1, n_channels1=n_channels1,
+            n_images2=n_images2, n_channels2=n_channels2,
+        )
+    loader_anom = DataLoader(dataset_anom, batch_size=batch_size, shuffle=False, num_workers=workers)
+
+    out = []
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        for im_q, im_k in tqdm(loader_anom, mininterval=30.0):   # im_q = OPT, im_k = SAR
+            im_q = im_q.to(device)
+            im_k = im_k.to(device)
+            _, q, k = model.contrastive_loss(im_q, im_k)
+            out.append((q.float() * k.float()).sum(dim=1).cpu())
+    cos_sim_anom = torch.cat(out).numpy()
+    print(f"OK -> serie anomale: {len(cos_sim_anom)} similarita' calcolate", flush=True)
+ 
+    # calcolo risultati, y=label -> 0=
+    thr_mean = float(cos_sim_thr.mean())
+    thr_std = float(cos_sim_thr.std())
+    thr_high = thr_mean + (n_std * thr_std)
+    thr_low = thr_mean - (n_std * thr_std)
+ 
+    scores = np.concatenate([cos_sim_normal, cos_sim_anom])
+    label = np.concatenate([np.zeros(len(cos_sim_normal)), np.ones(len(cos_sim_anom))])
+ 
+    ranks = pd.Series(scores).rank().values
+    auc_high = float((ranks[len(cos_sim_normal):].sum() - len(cos_sim_anom) * (len(cos_sim_anom) + 1) / 2) / (len(cos_sim_anom) * len(cos_sim_normal)))
+    auc_low = 1.0 - auc_high
+ 
+    tests = {
+        f"cos_sim > m+{n_std:g}*std": scores > thr_high,
+        f"cos_sim < m-{n_std:g}*std": scores < thr_low,
+        f"m-{n_std:g}*std < cos_sim < m+{n_std:g}*std": (scores > thr_high) | (scores < thr_low),
+    }
+
+    tests_metrics = {}
+    for key, value in tests.items():
+        tp = int((value & (label == 1)).sum())
+        fp = int((value & (label == 0)).sum())
+        fn = int((~value & (label == 1)).sum())
+        tn = int((~value & (label == 0)).sum())
+        prec = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
+        rec = tp / (tp + fn)
+        
+        tests_metrics[key] = {
+            "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+            "FA_rate": fp / (fp + tn), "MA_rate": fn / (fn + tp),
+            "REC": rec, "PREC": prec,
+            "F1": (2 * prec * rec / (prec + rec)) if (tp > 0) else 0.0,
+        }
+ 
+    results = {
+        "job_name": job_name,
+        "dataset_anomalies": dataset_anomalies,
+        "n_thr": len(cos_sim_thr), "n_normali": len(cos_sim_normal), "n_anomale": len(cos_sim_anom),
+        "thr": {"mean": thr_mean, "std": thr_std, "n_std": n_std, "thr_high": thr_high, "thr_low": thr_low},
+        "cos_sim_normal": {"mean": float(cos_sim_normal.mean()), "std": float(cos_sim_normal.std())},
+        "cos_sim_anom": {"mean": float(cos_sim_anom.mean()), "std": float(cos_sim_anom.std())},
+        "auroc_cos_sim_high_anom": auc_high,
+        "auroc_cos_sim_low_anom": auc_low,
+        "rules": tests_metrics,
+    }
+ 
+    # risultati
+
+    out_dir = f"/data/anomaly_{job_name}"
+    os.makedirs(out_dir, exist_ok=True)
+ 
+    pd.DataFrame({
+        "ID": normal_test_ids + anom_ids,
+        "label": [0] * len(cos_sim_normal) + [1] * len(cos_sim_anom),
+        "similarity": np.concatenate([cos_sim_normal, cos_sim_anom]),
+    }).to_csv(os.path.join(out_dir, "similarities.csv"), index=False)
+    with open(os.path.join(out_dir, "anomaly_results.json"), 'w') as f:
+        json.dump(results, f, indent=2)
+    print(json.dumps(results, indent=2), flush=True)   
+ 
+    try:
+        shutil.make_archive(out_dir, 'zip', out_dir)
+        project_work.log_artifact(name=f"anomaly_results_{job_name}", source=f"{out_dir}.zip", kind='artifact')
+        print("OK -> risultati salvati", flush=True)
     except Exception as e:
         print(f"EXC -> upload risultati: {e}", flush=True)
  
-    return "TERMINATO -> retrieval MoCo 2D"
+    return "TERMINATO -> anomaly detection"
+
+
+
+
+
+# EXTRAXT ANOMALIES
+
+def _list_zarr_groups(tar_path, suffix):
+    """
+    Apre il tar e raggruppa i membri per ID di serie, senza estrarre nulla.
+    Formato reale: "{SUFFIX}/{ID}_{SUFFIX}.zarr.zip" - un solo file per serie
+    (uno ZipStore Zarr, non una cartella con tanti membri).
+    Ritorna (tar_handle_aperto, {ID: [nome membro nel tar]}).
+    Il tar_handle va chiuso dal chiamante quando non serve piu'.
+    """
+    tf = tarfile.open(tar_path, 'r:')
+    pattern = re.compile(r"^[^/]+/(.*?)_" + re.escape(suffix) + r"\.zarr\.zip$")
+    groups = {}
+    for member in tf.getmembers():
+        m = pattern.match(member.name)
+        if m:
+            groups.setdefault(m.group(1), []).append(member.name)
+    return tf, groups
+ 
+ 
+def _load_and_process_zarr(zip_path, band_names_wanted, band_name_map=None):
+    """
+    Apre un file .zarr.zip (ZipStore Zarr) con variabile 'bands' (time,band,y,x)
+    e coordinata 'band' con i nomi veri delle bande, seleziona i canali richiesti
+    PER NOME (non per posizione), azzera i pixel non validi secondo nan_mask,
+    normalizza a percentile 2-98 su tutta la serie (canali+istanti insieme,
+    stessa logica di Singlemodal_Loader._load_and_process), e ritorna un array
+    (n_channels, n_images, H, W) float32 in [0,1].
+    """
+    store = zarr.storage.ZipStore(zip_path, mode='r')
+    ds = xr.open_zarr(store, consolidated=True)
+ 
+    available = [str(b) for b in ds['band'].values]
+    wanted = [band_name_map.get(b, b) for b in band_names_wanted] if band_name_map else list(band_names_wanted)
+    missing = [b for b in wanted if b not in available]
+    if missing:
+        store.close()
+        raise ValueError(f"bande mancanti {missing}, disponibili nel file: {available}")
+ 
+    data = ds['bands'].sel(band=wanted).values.astype(np.float32)   # (time, channel, H, W)
+    data = np.transpose(data, (1, 0, 2, 3))                          # -> (channel, time, H, W)
+ 
+    if 'nan_mask' in ds:
+        invalid = np.asarray(ds['nan_mask'].values)                  # (time, H, W), True = non valido
+        invalid = np.broadcast_to(invalid[None, :, :, :], data.shape)
+        data = np.where(invalid, np.nan, data)
+ 
+    ds.close()
+    store.close()
+ 
+    # anche i pixel gia' marcati come fill_value (es. -9999 per l'ottico) finiscono
+    # fuori dal range plausibile: li tratto come mancanti allo stesso modo dei NaN
+    data = np.where(data < -1000, np.nan, data)
+ 
+    p_low = np.nanpercentile(data, 2)
+    p_high = np.nanpercentile(data, 98)
+    scale = p_high - p_low if (p_high - p_low) > 1e-6 else 1.0
+    data = (data - p_low) / scale
+    data = np.nan_to_num(data, nan=0.0)          # mancante -> 0, stessa convenzione del padding nel resto del progetto
+    data = np.clip(data, 0.0, 1.0).astype(np.float32)
+ 
+    return data
+ 
+ 
+@handler()
+def build_precomputed_cache_anomalies(
+    split: str = "test",          # "train" | "val" | "test", cartella dentro Floods_Anomalies
+    n_series_sample: int = 5,     # NOTA: parti piccolo (5-10) per verificare che funzioni, poi alza a 5000
+    seed: int = 0,
+    max_part_gb: float = 15.0,
+):
+    project_data = dh.get_project("datasets")
+ 
+    sar_bands = ["vv", "vh"]                                                    # n_channels1 = 2
+    opt_bands_project = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]  # n_channels2 = 10
+    opt_band_map = {b: ("B0" + b[1:] if len(b) == 2 and b[1].isdigit() else b) for b in opt_bands_project}
+ 
+    print(f"Download artifact Floods_Anomalies...", flush=True)
+    anom_path = project_data.get_artifact("Floods_Anomalies").download("/data/anomalies")
+    print("OK -> download terminato", flush=True)
+ 
+    s1_tar_path = os.path.join(anom_path, split, "S1RTC.tar")
+    s2_tar_path = os.path.join(anom_path, split, "S2L2A.tar")
+ 
+    print(f"Indicizzazione S1RTC ({split})...", flush=True)
+    tf_s1, groups_s1 = _list_zarr_groups(s1_tar_path, "S1RTC")
+    print(f"OK -> {len(groups_s1)} serie SAR trovate", flush=True)
+ 
+    print(f"Indicizzazione S2L2A ({split})...", flush=True)
+    tf_s2, groups_s2 = _list_zarr_groups(s2_tar_path, "S2L2A")
+    print(f"OK -> {len(groups_s2)} serie OTTICO trovate", flush=True)
+ 
+    common_ids = sorted(set(groups_s1) & set(groups_s2))
+    print(f"{len(common_ids)} serie complete SAR+OTTICO", flush=True)
+ 
+    random.seed(seed)
+    sample_ids = random.sample(common_ids, min(n_series_sample, len(common_ids)))
+    print(f"campionate {len(sample_ids)} serie (seed={seed})", flush=True)
+ 
+    local_root = "/data/anomalies_cache_upload"
+    sar_dir = os.path.join(local_root, "SAR")
+    opt_dir = os.path.join(local_root, "OPT")
+    os.makedirs(sar_dir, exist_ok=True)
+    os.makedirs(opt_dir, exist_ok=True)
+ 
+    extract_tmp = "/data/anomalies_extract_tmp"
+    n_ok, n_failed = 0, 0
+ 
+    for ID in sample_ids:
+        try:
+            os.makedirs(extract_tmp, exist_ok=True)
+            for name in groups_s1[ID]:
+                tf_s1.extract(name, extract_tmp)
+            for name in groups_s2[ID]:
+                tf_s2.extract(name, extract_tmp)
+ 
+            s1_group_path = os.path.join(extract_tmp, "S1RTC", f"{ID}_S1RTC.zarr.zip")
+            s2_group_path = os.path.join(extract_tmp, "S2L2A", f"{ID}_S2L2A.zarr.zip")
+ 
+            im_sar = _load_and_process_zarr(s1_group_path, sar_bands)
+            im_opt = _load_and_process_zarr(s2_group_path, opt_bands_project, band_name_map=opt_band_map)
+ 
+            np.save(os.path.join(sar_dir, f"{ID}.npy"), im_sar)
+            np.save(os.path.join(opt_dir, f"{ID}.npy"), im_opt)
+            n_ok += 1
+            if n_ok <= 3:
+                print(f"OK -> {ID}: SAR {im_sar.shape} min/max {im_sar.min():.3f}/{im_sar.max():.3f}, "
+                      f"OPT {im_opt.shape} min/max {im_opt.min():.3f}/{im_opt.max():.3f}", flush=True)
+        except Exception as e:
+            n_failed += 1
+            print(f"EXC -> serie {ID}: {e}", flush=True)
+        finally:
+            shutil.rmtree(extract_tmp, ignore_errors=True)
+ 
+    tf_s1.close()
+    tf_s2.close()
+    print(f"OK -> {n_ok} serie processate, {n_failed} fallite", flush=True)
+ 
+    if n_ok == 0:
+        return "TERMINATO -> nessuna serie processata, controlla i log EXC sopra"
+ 
+    # ------------------------------------------------------------------
+    # scrivo le due cartelle in parti sotto max_part_gb (streaming: scrivo
+    # ed elimino ogni .npy dopo averlo aggiunto allo zip), poi le carico
+    # come UN SOLO artifact con sottocartelle SAR/OPT - stesso schema di
+    # build_precomputed_cache.py per il dataset "normale"
+    # ------------------------------------------------------------------
+    def _write_parts(src_dir, dest_dir, max_part_bytes):
+        part_num, current_zip, current_path, current_size = 1, None, None, 0
+ 
+        def _open():
+            nonlocal current_zip, current_path, current_size
+            current_path = os.path.join(dest_dir, f"part{part_num:02d}.zip")
+            current_zip = zipfile.ZipFile(current_path, 'w', zipfile.ZIP_DEFLATED)
+            current_size = 0
+ 
+        def _close():
+            nonlocal current_zip, part_num
+            current_zip.close()
+            print(f"OK -> {dest_dir} parte {part_num} pronta ({os.path.getsize(current_path) / 1e9:.2f} GB)", flush=True)
+            part_num += 1
+ 
+        _open()
+        for fname in os.listdir(src_dir):
+            full_path = os.path.join(src_dir, fname)
+            fsize = os.path.getsize(full_path)
+            if current_size > 0 and current_size + fsize > max_part_bytes:
+                _close()
+                _open()
+            current_zip.write(full_path, arcname=fname)
+            current_size += fsize
+            os.remove(full_path)
+        _close()
+        shutil.rmtree(src_dir, ignore_errors=True)
+ 
+    max_part_bytes = int(max_part_gb * 1024 ** 3)
+    local_upload_root = "/data/anomalies_cache_parts"
+    os.makedirs(os.path.join(local_upload_root, "SAR"), exist_ok=True)
+    os.makedirs(os.path.join(local_upload_root, "OPT"), exist_ok=True)
+ 
+    _write_parts(sar_dir, os.path.join(local_upload_root, "SAR"), max_part_bytes)
+    _write_parts(opt_dir, os.path.join(local_upload_root, "OPT"), max_part_bytes)
+ 
+    try:
+        project_data.log_artifact(
+            name=f"Floods_Anomalies_{split}_crop_norm_100",
+            kind='artifact',
+            source=local_upload_root,
+        )
+        print(f"OK -> artifact Floods_Anomalies_{split}_crop_norm_100 caricato", flush=True)
+        shutil.rmtree(local_upload_root, ignore_errors=True)
+    except Exception as e:
+        print(f"EXC -> upload artifact: {e}", flush=True)
+ 
+    return "TERMINATO -> cache anomalie precalcolata"
+
+
+
+@handler()
+def inspect_anomalies_tar(
+    split: str = "test",
+    n_show: int = 30,
+):
+    project_data = dh.get_project("datasets")
+ 
+    print("Download artifact Floods_Anomalies...", flush=True)
+    anom_path = project_data.get_artifact("Floods_Anomalies").download("/data/anomalies")
+    print("OK -> download terminato", flush=True)
+ 
+    print(f"\nContenuto di {anom_path}/{split}/:", flush=True)
+    split_dir = os.path.join(anom_path, split)
+    if os.path.isdir(split_dir):
+        for f in sorted(os.listdir(split_dir)):
+            full = os.path.join(split_dir, f)
+            size_gb = os.path.getsize(full) / 1e9 if os.path.isfile(full) else None
+            print(f"  {f}" + (f" ({size_gb:.2f} GB)" if size_gb is not None else " (cartella)"), flush=True)
+    else:
+        print(f"  ATTENZIONE: {split_dir} non esiste come cartella", flush=True)
+        print(f"Contenuto di {anom_path}:", flush=True)
+        for f in sorted(os.listdir(anom_path)):
+            print(f"  {f}", flush=True)
+ 
+    import tarfile
+ 
+    for tar_name in ["S1RTC.tar", "S2L2A.tar"]:
+        tar_path = os.path.join(split_dir, tar_name)
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"{tar_name}: {tar_path}", flush=True)
+        if not os.path.exists(tar_path):
+            print("  ATTENZIONE: file non trovato a questo percorso", flush=True)
+            continue
+ 
+        try:
+            tf = tarfile.open(tar_path, 'r:')
+            names = tf.getnames()
+            print(f"totale membri: {len(names)}", flush=True)
+ 
+            print(f"\nprimi {n_show} nomi:", flush=True)
+            for n in names[:n_show]:
+                print(f"  {n}", flush=True)
+ 
+            # primo segmento di ciascun path, per capire se c'e' un prefisso
+            # di cartella inatteso (es. "data/...", "./...", niente prefisso, ecc.)
+            top_level = sorted(set(n.split('/')[0] for n in names))
+            print(f"\nprimi segmenti di path distinti (max 20 mostrati): {top_level[:20]}", flush=True)
+ 
+            tf.close()
+        except Exception as e:
+            print(f"EXC -> apertura/lettura {tar_name}: {e}", flush=True)
+ 
+    return "TERMINATO -> ispezione tar completata"
+ 
+
+
+
+
 
 
 
