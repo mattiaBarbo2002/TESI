@@ -1029,6 +1029,8 @@ def train_moco_2D(
     steps_total = None   # NUOVO: step totali del run, serve al coseno
     base_lr = lr
     batch_step = 0
+
+    target_epoch = start_epoch + epochs - 1
  
     try:
         train_dataset = MoCo2encodersLoader(
@@ -1051,14 +1053,14 @@ def train_moco_2D(
         # quanti batch stanno in un epoca, per Standard e barch size 16 = 1243
         # quanti run farebbero se tutte le epoche vengono eseguite, no early stopping
         epoch_lenght = len(train_loader) if not queue_restored else None 
-        steps_total = (epochs - start_epoch + 1) * len(train_loader)
+        steps_total = (target_epoch - start_epoch + 1) * len(train_loader)
 
     except Exception as e:
-        print(f"EXC -> DataLoader: {e}", flush=True)
+        print(f"EXC -> DataLoader: {e}", flush=True)    
  
     # libreria time utilizzata per debug, tempo training
     try:
-        for epoch in range(start_epoch, epochs + 1):  
+        for epoch in range(start_epoch, target_epoch + 1):  
             model.train()
             model.encoder_q.eval()
             model.encoder_k.eval()
@@ -1119,7 +1121,7 @@ def train_moco_2D(
   
                 total_num += batch_size
                 total_loss += loss.item() * batch_size
-                train_bar.set_description(f'MoCo Epoch: [{epoch}/{epochs}], Loss: {loss.item():.4f}')
+                train_bar.set_description(f'MoCo Epoch: [{epoch}/{target_epoch}], Loss: {loss.item():.4f}')
  
             epoch_loss = total_loss / total_num
             results['lr'].append(optimizer.param_groups[0]['lr'])
@@ -1432,6 +1434,8 @@ def eval_moco_retrieval(
     return "TERMINATO -> retrieval MoCo 2D"
 
 
+# notebook -> anomaly_detection
+
 @handler()
 def train_anomaly_detection(
     job_name: str = "nome_job",          
@@ -1460,8 +1464,6 @@ def train_anomaly_detection(
  
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
-    
-    # ------------------------------------------------------------------
 
     # import ids lits from moco training
     try:
@@ -1515,7 +1517,7 @@ def train_anomaly_detection(
     anom_ids = sorted(anom_ids)
     random.seed(1)
     anom_ids = random.sample(anom_ids, num_anomalies)
-    print(f"OK -> {len(anom_ids)} serie anomale", flush=True)
+    print(f"OK -> {len(anom_ids)} serie anomale", "\n", flush=True)
 
     # estrazione serie normal_ids, threshold_ids + test_ad_ids
     sar_dir = "/data/cache_SAR"
@@ -1523,12 +1525,12 @@ def train_anomaly_detection(
 
     os.makedirs(sar_dir, exist_ok=True)
     os.makedirs(opt_dir, exist_ok=True)
-    wanted_names = {f"{ID}.npy" for ID in normal_ids}
+    wanted_normal_series = {f"{ID}.npy" for ID in set(normal_thr_ids) | set(normal_test_ids)}
     for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
         for part_path in sorted(glob(os.path.join(normal_path, modality, "part*.zip"))):
             with zipfile.ZipFile(part_path, 'r') as z:
                 for name in z.namelist():
-                    if name in wanted_names:
+                    if name in wanted_normal_series:
                         z.extract(name, cache_dir)
 
     # caricamento pesi moco
@@ -1552,28 +1554,10 @@ def train_anomaly_detection(
         state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
         model.load_state_dict(state_dict)
         model.eval()
-        print("OK -> modello MoCo caricato", flush=True)
+        print("OK -> modello MoCo caricato",  "\n", flush=True)
     except Exception as e:
         print(f"EXC -> caricamento modello MoCo: {e}", flush=True)
-
-    def _compute_similarities(ids):
-        dataset_pop = MoCo2encodersLoader(
-            listIDs=ids, sar_map={}, opt_map={}, transform=None,
-            patch_size=patch_size,
-            n_images1=n_images1, n_channels1=n_channels1,
-            n_images2=n_images2, n_channels2=n_channels2,
-        )
-        loader_pop = DataLoader(dataset_pop, batch_size=batch_size, shuffle=False, num_workers=workers)
-
-        out = []
-        with torch.no_grad(), torch.cuda.amp.autocast():
-            for im_q, im_k in tqdm(loader_pop, mininterval=30.0):   # im_q = OPT, im_k = SAR
-                im_q = im_q.to(device)
-                im_k = im_k.to(device)
-                _, q, k = model.contrastive_loss(im_q, im_k)
-                out.append((q.float() * k.float()).sum(dim=1).cpu())
-        return torch.cat(out).numpy()
-         
+      
 
     # esecuzione moco pesi congelati -> calcolo soglia 
     print("Cosine similarity: soglia", flush=True)
@@ -1593,7 +1577,7 @@ def train_anomaly_detection(
             _, q, k = model.contrastive_loss(im_q, im_k)
             out.append((q.float() * k.float()).sum(dim=1).cpu())
     cos_sim_thr = torch.cat(out).numpy()
-    print(f"OK -> soglia: {len(cos_sim_thr)} similarita' calcolate", flush=True)
+    print(f"OK -> soglia: {len(cos_sim_thr)} similarita' calcolate", "\n", flush=True)
 
     # esecuzione moco pesi congelati -> calcolo cos sim serie normali
     print("Cosine similarity: serie normali", flush=True)
@@ -1613,10 +1597,26 @@ def train_anomaly_detection(
             _, q, k = model.contrastive_loss(im_q, im_k)
             out.append((q.float() * k.float()).sum(dim=1).cpu())
     cos_sim_normal = torch.cat(out).numpy()
-    print(f"OK -> serie normali: {len(cos_sim_normal)} similarita' calcolate", flush=True)
+    print(f"OK -> serie normali: {len(cos_sim_normal)} similarita' calcolate", "\n", flush=True)
+
+    # pulizia cartelle
+    for d in ("/data/cache_SAR", "/data/cache_OPT"):
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+
+    # estrazione serie anomale
+    os.makedirs(sar_dir, exist_ok=True)
+    os.makedirs(opt_dir, exist_ok=True)
+    wanted_anom_series = {f"{ID}.npy" for ID in anom_ids}
+    for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
+        for part_path in sorted(glob(os.path.join(anom_path, modality, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                for name in z.namelist():
+                    if name in wanted_anom_series:
+                        z.extract(name, cache_dir)
 
     # esecuzione moco pesi congelati -> calcolo cos sim serie anomale
-    print("Cosine similarity: serie normali", flush=True)
+    print("Cosine similarity: serie anomale", flush=True)
     dataset_anom = MoCo2encodersLoader(
             listIDs=anom_ids, sar_map={}, opt_map={}, transform=None,
             patch_size=patch_size,
@@ -1633,7 +1633,7 @@ def train_anomaly_detection(
             _, q, k = model.contrastive_loss(im_q, im_k)
             out.append((q.float() * k.float()).sum(dim=1).cpu())
     cos_sim_anom = torch.cat(out).numpy()
-    print(f"OK -> serie anomale: {len(cos_sim_anom)} similarita' calcolate", flush=True)
+    print(f"OK -> serie anomale: {len(cos_sim_anom)} similarita' calcolate", "\n", flush=True)
  
     # calcolo risultati, y=label -> 0=
     thr_mean = float(cos_sim_thr.mean())
@@ -1960,6 +1960,319 @@ def inspect_anomalies_tar(
             print(f"EXC -> apertura/lettura {tar_name}: {e}", flush=True)
  
     return "TERMINATO -> ispezione tar completata"
+
+
+
+
+
+
+
+
+def save_reconstruction_pngs(model, x, save_dir="reconstruction_img", prefix="series", channels=None, device=None):
+
+    os.makedirs(save_dir, exist_ok=True)
+ 
+    if device is None:
+        device = next(model.parameters()).device
+ 
+    x = torch.as_tensor(x).float()
+    if x.dim() == 4:                # (C, T, H, W)
+        x = x.unsqueeze(0)
+    x = x.to(device)
+ 
+    model.train()
+    with torch.no_grad():
+        out = model(x)
+ 
+    x_np = x[0].cpu().numpy()       # (C, T, H, W)
+    out_np = out[0].cpu().numpy()   # (C, T, H, W)
+    C, T, H, W = x_np.shape
+ 
+    print(f"INPUT  ({prefix}) - min: {x_np.min():.4f}, max: {x_np.max():.4f}, "
+          f"mean: {x_np.mean():.4f}, std: {x_np.std():.4f}", flush=True)
+    print(f"OUTPUT ({prefix}) - min: {out_np.min():.4f}, max: {out_np.max():.4f}, "
+          f"mean: {out_np.mean():.4f}, std: {out_np.std():.4f}", flush=True)
+ 
+    if channels is None:
+        channels = list(range(min(3, C)))
+    rgb_mode = len(channels) == 3
+ 
+    for t in range(T):
+        in_frame = np.clip(x_np[:, t, :, :][channels], 0.0, 1.0)
+        out_frame = np.clip(out_np[:, t, :, :][channels], 0.0, 1.0)
+        out_path = os.path.join(save_dir, f"{prefix}_t{t + 1}.png")
+ 
+        if rgb_mode:
+            in_img = np.transpose(in_frame, (1, 2, 0))
+            out_img = np.transpose(out_frame, (1, 2, 0))
+ 
+            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+            axes[0].imshow(in_img)
+            axes[0].set_title(f"Input t{t + 1}")
+            axes[1].imshow(out_img)
+            axes[1].set_title(f"Output t{t + 1}")
+            for ax in axes:
+                ax.axis("off")
+            fig.suptitle(f"{prefix} - istante {t + 1}/{T} (canali {channels})")
+ 
+        else:
+            n_ch = len(channels)
+            fig, axes = plt.subplots(2, n_ch, figsize=(3 * n_ch, 6), squeeze=False)
+            for i, ch in enumerate(channels):
+                axes[0][i].imshow(in_frame[i], cmap="gray", vmin=0, vmax=1)
+                axes[0][i].set_title(f"Input ch{ch}")
+                axes[0][i].axis("off")
+                axes[1][i].imshow(out_frame[i], cmap="gray", vmin=0, vmax=1)
+                axes[1][i].set_title(f"Output ch{ch}")
+                axes[1][i].axis("off")
+            fig.suptitle(f"{prefix} - istante {t + 1}/{T}")
+ 
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+ 
+    print(f"OK -> {T} PNG salvati in {save_dir}/ (prefisso '{prefix}')", flush=True)
+
+@handler()
+def test_encoders_visual(
+    patch_size: int = 256,
+    n_images1: int = 4,
+    n_channels1: int = 2,
+    n_images2: int = 4,
+    n_channels2: int = 10,
+    output_dim: int = 10,
+    mamba: bool = False,
+    dataset: str = "Test",
+    test_sar: bool = True,
+    test_opt: bool = True,
+    weights_sar: str = "weights_s1",
+    weights_opt: str = "weights_s2",
+    n_samples: int = 10,
+    job_name: str = "nome",
+    ltae: bool = False,
+    monodimensional: bool = False,
+    sar_channel: int = 0,                 # NUOVO: quale canale SAR mostrare in scala di grigi
+    recon_channels: list | None = None,   # ORA: terna di indici canale OPT per l'RGB, default [2,1,0] = B4,B3,B2
+    save_dir: str = "/data/debug_recon",
+):
+ 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device, "\n", flush=True)
+ 
+    torch.backends.cudnn.benchmark = True
+ 
+    if recon_channels is None:
+        recon_channels = [2, 1, 0]
+ 
+    # progetti digital hub
+    project_work = dh.get_project("floods")
+    project_data = dh.get_project("datasets")
+ 
+    random_sar_ids = []
+    random_opt_ids = []
+    cache_sar_dir = "/data/cache_SAR"
+    cache_opt_dir = "/data/cache_OPT"
+ 
+    print(f"Download: {dataset}", flush=True)
+    dataset_path = project_data.get_artifact(f"{dataset}").download("/data/dataset_floods")
+    print("OK -> Download terminato", flush=True)
+ 
+    save_dir = save_dir + "_" + job_name
+    os.makedirs(save_dir, exist_ok=True)
+ 
+    # ------------------------------------------------------------------
+    # visualizzazione input vs ricostruzione: griglia 2x4, riga 0 = input,
+    # riga 1 = ricostruito, una colonna per istante temporale
+    # ------------------------------------------------------------------
+    def _visualizza_input_ricostruzione(input_arr, recon_arr, nome_serie, nome_output, is_sar):
+        """
+        input_arr, recon_arr: array (n_channels, 4, H, W), gia' in [0,1] (cache crop_norm)
+        is_sar=True -> un solo canale in grigio (sar_channel)
+        is_sar=False -> RGB con i tre canali di recon_channels (indici su n_channels2)
+        """
+        try:
+            fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+            fig.suptitle(f"Serie: {nome_serie}", fontsize=16)
+ 
+            for step in range(4):
+                if is_sar:
+                    img_in = input_arr[sar_channel, step]
+                    img_rec = recon_arr[sar_channel, step]
+                    kwargs = {"cmap": "gray", "vmin": 0, "vmax": 1}
+                else:
+                    r, g, b = recon_channels
+                    img_in = np.dstack([input_arr[r, step], input_arr[g, step], input_arr[b, step]])
+                    img_rec = np.dstack([recon_arr[r, step], recon_arr[g, step], recon_arr[b, step]])
+                    kwargs = {}
+ 
+                axes[0, step].imshow(img_in, **kwargs)
+                axes[0, step].set_title(f"Input t{step+1}")
+                axes[0, step].axis('off')
+ 
+                axes[1, step].imshow(img_rec, **kwargs)
+                axes[1, step].set_title(f"Ricostruito t{step+1}")
+                axes[1, step].axis('off')
+ 
+            plt.tight_layout()
+            plt.savefig(nome_output, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+        except Exception as e:
+            print(f"EXC -> PNG {nome_serie}: {e}", flush=True)
+ 
+    # indicizzo gli ID gia' pronti nella cache (senza estrarre), poi estraggo solo i campioni scelti
+    try:
+        if test_sar:
+            sar_available = set()
+            for part_path in sorted(glob(os.path.join(dataset_path, "SAR", "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    sar_available.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+            random_sar_ids = random.sample(sorted(sar_available), min(n_samples, len(sar_available))) if sar_available else []
+            print(f"{len(sar_available)} serie SAR trovate", flush=True)
+ 
+            os.makedirs(cache_sar_dir, exist_ok=True)
+            wanted_sar = {f"{ID}.npy" for ID in random_sar_ids}
+            for part_path in sorted(glob(os.path.join(dataset_path, "SAR", "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    for name in z.namelist():
+                        if name in wanted_sar:
+                            z.extract(name, cache_sar_dir)
+ 
+        if test_opt:
+            opt_available = set()
+            for part_path in sorted(glob(os.path.join(dataset_path, "OPT", "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    opt_available.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+            random_opt_ids = random.sample(sorted(opt_available), min(n_samples, len(opt_available))) if opt_available else []
+            print(f"{len(opt_available)} serie OPT trovate", flush=True)
+ 
+            os.makedirs(cache_opt_dir, exist_ok=True)
+            wanted_opt = {f"{ID}.npy" for ID in random_opt_ids}
+            for part_path in sorted(glob(os.path.join(dataset_path, "OPT", "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    for name in z.namelist():
+                        if name in wanted_opt:
+                            z.extract(name, cache_opt_dir)
+ 
+    except Exception as e:
+        print(f"EXC -> recupero liste: {e}", flush=True)
+ 
+    if test_sar:
+        try:
+            sar_path = project_work.get_artifact(weights_sar).download("/data/weights_sar.pth")
+        except Exception as e:
+            print(f"EXC -> {weights_sar} non trovato: {e}", flush=True)
+            sar_path = None
+ 
+        if sar_path:
+            if monodimensional:
+                modelSAR = Singlemodal_CAE(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, mamba=mamba).to(device)
+ 
+            else:
+                modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, n_head=8, d_k=8, ltae=ltae).to(device)
+ 
+            state_dict = torch.load(sar_path, map_location=device)
+            if all(k.startswith('module.') for k in state_dict.keys()):
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            modelSAR.load_state_dict(state_dict)
+            modelSAR.eval()
+ 
+            print("SERIE SAR:", flush=True)
+            with torch.no_grad():
+                for i, ID in enumerate(random_sar_ids):
+                    im = np.load(os.path.join(cache_sar_dir, f"{ID}.npy"))
+                    im = torch.from_numpy(im).unsqueeze(0).to(device)   # aggiunge la dimensione batch (gia' croppato/normalizzato)
+ 
+                    if monodimensional:
+                        try:
+                            latent_vector = modelSAR.encoder(im)
+                        except AttributeError as e:
+                            print(f"EXC -> nome encoder sar: {e}", flush=True)
+                            break
+ 
+                        vector = latent_vector.cpu().numpy().flatten()
+                        print(f"ID {i}: {ID} | shape: {list(latent_vector.shape)}", flush=True)
+                        print(f"VEC: {np.round(vector, 4)}\n", flush=True)
+ 
+                    # NUOVO: ricostruzione intera (encoder+decoder) e confronto input/output su PNG
+                    recon = modelSAR(im)
+                    _visualizza_input_ricostruzione(
+                        input_arr=im.squeeze(0).cpu().numpy(),
+                        recon_arr=recon.squeeze(0).detach().cpu().numpy(),
+                        nome_serie=ID,
+                        nome_output=os.path.join(save_dir, f"SAR_{ID}_recon.png"),
+                        is_sar=True,
+                    )
+ 
+            del modelSAR
+            torch.cuda.empty_cache()
+ 
+    if test_opt:
+        try:
+            opt_path = project_work.get_artifact(weights_opt).download("/data/weights_opt.pth")
+        except Exception as e:
+            print(f"EXC -> {weights_opt} non trovato: {e}", flush=True)
+            opt_path = None
+ 
+        if opt_path:
+ 
+            if monodimensional:
+                modelOPT = Singlemodal_CAE(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, mamba=mamba).to(device)
+ 
+            else:
+                modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, n_head=8, d_k=8, ltae=ltae).to(device)
+ 
+            state_dict = torch.load(opt_path, map_location=device)
+            if all(k.startswith('module.') for k in state_dict.keys()):
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            modelOPT.load_state_dict(state_dict)
+            modelOPT.eval()
+ 
+            print("SERIE OPT:", flush=True)
+            with torch.no_grad():
+                for i, ID in enumerate(random_opt_ids):
+                    im = np.load(os.path.join(cache_opt_dir, f"{ID}.npy"))
+                    im = torch.from_numpy(im).unsqueeze(0).to(device)
+ 
+                    if monodimensional:
+                        try:
+                            latent_vector = modelOPT.encoder(im)
+                        except AttributeError as e:
+                            print(f"EXC -> nome encoder opt: {e}", flush=True)
+                            break
+ 
+                        vector = latent_vector.cpu().numpy().flatten()
+                        print(f"ID {i}: {ID} | shape: {list(latent_vector.shape)}", flush=True)
+                        print(f"VEC: {np.round(vector, 4)}\n", flush=True)
+ 
+                    # NUOVO: ricostruzione intera e confronto input/output su PNG
+                    recon = modelOPT(im)
+                    _visualizza_input_ricostruzione(
+                        input_arr=im.squeeze(0).cpu().numpy(),
+                        recon_arr=recon.squeeze(0).detach().cpu().numpy(),
+                        nome_serie=ID,
+                        nome_output=os.path.join(save_dir, f"OPT_{ID}_recon.png"),
+                        is_sar=False,
+                    )
+ 
+            del modelOPT
+            torch.cuda.empty_cache()
+ 
+    # zip png, upload artifact
+    zip_base = save_dir.rstrip("/")
+    zip_path = f"{zip_base}.zip"
+    try:
+        shutil.make_archive(zip_base, 'zip', save_dir)
+        project_work.log_artifact(
+            name=f"test-encoders-reconstructions_{dataset}_{job_name}",
+            kind="artifact",
+            source=zip_path
+        )
+        print(f"OK -> {zip_path} caricato come artifact", flush=True)
+    except Exception as e:
+        print(f"EXC -> upload zip ricostruzioni: {e}", flush=True)
+ 
+    return "TERMINATO"
+
  
 
 

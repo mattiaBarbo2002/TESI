@@ -201,7 +201,7 @@ def train_autoencoders_1D(
         # resume = True, carica pesi e metriche vecchio train
         if resume:
             try:
-                w_path = project_work.get_artifact(f"autoencoder1D_SAR_weights_{job_name}").download("/data")
+                w_path = project_work.get_artifact(f"autoencoder_1D_SAR_weights_{job_name}").download("/data")
                 state_dict = torch.load(w_path, map_location=device)
                 (modelSAR.module if n_gpus > 1 else modelSAR).load_state_dict(state_dict)
                 print(f"OK -> pesi SAR caricati: {job_name}", flush=True)
@@ -209,7 +209,7 @@ def train_autoencoders_1D(
                 print(f"EXC -> nessun peso SAR trovato: inizializzazione casuale: {e}", flush=True)
 
             try:
-                m_path = project_work.get_artifact(f"autoencoder1D_SAR_metrics_{job_name}").download("/data")
+                m_path = project_work.get_artifact(f"autoencoder_1D_SAR_metrics_{job_name}").download("/data")
                 prev_df = pd.read_csv(m_path)
                 best_loss = prev_df['train_loss'].min()
                 resultsSAR = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
@@ -660,7 +660,7 @@ def train_autoencoders_2D(
         # resume = True, carica pesi e metriche vecchio train
         if resume:
             try:
-                w_path = project_work.get_artifact(f"autoencoder2D_SAR_weights_{job_name}").download("/data")
+                w_path = project_work.get_artifact(f"autoencoder_2D_SAR_weights_{job_name}").download("/data")
                 state_dict = torch.load(w_path, map_location=device)
                 (modelSAR.module if n_gpus > 1 else modelSAR).load_state_dict(state_dict)
                 print(f"OK -> pesi SAR caricati -> {job_name}", flush=True)
@@ -668,7 +668,7 @@ def train_autoencoders_2D(
                 print(f"EXC -> nessun peso SAR trovato: inizializzazione casuale: {e}", flush=True)
  
             try:
-                m_path = project_work.get_artifact(f"autoencoder2D_SAR_metrics_{job_name}").download("/data")
+                m_path = project_work.get_artifact(f"autoencoder_2D_SAR_metrics_{job_name}").download("/data")
                 prev_df = pd.read_csv(m_path)
                 best_loss = prev_df['train_loss'].min()
                 resultsSAR = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
@@ -1931,47 +1931,52 @@ def test_encoders_visual(
     # progetti digital hub
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
-    
-    sar_zip_map = {}
-    opt_zip_map = {}
-    train_data_SAR_IDS = []
-    train_data_OPT_IDS = []
-    
  
-    print(f"Download: {dataset}", flush=True)
-    dataset_path = project_data.get_artifact(f"Floods_{dataset}").download("/data/dataset_floods")
+    random_sar_ids = []
+    random_opt_ids = []
+    cache_sar_dir = "/data/cache_SAR"
+    cache_opt_dir = "/data/cache_OPT"
+ 
+    print(f"Download: Floods_{dataset}_crop_norm", flush=True)
+    dataset_path = project_data.get_artifact(f"Floods_{dataset}_crop_norm").download("/data/dataset_floods")
     print("OK -> Download terminato", flush=True)
-
+ 
     save_dir = save_dir + "_" + job_name
     os.makedirs(save_dir, exist_ok=True)
-
-
+ 
+    # indicizzo gli ID gia' pronti nella cache (senza estrarre), poi estraggo solo i campioni scelti
     try:
         if test_sar:
-            sar_dir = os.path.join(dataset_path, "SAR")
-            sar_zip_map = {}
-            for zip_file in sorted(glob(os.path.join(sar_dir, "SAR_*.zip"))):
-                with zipfile.ZipFile(zip_file, 'r') as z:
-                    for n in z.namelist():
-                        if n.lower().endswith('.tif'):
-                            ID = os.path.basename(n).split('_SAR_')[0]
-                            sar_zip_map[ID] = zip_file
-            train_data_SAR_IDS = list(sar_zip_map.keys())
-            random_sar_ids = random.sample(train_data_SAR_IDS, min(n_samples, len(train_data_SAR_IDS))) if train_data_SAR_IDS else []
-            print(f"{len(train_data_SAR_IDS)} serie SAR trovate", flush=True)
+            sar_available = set()
+            for part_path in sorted(glob(os.path.join(dataset_path, "SAR", "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    sar_available.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+            random_sar_ids = random.sample(sorted(sar_available), min(n_samples, len(sar_available))) if sar_available else []
+            print(f"{len(sar_available)} serie SAR trovate", flush=True)
+ 
+            os.makedirs(cache_sar_dir, exist_ok=True)
+            wanted_sar = {f"{ID}.npy" for ID in random_sar_ids}
+            for part_path in sorted(glob(os.path.join(dataset_path, "SAR", "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    for name in z.namelist():
+                        if name in wanted_sar:
+                            z.extract(name, cache_sar_dir)
  
         if test_opt:
-            opt_dir = os.path.join(dataset_path, "OPT")
-            opt_zip_map = {}
-            for zip_file in sorted(glob(os.path.join(opt_dir, "OPT_*.zip"))):
-                with zipfile.ZipFile(zip_file, 'r') as z:
-                    for n in z.namelist():
-                        if n.lower().endswith('.tif'):
-                            ID = os.path.basename(n).split('_OPT_')[0]
-                            opt_zip_map[ID] = zip_file
-            train_data_OPT_IDS = list(opt_zip_map.keys())
-            random_opt_ids = random.sample(train_data_OPT_IDS, min(n_samples, len(train_data_OPT_IDS))) if train_data_OPT_IDS else []
-            print(f"{len(train_data_OPT_IDS)} serie OPT trovate", flush=True)
+            opt_available = set()
+            for part_path in sorted(glob(os.path.join(dataset_path, "OPT", "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    opt_available.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+            random_opt_ids = random.sample(sorted(opt_available), min(n_samples, len(opt_available))) if opt_available else []
+            print(f"{len(opt_available)} serie OPT trovate", flush=True)
+ 
+            os.makedirs(cache_opt_dir, exist_ok=True)
+            wanted_opt = {f"{ID}.npy" for ID in random_opt_ids}
+            for part_path in sorted(glob(os.path.join(dataset_path, "OPT", "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    for name in z.namelist():
+                        if name in wanted_opt:
+                            z.extract(name, cache_opt_dir)
  
     except Exception as e:
         print(f"EXC -> recupero liste: {e}", flush=True)
@@ -1986,43 +1991,36 @@ def test_encoders_visual(
         if sar_path:
             if monodimensional:
                 modelSAR = Singlemodal_CAE(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, mamba=mamba).to(device)
-
+ 
             else:
                 modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, n_head=8, d_k=8, ltae=ltae).to(device)
-
-
+ 
             state_dict = torch.load(sar_path, map_location=device)
             if all(k.startswith('module.') for k in state_dict.keys()):
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
             modelSAR.load_state_dict(state_dict)
             modelSAR.eval()
  
-            datasetSAR = Singlemodal_Loader(
-                listIDs=random_sar_ids, root=dataset_path, zip_map=sar_zip_map,
-                transform=None, patch_size=patch_size, n_images=n_images1,
-                n_channels=n_channels1, data_type='SAR'
-            )
-            loaderSAR = torch.utils.data.DataLoader(datasetSAR, batch_size=1, shuffle=False)
- 
             print("SERIE SAR:", flush=True)
             with torch.no_grad():
-                for i, im in enumerate(loaderSAR):
-                    im = im.to(device)
-
+                for i, ID in enumerate(random_sar_ids):
+                    im = np.load(os.path.join(cache_sar_dir, f"{ID}.npy"))
+                    im = torch.from_numpy(im).unsqueeze(0).to(device)   # aggiunge la dimensione batch (gia' croppato/normalizzato)
+ 
                     if monodimensional:
                         try:
                             latent_vector = modelSAR.encoder(im)
                         except AttributeError as e:
                             print(f"EXC -> nome encoder sar: {e}", flush=True)
-                            break    
+                            break
  
                         vector = latent_vector.cpu().numpy().flatten()
-                        print(f"ID {i}: {random_sar_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
+                        print(f"ID {i}: {ID} | shape: {list(latent_vector.shape)}", flush=True)
                         print(f"VEC: {np.round(vector, 4)}\n", flush=True)
  
                     save_reconstruction_pngs(
                         modelSAR, im, save_dir=save_dir,
-                        prefix=f"SAR_{random_sar_ids[i]}",
+                        prefix=f"SAR_{ID}",
                         channels=recon_channels, device=device,
                     )
  
@@ -2037,12 +2035,12 @@ def test_encoders_visual(
             opt_path = None
  
         if opt_path:
-
+ 
             if monodimensional:
                 modelOPT = Singlemodal_CAE(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, mamba=mamba).to(device)
-
+ 
             else:
-                modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, n_head=8, d_k=8, ltae=ltae).to(device)    
+                modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, n_head=8, d_k=8, ltae=ltae).to(device)
  
             state_dict = torch.load(opt_path, map_location=device)
             if all(k.startswith('module.') for k in state_dict.keys()):
@@ -2050,18 +2048,12 @@ def test_encoders_visual(
             modelOPT.load_state_dict(state_dict)
             modelOPT.eval()
  
-            datasetOPT = Singlemodal_Loader(
-                listIDs=random_opt_ids, root=dataset_path, zip_map=opt_zip_map,
-                transform=None, patch_size=patch_size, n_images=n_images2,
-                n_channels=n_channels2, data_type='OPT'
-            )
-            loaderOPT = torch.utils.data.DataLoader(datasetOPT, batch_size=1, shuffle=False)
- 
             print("SERIE OPT:", flush=True)
             with torch.no_grad():
-                for i, im in enumerate(loaderOPT):
-                    im = im.to(device)
-
+                for i, ID in enumerate(random_opt_ids):
+                    im = np.load(os.path.join(cache_opt_dir, f"{ID}.npy"))
+                    im = torch.from_numpy(im).unsqueeze(0).to(device)
+ 
                     if monodimensional:
                         try:
                             latent_vector = modelOPT.encoder(im)
@@ -2070,12 +2062,12 @@ def test_encoders_visual(
                             break
  
                         vector = latent_vector.cpu().numpy().flatten()
-                        print(f"ID {i}: {random_opt_ids[i]} | shape: {list(latent_vector.shape)}", flush=True)
+                        print(f"ID {i}: {ID} | shape: {list(latent_vector.shape)}", flush=True)
                         print(f"VEC: {np.round(vector, 4)}\n", flush=True)
  
                     save_reconstruction_pngs(
                         modelOPT, im, save_dir=save_dir,
-                        prefix=f"OPT_{random_opt_ids[i]}",
+                        prefix=f"OPT_{ID}",
                         channels=recon_channels, device=device,
                     )
  
@@ -2097,6 +2089,7 @@ def test_encoders_visual(
         print(f"EXC -> upload zip ricostruzioni: {e}", flush=True)
  
     return "TERMINATO"
+
 
 
 import os

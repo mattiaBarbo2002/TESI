@@ -23,11 +23,19 @@ PESI
 
 moco_Floods_Standard_moco_2D_convLstm_net_v4_200
 
-encoders-Floods_train_sar_2D_convLstm_v1_Standard_200
-encoders-Floods_train_opt_2D_convLstm_v1_Standard_200
+riduzione = (baseline − mia) / baseline × 100
+rapporto = baseline / mia
 
-encoders-Floods_train_sar_1D_v1_Standard_200
-encoders-Floods_train_opt_1D_v1_Standard_200
+encoders-Floods_train_sar_2D_convLstm_v1_Standard_200 -> 0.003701089686585861 -> 0.032255 -> 88,5%	8,72× più bassa
+encoders-Floods_train_opt_2D_convLstm_v1_Standard_200 -> 0.001852000632324523 -> 0.043498 -> 95,7%	23,49× più bassa
+
+encoders-Floods_train_sar_1D_v1_Standard_200 -> 0.015578912587853166 -> 51,7%	2,07× più bassa
+encoders-Floods_train_opt_1D_v1_Standard_200 -> 0.010190900272846777 -> 76,6%	4,27× più bassa
+
+8.318 -> 0,0244%
+moco_2D_net_v2 -> 5.470402221188657 -> 0,4210% ~17,3
+moco_2D_net_v3 -> 4.896006724571664 -> 0,7476% ~30,6
+moco_2D_net_v3 -> 4.832832649458059 -> 0,7963% ~32,6
 
 
 

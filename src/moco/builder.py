@@ -266,7 +266,7 @@ class MoCo2encoders_2d(nn.Module):
  
         self.simple_proj = simple_proj
         self.attn = attn
-        self.pool_grid = pool_grid   # NUOVO
+        self.pool_grid = pool_grid   
  
         # pesi encoder congelati, entrambi false, alleno solo MLP
         for param_q, param_k in zip(
@@ -280,25 +280,27 @@ class MoCo2encoders_2d(nn.Module):
         encoder_k_dim = self.encoder_k.output_dim
  
         # pooling (batch, channels, 64, 64) -> (batch, channels, pool_grid, pool_grid), poi flatten in contrastive_loss
-        # con pool_grid=1 e' esattamente il GAP di prima; con pool_grid>1 mantiene una griglia invece di collassare a un solo vettore
+        # pool_grid=1 e'GAP, con pool_grid>1 patch divisa in pool_grid quadrati, poi flatten -> vettore = 64(canali)*pool_grid
         self.pool_q = nn.AdaptiveAvgPool2d(pool_grid)
         self.pool_k = nn.AdaptiveAvgPool2d(pool_grid)
  
         if simple_proj:
  
-            proj_in_q = encoder_q_dim * pool_grid * pool_grid   # NUOVO: prima era solo encoder_q_dim (implicitamente pool_grid=1)
-            proj_in_k = encoder_k_dim * pool_grid * pool_grid   # NUOVO
+            proj_in_q = encoder_q_dim * pool_grid * pool_grid   
+            proj_in_k = encoder_k_dim * pool_grid * pool_grid   
  
             self.proj_q = nn.Sequential(
-                        nn.Linear(proj_in_q, dim),
-                        nn.ReLU(),
-                        nn.Linear(dim, dim),
-                    )
+                nn.Linear(proj_in_q, dim),
+                nn.ReLU(),
+                nn.Linear(dim, dim),
+                nn.Tanh()   # prova tanh
+            )
             
             self.proj_k = nn.Sequential(
                 nn.Linear(proj_in_k, dim),
                 nn.ReLU(),
                 nn.Linear(dim, dim),
+                nn.Tanh(),  # prova tanh
             )
  
             # inizializzazione MLP q (predefinita pytorch), e copia pesi per k
@@ -307,22 +309,22 @@ class MoCo2encoders_2d(nn.Module):
                 param_proj_k.requires_grad = False 
  
         else:
-            #
+            # hidden_channels_dim // 2
             self.conv_q = nn.Sequential(
-                nn.Conv2d(encoder_q_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),                  # 64->32
+                nn.Conv2d(encoder_q_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),                  # dim 64->32, c 16->128 
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
                 
-                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # 32->16
+                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16, c 128->128
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
             )
             self.conv_k = nn.Sequential(
-                nn.Conv2d(encoder_k_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(encoder_k_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
                 
-                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
             )
@@ -331,19 +333,21 @@ class MoCo2encoders_2d(nn.Module):
             if attn:
                 self.attn_q = nn.Conv2d(hidden_channels_dim, 1, kernel_size=1)
                 self.attn_k = nn.Conv2d(hidden_channels_dim, 1, kernel_size=1)
-                proj_in = hidden_channels_dim   # NUOVO: l'attention collassa sempre a un vettore, pool_grid qui non si applica
+                proj_in = hidden_channels_dim   
             else:
-                proj_in = hidden_channels_dim * pool_grid * pool_grid   # NUOVO: prima era solo hidden_channels_dim (implicitamente pool_grid=1)
+                proj_in = hidden_channels_dim * pool_grid * pool_grid   
  
             self.proj_q = nn.Sequential(
                 nn.Linear(proj_in, dim),
                 nn.ReLU(),
                 nn.Linear(dim, dim),
+                nn.Tanh()
             )
             self.proj_k = nn.Sequential(
                 nn.Linear(proj_in, dim),
                 nn.ReLU(),
                 nn.Linear(dim, dim),
+                nn.Tanh()
             )
  
             for param_q, param_k in zip(self.conv_q.parameters(), self.conv_k.parameters()):
@@ -547,6 +551,7 @@ class MoCo2encoders_2d(nn.Module):
         # print("ModelMoCoUnet(nn.Module)", "minibatch loss value", loss)
  
         return loss 
+
    
 
 
