@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from convlstm import ConvLSTM
-from ltae import LTAE2d
-from ltae import PositionalEncoder
+from .convlstm import ConvLSTM
+from .ltae import LTAE2d
+from .ltae import PositionalEncoder
 # from mambapy.mamba import MambaConfig, Mamba
 
 class ConvBlock(nn.Module):

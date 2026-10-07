@@ -17,8 +17,8 @@ import shutil
 import time
 import warnings
 
-import moco.builder
-import moco.loader
+import csv.src.moco.builder
+import csv.src.moco.loader
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -29,7 +29,7 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.datasets as datasets
-from multimodal_3Dconv_attention import Singlemodal_Encoder, Multimodal_Encoder, Singlemodal_CAE
+from csv.src.multimodal_3Dconv_attention import Singlemodal_Encoder, Multimodal_Encoder, Singlemodal_CAE
 import torchvision.transforms as transforms
 from tqdm import tqdm
 import pandas as pd
@@ -218,7 +218,7 @@ def main() -> None:
             else:
                 print("=> no checkpoint found at '{}'".format(args.resume_pretrainS2))
 
-        datasetS2 = moco.loader.Singlemodal_Loader(
+        datasetS2 = csv.src.moco.loader.Singlemodal_Loader(
             listIDs = train_data_IDS,
             root = traindir,
             transform = transforms.Compose(augmentation),
@@ -316,7 +316,7 @@ def main() -> None:
             else:
                 print("=> no checkpoint found at '{}'".format(args.resume_pretrainS1))
 
-        datasetS1 = moco.loader.Singlemodal_Loader(
+        datasetS1 = csv.src.moco.loader.Singlemodal_Loader(
             listIDs = train_data_IDS,
             root = traindir,
             transform = transforms.Compose(augmentation),
@@ -395,7 +395,7 @@ def main() -> None:
             print("=> loaded best checkpoint of S1 CAE '{}'".format(args.results_dir + '/modelS1_best.pth'))
     # create model MoCo model
     use_amp = True
-    model = moco.builder.MoCo2encoders(
+    model = csv.src.moco.builder.MoCo2encoders(
         base_encoder_q = modelS2.encoder,
         base_encoder_k = modelS1.encoder,
         dim=args.moco_dim,
@@ -442,7 +442,7 @@ def main() -> None:
     # logging
     results = {'lr': [], 'train_loss': []}
 
-    train_dataset = moco.loader.MoCo2encodersLoader(
+    train_dataset = csv.src.moco.loader.MoCo2encodersLoader(
         listIDs = train_data_IDS,
         root = traindir,
         transform = transforms.Compose(augmentation),

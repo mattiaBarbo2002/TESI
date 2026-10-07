@@ -6,15 +6,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
-import random
 
-from PIL import ImageFilter
 from torch.utils.data import Dataset
-import tifffile as tiff
 import os
 import numpy as np
 import rasterio
-import zipfile
 
 
 # lettura file zip senza estrarlo
@@ -122,6 +118,16 @@ class Singlemodal_Loader(Dataset):
         p_low = np.percentile(serie_to_array, 2)
         p_high = np.percentile(serie_to_array, 98)
         scale = p_high - p_low if (p_high - p_low) > 1e-6 else 1.0
+
+        """
+        p_low = np.nanpercentile(data, 2)
+        p_high = np.nanpercentile(data, 98)
+        scale = p_high - p_low if (p_high - p_low) > 1e-6 else 1.0
+        data = (data - p_low) / scale
+        data = np.nan_to_num(data, nan=0.0)
+        data = np.clip(data, 0.0, 1.0).astype(np.float32)
+        return data
+        """
 
         im = np.zeros((self.n_channels, self.n_images, self.patch_size, self.patch_size), dtype=np.float32)
 

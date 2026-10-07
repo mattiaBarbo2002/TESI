@@ -293,14 +293,14 @@ class MoCo2encoders_2d(nn.Module):
                 nn.Linear(proj_in_q, dim),
                 nn.ReLU(),
                 nn.Linear(dim, dim),
-                nn.Tanh()   # prova tanh
+                # nn.Tanh()   # prova tanh
             )
             
             self.proj_k = nn.Sequential(
                 nn.Linear(proj_in_k, dim),
                 nn.ReLU(),
                 nn.Linear(dim, dim),
-                nn.Tanh(),  # prova tanh
+                # nn.Tanh(),  # prova tanh
             )
  
             # inizializzazione MLP q (predefinita pytorch), e copia pesi per k
@@ -311,20 +311,20 @@ class MoCo2encoders_2d(nn.Module):
         else:
             # hidden_channels_dim // 2
             self.conv_q = nn.Sequential(
-                nn.Conv2d(encoder_q_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),                  # dim 64->32, c 16->128 
+                nn.Conv2d(encoder_q_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),                  # dim 64->32, c 16->128 
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
                 
-                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16, c 128->128
+                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16, c 128->128
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
             )
             self.conv_k = nn.Sequential(
-                nn.Conv2d(encoder_k_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(encoder_k_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
                 
-                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
             )
@@ -341,13 +341,13 @@ class MoCo2encoders_2d(nn.Module):
                 nn.Linear(proj_in, dim),
                 nn.ReLU(),
                 nn.Linear(dim, dim),
-                nn.Tanh()
+                # nn.Tanh()
             )
             self.proj_k = nn.Sequential(
                 nn.Linear(proj_in, dim),
                 nn.ReLU(),
                 nn.Linear(dim, dim),
-                nn.Tanh()
+                # nn.Tanh()
             )
  
             for param_q, param_k in zip(self.conv_q.parameters(), self.conv_k.parameters()):
