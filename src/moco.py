@@ -914,3 +914,6 @@ def moco_eval(
             print(f"{label:30s}{100 * rr['adiacente']:10.2f}%{100 * rr['vicino']:8.2f}%{100 * rr['medio']:7.2f}%{100 * rr['lontano']:8.2f}%{100 * rr['altro_evento']:10.2f}%", flush=True)
  
     return "TERMINATO -> MoCo Eval"
+
+
+

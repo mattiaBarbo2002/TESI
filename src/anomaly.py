@@ -16,27 +16,32 @@ from glob import glob
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from digitalhub_runtime_python import handler
-from sklearn.svm import OneClassSVM
-from sklearn.preprocessing import StandardScaler
 from scipy.stats import rankdata, spearmanr
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import OneClassSVM
+from sklearn.decomposition import PCA 
+from sklearn.metrics import roc_auc_score
 
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_2d
 from floodlib.loader import MoCo2encodersLoader
 from floodlib.builder import MoCo2encoders_2d
+
+
 
 matplotlib.use("Agg") 
 
 
 # notebook -> anomaly_detection
 
-@handler()
+handler()
 def ad_cosine(
-    job_name: str = "nome_job",          
+    job_name: str = "nome_job",
     dataset_standard: str = "Standard",
-    dataset_anomalies: str = "test",       
+    dataset_anomalies: str = "test",
     moco_version: str = "check_v1",
-    simple_proj: bool = False,           
-    attn: bool = False,                  
+    simple_proj: bool = False,
+    attn: bool = False,
     hidden_channels_dim: int = 64,
     pool_grid: int = 1,
     moco_dim: int = 128,
@@ -46,13 +51,16 @@ def ad_cosine(
     patch_size: int = 256,
     n_images1: int = 4, n_channels1: int = 2,       # sar
     n_images2: int = 4, n_channels2: int = 10,      # ottico
-    n_normal_eval: int = 2402,                     
-    n_threshold_series: int = 0,                    
+    n_normal_eval: int = 1577,
+    n_threshold_series: int = 0,
     num_anomalies: int = 100,
-    n_std: float = 1.0,                             
+    n_std: float = 1.0,
     batch_size: int = 32,
     workers: int = 0,
+    min_flood_pct: float = 10.0,                    # % minima di patch allagata (classe 2 in MASK/); 0 = nessun filtro
 ):
+    import io
+ 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
  
@@ -79,7 +87,7 @@ def ad_cosine(
     print(f"Lettura serie normali: Floods_{dataset_standard}_crop_norm", flush=True)
     normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
     ids_per_sensor_normal = {}
-    
+ 
     for sensor in ("SAR", "OPT"):
         ids = set()
         for part_path in sorted(glob(os.path.join(normal_path, sensor, "part*.zip"))):
@@ -104,15 +112,34 @@ def ad_cosine(
     print(f"Lettura serie anomale: {dataset_anomalies}", flush=True)
     anom_path = project_data.get_artifact(f"{dataset_anomalies}").download(f"/data/{dataset_anomalies}")
     ids_per_sensor_anom = {}
-    
+ 
     for sensor in ("SAR", "OPT"):
         ids = set()
         for part_path in sorted(glob(os.path.join(anom_path, sensor, "part*.zip"))):
             with zipfile.ZipFile(part_path, 'r') as z:
                 ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
         ids_per_sensor_anom[sensor] = ids
-        
+ 
     anom_ids = ids_per_sensor_anom["SAR"] & ids_per_sensor_anom["OPT"]
+ 
+    # filtro per superficie alluvionale minima, calcolata dalle maschere (classe 2 = flood)
+    if min_flood_pct > 0:
+        mask_parts = sorted(glob(os.path.join(anom_path, "MASK", "part*.zip")))
+        if not mask_parts:
+            raise ValueError(f"cartella MASK/ non trovata in {dataset_anomalies}: serve l'artifact creato con include_mask=True")
+        flood_pct = {}
+        for part_path in mask_parts:
+            with zipfile.ZipFile(part_path, 'r') as z:
+                for name in z.namelist():
+                    if name.endswith('.npy') and name[:-4] in anom_ids:
+                        mask = np.load(io.BytesIO(z.read(name)))
+                        flood_pct[name[:-4]] = 100.0 * float((mask == 2).sum()) / mask.size
+        n_before = len(anom_ids)
+        anom_ids = {ID for ID in anom_ids if flood_pct.get(ID, 0.0) >= min_flood_pct}
+        print(f"OK -> filtro flood >= {min_flood_pct:g}%: {len(anom_ids)} serie su {n_before}", flush=True)
+ 
+    if len(anom_ids) < num_anomalies:
+        raise ValueError(f"serie anomale disponibili: {len(anom_ids)}, richieste num_anomalies={num_anomalies}")
  
     anom_ids = sorted(anom_ids)
     random.seed(1)
@@ -157,9 +184,9 @@ def ad_cosine(
         print("OK -> modello MoCo caricato",  "\n", flush=True)
     except Exception as e:
         print(f"EXC -> caricamento modello MoCo: {e}", flush=True)
-      
  
-    # esecuzione moco pesi congelati -> calcolo soglia 
+ 
+    # esecuzione moco pesi congelati -> calcolo soglia
     print("Cosine similarity: soglia", flush=True)
     dataset_thr = MoCo2encodersLoader(
             listIDs=normal_thr_ids, sar_map={}, opt_map={}, transform=None,
@@ -262,7 +289,7 @@ def ad_cosine(
         tn = int((~value & (label == 0)).sum())
         prec = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
         rec = tp / (tp + fn)
-        
+ 
         tests_metrics[key] = {
             "TP": tp, "FP": fp, "FN": fn, "TN": tn,
             "FA_rate": fp / (fp + tn), "MA_rate": fn / (fn + tp),
@@ -294,16 +321,17 @@ def ad_cosine(
     }).to_csv(os.path.join(out_dir, "similarities.csv"), index=False)
     with open(os.path.join(out_dir, "anomaly_results.json"), 'w') as f:
         json.dump(results, f, indent=2)
-    print(json.dumps(results, indent=2), flush=True)   
+    print(json.dumps(results, indent=2), flush=True)
  
     try:
         shutil.make_archive(out_dir, 'zip', out_dir)
-        project_work.log_artifact(name=f"anomaly_results_{job_name}", source=f"{out_dir}.zip", kind='artifact')
+        project_work.log_artifact(name=f"anomaly_results_cosine_{job_name}", source=f"{out_dir}.zip", kind='artifact')
         print("OK -> risultati salvati", flush=True)
     except Exception as e:
         print(f"EXC -> upload risultati: {e}", flush=True)
  
     return "TERMINATO -> anomaly detection"
+
 
 
 
@@ -332,12 +360,15 @@ def ad_ocsvm(
     standardize: bool = True,                       # StandardScaler (fit sulle serie di fit) sul vettore concatenato [q; k]
     batch_size: int = 32,
     workers: int = 0,
+    min_flood_pct: float = 10.0,                    # % minima di patch allagata (classe 2 in MASK/); 0 = nessun filtro
 ):
+    import io
+ 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
  
     # sklearn subito, cosi' se manca si ferma prima dei download e delle estrazioni
-
+ 
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
  
@@ -395,6 +426,25 @@ def ad_ocsvm(
         ids_per_sensor_anom[sensor] = ids
  
     anom_ids = ids_per_sensor_anom["SAR"] & ids_per_sensor_anom["OPT"]
+ 
+    # filtro per superficie alluvionale minima, calcolata dalle maschere (classe 2 = flood)
+    if min_flood_pct > 0:
+        mask_parts = sorted(glob(os.path.join(anom_path, "MASK", "part*.zip")))
+        if not mask_parts:
+            raise ValueError(f"cartella MASK/ non trovata in {dataset_anomalies}: serve l'artifact creato con include_mask=True")
+        flood_pct = {}
+        for part_path in mask_parts:
+            with zipfile.ZipFile(part_path, 'r') as z:
+                for name in z.namelist():
+                    if name.endswith('.npy') and name[:-4] in anom_ids:
+                        mask = np.load(io.BytesIO(z.read(name)))
+                        flood_pct[name[:-4]] = 100.0 * float((mask == 2).sum()) / mask.size
+        n_before = len(anom_ids)
+        anom_ids = {ID for ID in anom_ids if flood_pct.get(ID, 0.0) >= min_flood_pct}
+        print(f"OK -> filtro flood >= {min_flood_pct:g}%: {len(anom_ids)} serie su {n_before}", flush=True)
+ 
+    if len(anom_ids) < num_anomalies:
+        raise ValueError(f"serie anomale disponibili: {len(anom_ids)}, richieste num_anomalies={num_anomalies}")
  
     anom_ids = sorted(anom_ids)
     random.seed(1)
@@ -574,12 +624,546 @@ def ad_ocsvm(
  
     try:
         shutil.make_archive(out_dir, 'zip', out_dir)
-        project_work.log_artifact(name=f"anomaly_results_{job_name}", source=f"{out_dir}.zip", kind='artifact')
+        project_work.log_artifact(name=f"anomaly_results_ocsvm_{job_name}", source=f"{out_dir}.zip", kind='artifact')
         print("OK -> risultati salvati", flush=True)
     except Exception as e:
         print(f"EXC -> upload risultati: {e}", flush=True)
  
     return "TERMINATO -> anomaly detection (OC-SVM)"
+
+
+
+
+
+
+
+@handler()
+def ad_pca(
+    job_name: str = "nome_job",
+    old_vectors: str = "",
+    dataset_standard: str = "Standard",
+    dataset_anomalies: str = "test",
+    moco_version: str = "check_v1",
+    simple_proj: bool = False,
+    attn: bool = False,
+    hidden_channels_dim: int = 64,
+    pool_grid: int = 1,
+    moco_dim: int = 128,
+    moco_k: int = 4096,
+    moco_m: float = 0.999,
+    moco_t: float = 0.07,
+    patch_size: int = 256,
+    n_images1: int = 4, n_channels1: int = 2,       # sar
+    n_images2: int = 4, n_channels2: int = 10,      # ottico
+    standardize: bool = True,                       # StandardScaler sul vettore concatenato [q; k]
+    batch_size: int = 32,
+    workers: int = 0,
+    min_flood_area: float = 10.0,                    # % floods da mask
+    k_pca: int = 8,
+):
+ 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device, "\n", flush=True)
+  
+    project_work = dh.get_project("floods")
+    project_data = dh.get_project("datasets")
+ 
+    # lettura ids serie anomale
+    print(f"Lettura serie anomale: {dataset_anomalies}", flush=True)
+    anom_path = project_data.get_artifact(f"{dataset_anomalies}").download(f"/data/{dataset_anomalies}")
+    ids_per_sensor_anom = {}
+ 
+    for sensor in ("SAR", "OPT"):
+        ids = set()
+        for part_path in sorted(glob(os.path.join(anom_path, sensor, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+        ids_per_sensor_anom[sensor] = ids
+ 
+    anom_ids = ids_per_sensor_anom["SAR"] & ids_per_sensor_anom["OPT"]
+    num_fit_series = len(anom_ids)
+ 
+    # filtro superficie alluvione
+    if min_flood_area > 0:
+        try:
+            mask_parts = sorted(glob(os.path.join(anom_path, "MASK", "part*.zip")))
+
+            flood_area = {}
+            for part_path in mask_parts:
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    for name in z.namelist():
+                        if name.endswith('.npy') and name[:-4] in anom_ids:
+                            mask = np.load(io.BytesIO(z.read(name)))
+                            flood_area[name[:-4]] = 100.0 * float((mask == 2).sum()) / mask.size
+
+            anom_ids = {ID for ID in anom_ids if flood_area.get(ID, 0.0) >= min_flood_area}
+            print(f"OK -> flood >= {min_flood_area:g}%: {len(anom_ids)} serie su {len(anom_ids)}", flush=True)
+
+        except Exception as e:
+            print(f"EXC -> flood_ {e}", flush=True)
+ 
+    anom_ids = sorted(anom_ids)
+    print(f"OK -> {len(anom_ids)} serie anomale", "\n", flush=True)
+
+
+    # lettura serie normali
+    print(f"Lettura serie normali: Floods_{dataset_standard}_crop_norm", flush=True)
+    normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
+
+    # import ids lits from moco training
+    p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    with open(p, 'r') as f:
+        test_ids = json.load(f)
+    print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
+    num_fit_series = len(test_ids) - num_fit_series
+ 
+    random.seed(0)
+    shuffled_test_ids = random.sample(test_ids, len(test_ids)) 
+
+    ids_per_sensor_normal = {}
+ 
+    for sensor in ("SAR", "OPT"):
+        ids = set()
+        for part_path in sorted(glob(os.path.join(normal_path, sensor, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+        ids_per_sensor_normal[sensor] = ids
+ 
+    normal_ids = ids_per_sensor_normal["SAR"] & ids_per_sensor_normal["OPT"]
+ 
+    shuffled_test_ids = [ID for ID in shuffled_test_ids if ID in normal_ids]
+    normal_fit_ids = shuffled_test_ids[:num_fit_series]                                             # fit -> iperpiano
+    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]              # anomaly detection 
+
+
+    print(f"OK -> {len(test_ids)} serie normali tot, {len(normal_fit_ids)} serie fit, {len(normal_test_ids)} serie test normali")
+
+    if old_vectors:
+        print(f"Upload embedding: anomaly_results_pca_{old_vectors}", flush=True)
+        p = project_work.get_artifact(f"anomaly_results_pca_{old_vectors}").download("/data/old_vectors.zip", overwrite=True)
+        with zipfile.ZipFile(p) as z:
+            z.extract("embeddings.npz", "/data/old_vectors")
+            old_results = json.loads(z.read("anomaly_results.json"))
+
+        for key, value in (("moco_version", moco_version), ("dataset_anomalies", dataset_anomalies)):
+            if old_results.get(key) != value:
+                raise ValueError(f"old_vectors={old_vectors} ha {key}={old_results.get(key)}, questo job ha {value}")
+
+        old = np.load("/data/old_vectors/embeddings.npz")
+        lookup = {}
+        for g in ("fit", "normal", "anom"):
+            for i, ID in enumerate(old[f"{g}_ids"]):
+                lookup[str(ID)] = (old[f"{g}_q"][i], old[f"{g}_k"][i])
+
+        def take(ids, nome):
+            missing = [ID for ID in ids if ID not in lookup]
+            if missing:
+                raise ValueError(f"{len(missing)} serie {nome} non presenti in {old_vectors} (es. {missing[:3]})")
+            return np.stack([lookup[ID][0] for ID in ids]), np.stack([lookup[ID][1] for ID in ids])
+
+        q_fit, k_fit = take(normal_fit_ids, "fit")
+        q_normal, k_normal = take(normal_test_ids, "normali test")
+        q_anom, k_anom = take(anom_ids, "anomale")
+        print(f"OK -> embedding caricatu: {len(q_fit)} fit, {len(q_normal)} normali, {len(q_anom)} anomale", "\n", flush=True)
+
+    else:
+
+        print("calcolo vettori MoCo", flush = True)
+
+        # estrazione serie normal_ids, fit_ids + test_ad_ids
+        sar_dir = "/data/cache_SAR"
+        opt_dir = "/data/cache_OPT"
+
+        os.makedirs(sar_dir, exist_ok=True)
+        os.makedirs(opt_dir, exist_ok=True)
+        wanted_normal_series = {f"{ID}.npy" for ID in set(normal_fit_ids) | set(normal_test_ids)}
+        for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
+            for part_path in sorted(glob(os.path.join(normal_path, modality, "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    for name in z.namelist():
+                        if name in wanted_normal_series:
+                            z.extract(name, cache_dir)
+
+        # caricamento pesi moco
+        try:
+            encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+            encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+
+            model = MoCo2encoders_2d(
+                base_encoder_q=encoderOPT.encoder,
+                base_encoder_k=encoderSAR.encoder,
+                dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                symmetric=False, device=device,
+                hidden_channels_dim=hidden_channels_dim,
+                simple_proj=simple_proj,
+                pool_grid=pool_grid,
+                attn=attn
+            ).to(device)
+
+            w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+            checkpoint = torch.load(w_path, map_location=device)
+            state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+            model.load_state_dict(state_dict)
+            model.eval()
+            print("OK -> modello MoCo caricato",  "\n", flush=True)
+
+        except Exception as e:
+            print(f"EXC -> caricamento modello MoCo: {e}", flush=True)
+
+        # embedding MoCo a pesi congelati: q (ottico) e k (SAR), un vettore per serie nell'ordine di ids
+        # 2 matrici: rows = serie, cols = dim
+        def embed(ids):
+            dataset = MoCo2encodersLoader(
+                    listIDs=ids, sar_map={}, opt_map={}, transform=None,
+                    patch_size=patch_size,
+                    n_images1=n_images1, n_channels1=n_channels1,
+                    n_images2=n_images2, n_channels2=n_channels2,
+                )
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
+
+            out_q, out_k = [], []
+            with torch.no_grad(), torch.cuda.amp.autocast():
+                for im_q, im_k in tqdm(loader, mininterval=30.0):   # im_q = OPT, im_k = SAR
+                    im_q = im_q.to(device)
+                    im_k = im_k.to(device)
+                    _, q, k = model.contrastive_loss(im_q, im_k)
+                    out_q.append(q.float().flatten(1).cpu())
+                    out_k.append(k.float().flatten(1).cpu())
+            return torch.cat(out_q).numpy(), torch.cat(out_k).numpy()
+
+        # embedding serie di fit 
+        print("Embedding MoCo: serie di fit pac", flush=True)
+        q_fit, k_fit = embed(normal_fit_ids)
+        print(f"OK -> normali fit: {len(q_fit)} serie, q {q_fit.shape[1]} + k {k_fit.shape[1]} = {q_fit.shape[1] + k_fit.shape[1]} dim", "\n", flush=True)
+
+        # embedding serie normali
+        print("Embedding MoCo: serie normali", flush=True)
+        q_normal, k_normal = embed(normal_test_ids)
+        print(f"OK -> normali test: {len(q_normal)} serie, q {q_normal.shape[1]} + k {k_normal.shape[1]} = {q_normal.shape[1] + k_normal.shape[1]} dim", "\n", flush=True)
+
+        # pulizia cartelle
+        for d in ("/data/cache_SAR", "/data/cache_OPT"):
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d, exist_ok=True)
+
+        # estrazione serie anomale
+        os.makedirs(sar_dir, exist_ok=True)
+        os.makedirs(opt_dir, exist_ok=True)
+        wanted_anom_series = {f"{ID}.npy" for ID in anom_ids}
+        for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
+            for part_path in sorted(glob(os.path.join(anom_path, modality, "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    for name in z.namelist():
+                        if name in wanted_anom_series:
+                            z.extract(name, cache_dir)
+
+        # embedding serie anomale
+        print("Embedding MoCo: serie anomale", flush=True)
+        q_anom, k_anom = embed(anom_ids)
+        print(f"OK -> anomale: {len(q_anom)} serie, q {q_anom.shape[1]} + k {k_anom.shape[1]} = {q_anom.shape[1] + k_anom.shape[1]} dim", "\n", flush=True)
+ 
+    # concatenazione
+    z_fit = np.concatenate([q_fit, k_fit], axis=1)
+    z_normal = np.concatenate([q_normal, k_normal], axis=1)
+    z_anom = np.concatenate([q_anom, k_anom],axis=1)
+
+    if standardize:
+        scaler = StandardScaler().fit(z_fit)
+        z_fit, z_normal, z_anom = scaler.transform(z_fit), scaler.transform(z_normal), scaler.transform(z_anom)
+
+    pca_full = PCA().fit(z_fit)                      
+    #cum = np.cumsum(pca_full.explained_variance_ratio_)
+    # [ 1  2  5  9 13 19 25 43 55 63 73]
+    #print(np.searchsorted(cum, [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.99]) + 1)     
+
+    pca = PCA(n_components=k_pca).fit(z_fit)
+    res_normal = ((z_normal - pca.inverse_transform(pca.transform(z_normal))) ** 2).sum(axis=1)
+    res_anom = ((z_anom - pca.inverse_transform(pca.transform(z_anom))) ** 2).sum(axis=1)
+
+    y = np.r_[np.zeros(len(res_normal)), np.ones(len(res_anom))]
+    print(roc_auc_score(y, np.r_[res_normal, res_anom]))
+
+    # salvataggio e risultati
+    out_dir = f"/data/anomaly_results_pca_{job_name}"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir)
+    
+    # punteggi
+    score_normal = -res_normal.astype(np.float64)
+    score_anom = -res_anom.astype(np.float64)
+    auroc = roc_auc_score(np.r_[np.zeros(len(res_normal)), np.ones(len(res_anom))], np.r_[res_normal, res_anom])
+    
+    df = pd.DataFrame({
+        "ID": normal_test_ids + anom_ids,
+        "label": [0] * len(score_normal) + [1] * len(score_anom),
+        "score": np.concatenate([score_normal, score_anom]),
+    })
+    df.to_csv(os.path.join(out_dir, "scores.csv"), index=False)
+    
+    # soglia
+    false_allarms = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)                             
+    normali = df[df.label == 0].sample(frac=1, random_state=0)        
+    meta = len(normali) // 2
+    thr_scores = normali.score.values[:meta]                          
+    eval_norm = normali.score.values[meta:]                           
+    anom = df[df.label == 1].score.values
+    
+    rules = {}
+    for fa in false_allarms:
+        thr = float(np.quantile(thr_scores, fa))                        
+        tp = int((anom < thr).sum()); fn = len(anom) - tp               
+        fp = int((eval_norm < thr).sum()); tn = len(eval_norm) - fp     
+        prec = tp / (tp + fp) if tp + fp else 0.0
+        rec = tp / (tp + fn)
+        rules[f"pca score < soglia (FA {fa:.0%})"] = {
+            "soglia": thr, "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+            "FA_rate": fp / (fp + tn), "MA_rate": fn / (fn + tp), "REC": rec, "PREC": prec,
+            "F1": 2 * prec * rec / (prec + rec) if tp > 0 else 0.0,
+        }
+        print(f"FA {fa:.0%}: soglia {thr:.4f} | TP {tp} FP {fp} FN {fn} TN {tn} | FA {fp/(fp+tn):.3f} REC {rec:.3f} PREC {prec:.3f}", flush=True)
+    
+    # 3) vettori (servono ai job di analisi successivi)
+    np.savez_compressed(
+        os.path.join(out_dir, "embeddings.npz"),
+        fit_ids=np.array(normal_fit_ids), fit_q=q_fit, fit_k=k_fit,
+        normal_ids=np.array(normal_test_ids), normal_q=q_normal, normal_k=k_normal,
+        anom_ids=np.array(anom_ids), anom_q=q_anom, anom_k=k_anom,
+    )
+    
+    # 4) riassunto
+    results = {
+        "job_name": job_name, "metodo": "pca_residuo", "dataset_anomalies": dataset_anomalies,
+        "moco_version": moco_version, "min_flood_area": min_flood_area, "standardize": standardize,
+        "k": int(k_pca), "varianza_spiegata": float(cum[k_pca - 1]),
+        "n_fit": len(normal_fit_ids), "n_normali": len(normal_test_ids), "n_anomale": len(anom_ids),
+        "auroc": float(auroc),
+        "rules": rules,
+    }
+    with open(os.path.join(out_dir, "anomaly_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    
+    shutil.make_archive(out_dir, "zip", out_dir)
+    project_work.log_artifact(name=f"anomaly_results_pca_{job_name}", source=f"{out_dir}.zip", kind="artifact")
+
+
+
+
+@handler()
+def ad_md(
+    job_name: str = "nome_job",
+    dataset_standard: str = "Standard",
+    dataset_anomalies: str = "test",
+    moco_version: str = "check_v1",
+    simple_proj: bool = False,
+    attn: bool = False,
+    hidden_channels_dim: int = 64,
+    pool_grid: int = 1,
+    moco_dim: int = 128,
+    moco_k: int = 4096,
+    moco_m: float = 0.999,
+    moco_t: float = 0.07,
+    patch_size: int = 256,
+    n_images1: int = 4, n_channels1: int = 2,       # sar
+    n_images2: int = 4, n_channels2: int = 10,      # ottico
+    standardize: bool = True,                       # StandardScaler sul vettore concatenato [q; k]
+    batch_size: int = 32,
+    workers: int = 0,
+    min_flood_area: float = 10.0,                    # % floods da mask
+    k_pca: int = 8,
+):
+ 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device, "\n", flush=True)
+  
+    project_work = dh.get_project("floods")
+    project_data = dh.get_project("datasets")
+ 
+    # lettura ids serie anomale
+    print(f"Lettura serie anomale: {dataset_anomalies}", flush=True)
+    anom_path = project_data.get_artifact(f"{dataset_anomalies}").download(f"/data/{dataset_anomalies}")
+    ids_per_sensor_anom = {}
+ 
+    for sensor in ("SAR", "OPT"):
+        ids = set()
+        for part_path in sorted(glob(os.path.join(anom_path, sensor, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+        ids_per_sensor_anom[sensor] = ids
+ 
+    anom_ids = ids_per_sensor_anom["SAR"] & ids_per_sensor_anom["OPT"]
+    num_fit_series = len(anom_ids)
+ 
+    # filtro superficie alluvione
+    if min_flood_area > 0:
+        try:
+            mask_parts = sorted(glob(os.path.join(anom_path, "MASK", "part*.zip")))
+
+            flood_area = {}
+            for part_path in mask_parts:
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    for name in z.namelist():
+                        if name.endswith('.npy') and name[:-4] in anom_ids:
+                            mask = np.load(io.BytesIO(z.read(name)))
+                            flood_area[name[:-4]] = 100.0 * float((mask == 2).sum()) / mask.size
+
+            anom_ids = {ID for ID in anom_ids if flood_area.get(ID, 0.0) >= min_flood_area}
+            print(f"OK -> flood >= {min_flood_area:g}%: {len(anom_ids)} serie su {num_fit_series}", flush=True)
+
+        except Exception as e:
+            print(f"EXC -> flood_ {e}", flush=True)
+ 
+    anom_ids = sorted(anom_ids)
+    print(f"OK -> {len(anom_ids)} serie anomale", "\n", flush=True)
+
+
+    # import ids lits from moco training
+    p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    with open(p, 'r') as f:
+        test_ids = json.load(f)
+    print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
+ 
+    random.seed(0)
+    shuffled_test_ids = random.sample(test_ids, len(test_ids))     
+
+    # lettura serie normali
+    print(f"Lettura serie normali: Floods_{dataset_standard}_crop_norm", flush=True)
+    normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
+    ids_per_sensor_normal = {}
+ 
+    for sensor in ("SAR", "OPT"):
+        ids = set()
+        for part_path in sorted(glob(os.path.join(normal_path, sensor, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+        ids_per_sensor_normal[sensor] = ids
+ 
+    normal_ids = ids_per_sensor_normal["SAR"] & ids_per_sensor_normal["OPT"]
+ 
+    shuffled_test_ids = [ID for ID in shuffled_test_ids if ID in normal_ids]
+    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]              # anomaly detection 
+    normal_fit_ids = shuffled_test_ids[:num_fit_series]                                             # fit -> iperpiano
+
+    print(f"OK -> {len(normal_fit_ids)} serie fit pac, {len(normal_test_ids)} serie test normali")
+ 
+    # estrazione serie normal_ids, fit_ids + test_ad_ids
+    sar_dir = "/data/cache_SAR"
+    opt_dir = "/data/cache_OPT"
+ 
+    os.makedirs(sar_dir, exist_ok=True)
+    os.makedirs(opt_dir, exist_ok=True)
+    wanted_normal_series = {f"{ID}.npy" for ID in set(normal_fit_ids) | set(normal_test_ids)}
+    for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
+        for part_path in sorted(glob(os.path.join(normal_path, modality, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                for name in z.namelist():
+                    if name in wanted_normal_series:
+                        z.extract(name, cache_dir)
+ 
+    # caricamento pesi moco
+    try:
+        encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+        encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+ 
+        model = MoCo2encoders_2d(
+            base_encoder_q=encoderOPT.encoder,
+            base_encoder_k=encoderSAR.encoder,
+            dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+            symmetric=False, device=device,
+            hidden_channels_dim=hidden_channels_dim,
+            simple_proj=simple_proj,
+            pool_grid=pool_grid,
+            attn=attn
+        ).to(device)
+ 
+        w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+        checkpoint = torch.load(w_path, map_location=device)
+        state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+        model.load_state_dict(state_dict)
+        model.eval()
+        print("OK -> modello MoCo caricato",  "\n", flush=True)
+
+    except Exception as e:
+        print(f"EXC -> caricamento modello MoCo: {e}", flush=True)
+ 
+    # embedding MoCo a pesi congelati: q (ottico) e k (SAR), un vettore per serie nell'ordine di ids
+    # 2 matrici: rows = serie, cols = dim
+    def embed(ids):
+        dataset = MoCo2encodersLoader(
+                listIDs=ids, sar_map={}, opt_map={}, transform=None,
+                patch_size=patch_size,
+                n_images1=n_images1, n_channels1=n_channels1,
+                n_images2=n_images2, n_channels2=n_channels2,
+            )
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
+ 
+        out_q, out_k = [], []
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            for im_q, im_k in tqdm(loader, mininterval=30.0):   # im_q = OPT, im_k = SAR
+                im_q = im_q.to(device)
+                im_k = im_k.to(device)
+                _, q, k = model.contrastive_loss(im_q, im_k)
+                out_q.append(q.float().flatten(1).cpu())
+                out_k.append(k.float().flatten(1).cpu())
+        return torch.cat(out_q).numpy(), torch.cat(out_k).numpy()
+ 
+    # embedding serie di fit 
+    print("Embedding MoCo: serie di fit pac", flush=True)
+    q_fit, k_fit = embed(normal_fit_ids)
+    print(f"OK -> normali fit: {len(q_fit)} serie, q {q_fit.shape[1]} + k {k_fit.shape[1]} = {q_fit.shape[1] + k_fit.shape[1]} dim", "\n", flush=True)
+ 
+    # embedding serie normali
+    print("Embedding MoCo: serie normali", flush=True)
+    q_normal, k_normal = embed(normal_test_ids)
+    print(f"OK -> normali test: {len(q_normal)} serie, q {q_normal.shape[1]} + k {k_normal.shape[1]} = {q_normal.shape[1] + k_normal.shape[1]} dim", "\n", flush=True)
+ 
+    # pulizia cartelle
+    for d in ("/data/cache_SAR", "/data/cache_OPT"):
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+ 
+    # estrazione serie anomale
+    os.makedirs(sar_dir, exist_ok=True)
+    os.makedirs(opt_dir, exist_ok=True)
+    wanted_anom_series = {f"{ID}.npy" for ID in anom_ids}
+    for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
+        for part_path in sorted(glob(os.path.join(anom_path, modality, "part*.zip"))):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                for name in z.namelist():
+                    if name in wanted_anom_series:
+                        z.extract(name, cache_dir)
+ 
+    # embedding serie anomale
+    print("Embedding MoCo: serie anomale", flush=True)
+    q_anom, k_anom = embed(anom_ids)
+    print(f"OK -> anomale: {len(q_anom)} serie, q {q_anom.shape[1]} + k {k_anom.shape[1]} = {q_anom.shape[1] + k_anom.shape[1]} dim", "\n", flush=True)
+ 
+    # concatenazione
+    z_fit = np.concatenate([q_fit, k_fit], axis=1)
+    z_normal = np.concatenate([q_normal, k_normal], axis=1)
+    z_anom = np.concatenate([q_anom, k_anom],axis=1)
+
+    if standardize:
+        scaler = StandardScaler().fit(z_fit)
+        z_fit, z_normal, z_anom = scaler.transform(z_fit), scaler.transform(z_normal), scaler.transform(z_anom)    
+
+    
+
+
+ 
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -596,19 +1180,19 @@ def _ae_auroc(score_normal, score_anom):
     n1, n2 = len(score_normal), len(score_anom)
     r = rankdata(np.concatenate([score_normal, score_anom]))
     return float((r[:n1].sum() - n1 * (n1 + 1) / 2) / (n1 * n2))
-
-
+ 
+ 
 def _ae_auroc_se(a, n1, n2):
     """Errore standard dell'AUROC (Hanley-McNeil, 1982) per n1 normali e n2 anomale."""
     q1, q2 = a / (2 - a), 2 * a * a / (1 + a)
     return float(np.sqrt((a * (1 - a) + (n1 - 1) * (q1 - a * a) + (n2 - 1) * (q2 - a * a)) / (n1 * n2)))
-
-
+ 
+ 
 def _ae_auroc_se_null(n1, n2):
     """Errore standard dell'AUROC se non c'e' nessun segnale (ipotesi nulla)."""
     return float(np.sqrt((n1 + n2 + 1) / (12.0 * n1 * n2)))
-
-
+ 
+ 
 # ----------------------------------------------------------------------------------------------
 # dati
 # ----------------------------------------------------------------------------------------------
@@ -626,8 +1210,8 @@ def _ae_load_embeddings(npz_path):
     if e["fit_q"].shape[1] != e["normal_q"].shape[1] or e["fit_q"].shape[1] != e["anom_q"].shape[1]:
         raise ValueError("dimensione di q diversa tra fit, normal e anom")
     return e
-
-
+ 
+ 
 def _ae_inputs(e):
     """{nome: (fit, normal, anom)} per gli ingressi q (ottico), k (SAR) e [q;k] (concatenazione)."""
     out = {}
@@ -635,8 +1219,8 @@ def _ae_inputs(e):
         out[name] = tuple(e[f"{part}_{name}"] for part in ("fit", "normal", "anom"))
     out["[q;k]"] = tuple(np.hstack([e[f"{part}_q"], e[f"{part}_k"]]) for part in ("fit", "normal", "anom"))
     return out
-
-
+ 
+ 
 # ----------------------------------------------------------------------------------------------
 # punteggi di normalita'
 # ----------------------------------------------------------------------------------------------
@@ -644,8 +1228,8 @@ def _ae_cosine_qk(q, k):
     """Similarita' coseno tra q e k della stessa serie (il punteggio usato finora)."""
     nq, nk = np.linalg.norm(q, axis=1), np.linalg.norm(k, axis=1)
     return (q * k).sum(axis=1) / (nq * nk + 1e-12)
-
-
+ 
+ 
 def _ae_ocsvm_normality(X_fit, X_n, X_a, nu, gamma_mult=1.0, standardize=True):
     """OC-SVM RBF; gamma = gamma_mult x 'scale' di sklearn (1 / (n_features * var(X)) sui dati standardizzati)."""
     from sklearn.preprocessing import StandardScaler
@@ -656,27 +1240,60 @@ def _ae_ocsvm_normality(X_fit, X_n, X_a, nu, gamma_mult=1.0, standardize=True):
     gamma = "scale" if gamma_mult == 1.0 else gamma_mult / (X_fit.shape[1] * X_fit.var())
     m = OneClassSVM(kernel="rbf", nu=nu, gamma=gamma).fit(X_fit)
     return m.decision_function(X_n), m.decision_function(X_a)
-
-
+ 
+ 
 def _ae_knn_cosine_normality(X_fit, X_n, X_a, n_neighbors, standardize=True):
     """Media delle n_neighbors similarita' coseno piu' alte verso le serie di fit."""
     if standardize:
         from sklearn.preprocessing import StandardScaler
         sc = StandardScaler().fit(X_fit)
         X_fit, X_n, X_a = sc.transform(X_fit), sc.transform(X_n), sc.transform(X_a)
-
+ 
     def unit(X):
         return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
-
+ 
     F = unit(X_fit)
-
+ 
     def score(Y):
         s = unit(Y) @ F.T
         return np.partition(s, -n_neighbors, axis=1)[:, -n_neighbors:].mean(axis=1)
-
+ 
     return score(X_n), score(X_a)
-
-
+ 
+ 
+def _ae_mahalanobis_normality(X_fit, X_n, X_a, standardize=True):
+    """Distanza di Mahalanobis dal centro delle serie di fit: misura quanto un punto e' lontano dal centro in unita'
+    della variabilita' normale LUNGO OGNI DIREZIONE (una direzione in cui le normali variano pochissimo pesa molto).
+    La covarianza e' stimata con lo shrinkage di Ledoit-Wolf, che la tira verso l'identita' quanto serve a renderla
+    stabile con 256 dimensioni e ~2500 campioni. Punteggio di normalita' = -distanza^2.
+    Restituisce (punteggio normali, punteggio anomale, {'shrinkage': coefficiente scelto da Ledoit-Wolf in [0, 1]})."""
+    from sklearn.covariance import LedoitWolf
+    from sklearn.preprocessing import StandardScaler
+    if standardize:
+        sc = StandardScaler().fit(X_fit)
+        X_fit, X_n, X_a = sc.transform(X_fit), sc.transform(X_n), sc.transform(X_a)
+    lw = LedoitWolf().fit(X_fit)
+    return -lw.mahalanobis(X_n), -lw.mahalanobis(X_a), {"shrinkage": float(lw.shrinkage_)}
+ 
+ 
+def _ae_pca_residual_normality(X_fit, X_n, X_a, n_components, standardize=True):
+    """Errore di ricostruzione PCA: si impara sul fit il sottospazio a `n_components` dimensioni in cui le normali
+    variano di piu'; un punto e' anomalo se ha molta parte fuori da quel sottospazio (non si lascia ricostruire).
+    Punteggio di normalita' = -(norma al quadrato del residuo).
+    Restituisce (punteggio normali, punteggio anomale, {'var_spiegata': varianza del fit spiegata dai componenti})."""
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    if standardize:
+        sc = StandardScaler().fit(X_fit)
+        X_fit, X_n, X_a = sc.transform(X_fit), sc.transform(X_n), sc.transform(X_a)
+    pca = PCA(n_components=n_components, svd_solver="full").fit(X_fit)
+ 
+    def score(X):
+        return -((X - pca.inverse_transform(pca.transform(X))) ** 2).sum(axis=1)
+ 
+    return score(X_n), score(X_a), {"var_spiegata": float(pca.explained_variance_ratio_.sum())}
+ 
+ 
 def _ae_otsu_threshold_1d(x, bins=64):
     """Soglia di Otsu su un istogramma a `bins` classi: massimizza la varianza tra le due classi.
     Restituisce il bordo tra le due classi (= centro della classe scelta da skimage + mezza larghezza)."""
@@ -691,8 +1308,8 @@ def _ae_otsu_threshold_1d(x, bins=64):
     m2 = (np.cumsum((counts * centers)[::-1]) / w2[::-1])[::-1]
     var_between = w1[:-1] * w2[1:] * (m1[:-1] - m2[1:]) ** 2
     return float(edges[int(np.argmax(var_between)) + 1])
-
-
+ 
+ 
 def _ae_thresholds(X, method="otsu", bins=64):
     """Una soglia per dimensione, calcolata su X (N, D)."""
     if method == "median":
@@ -700,33 +1317,33 @@ def _ae_thresholds(X, method="otsu", bins=64):
     if method == "otsu":
         return np.array([_ae_otsu_threshold_1d(X[:, j], bins) for j in range(X.shape[1])])
     raise ValueError(f"metodo soglie sconosciuto: {method}")
-
-
+ 
+ 
 def _ae_hamming_counts(B1, B2):
     """(n1, n2): numero di bit diversi tra ogni riga di B1 e ogni riga di B2 (codici 0/1)."""
     a, b = B1.astype(np.float32), B2.astype(np.float32)
     return a @ (1.0 - b).T + (1.0 - a) @ b.T
-
-
+ 
+ 
 def _ae_knn_hamming_normality(B_fit, B_n, B_a, n_neighbors):
     """Meno la frazione media di bit diversi dai n_neighbors codici di fit piu' vicini."""
     D = B_fit.shape[1]
-
+ 
     def score(B):
         h = _ae_hamming_counts(B, B_fit)
         return -np.partition(h, n_neighbors - 1, axis=1)[:, :n_neighbors].mean(axis=1) / D
-
+ 
     return score(B_n), score(B_a)
-
-
+ 
+ 
 def _ae_bit_balance(B):
     """Quanto sono bilanciati i bit sul fit: p_min_medio = media di min(p, 1-p) (0.5 = tutti bilanciati)."""
     p = B.mean(axis=0)
     return {"dim": int(B.shape[1]),
             "p_min_medio": float(np.minimum(p, 1 - p).mean()),
             "bit_sbilanciati(<10% o >90%)": int(((p < 0.1) | (p > 0.9)).sum())}
-
-
+ 
+ 
 # ----------------------------------------------------------------------------------------------
 # flood per serie (per la stratificazione)
 # ----------------------------------------------------------------------------------------------
@@ -746,8 +1363,8 @@ def _ae_flood_px_from_masks(mask_dir, flood_class=2, out_csv=None):
     if out_csv:
         df.to_csv(out_csv, index=False)
     return df
-
-
+ 
+ 
 def _ae_stratify(scores, anom_ids, flood_df, labels, n_bins=4, min_group=30):
     """Per ogni metodo in `labels`: correlazione di Spearman tra normalita' e frazione di flood (tra le anomale)
     e AUROC contro TUTTE le normali per gruppi di anomale con frazione di flood crescente.
@@ -761,7 +1378,7 @@ def _ae_stratify(scores, anom_ids, flood_df, labels, n_bins=4, min_group=30):
         print(f"ATTENZIONE -> {int((~in_csv).sum())} anomale non nel CSV dei flood, escluse dalla stratificazione", flush=True)
     ids = [i for i, ok in zip(anom_ids, in_csv) if ok]
     frac = np.array([f.loc[i, "flood_px"] / total.loc[i] for i in ids])
-
+ 
     groups = []                                              # (nome, maschera booleana sulle anomale con ID nel CSV)
     zero = frac == 0
     if zero.sum() >= min_group:
@@ -773,7 +1390,7 @@ def _ae_stratify(scores, anom_ids, flood_df, labels, n_bins=4, min_group=30):
             g = (~zero) & (frac >= lo) & ((frac <= hi) if hi == edges[-1] else (frac < hi))
             if g.sum() >= min_group:
                 groups.append((f"{100 * lo:.1f}-{100 * hi:.1f}%", g))
-
+ 
     rows = []
     for lab in labels:
         sn, sa = scores[lab]
@@ -785,8 +1402,8 @@ def _ae_stratify(scores, anom_ids, flood_df, labels, n_bins=4, min_group=30):
             row[f"AUROC {name} (n={int(g.sum())})"] = f"{a:.3f}±{_ae_auroc_se(a, len(sn), int(g.sum())):.3f}"
         rows.append(row)
     return pd.DataFrame(rows), groups
-
-
+ 
+ 
 def _ae_flood_probe(e, flood_df, n_splits=5, n_neighbors=20, seed=0):
     """Quanta informazione sul flood c'e' nei vettori, usando SOLO le anomale (nessuna normale: niente confusione
     di dominio). Si prevede la frazione di flood da q, da k e da [q;k] con due modelli (regressione lineare Ridge e
@@ -799,7 +1416,7 @@ def _ae_flood_probe(e, flood_df, n_splits=5, n_neighbors=20, seed=0):
     from sklearn.neighbors import KNeighborsRegressor
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
-
+ 
     f = flood_df.drop_duplicates("ID").set_index("ID")
     total = f["total_px"] if "total_px" in f.columns else pd.Series(65536, index=f.index)
     ids_all = list(e["anom_ids"])
@@ -812,7 +1429,7 @@ def _ae_flood_probe(e, flood_df, n_splits=5, n_neighbors=20, seed=0):
     y = np.array([f.loc[i, "flood_px"] / total.loc[i] for i in ids])
     if np.ptp(y) == 0:
         raise ValueError("frazione di flood identica per tutte le anomale: niente da prevedere")
-
+ 
     groups = np.array([str(i).split("_")[0] for i in ids])
     n_groups = len(set(groups))
     if n_groups >= n_splits:
@@ -825,7 +1442,7 @@ def _ae_flood_probe(e, flood_df, n_splits=5, n_neighbors=20, seed=0):
         cv = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
         cv_desc = (f"KFold a {n_splits} fold (solo {n_groups} gruppi nell'ID: non basta per raggruppare, "
                    f"serie dello stesso evento possono finire in fold diversi)")
-
+ 
     Xs = {"q": e["anom_q"][keep], "k": e["anom_k"][keep], "[q;k]": np.hstack([e["anom_q"][keep], e["anom_k"][keep]])}
     models = {
         "lineare (Ridge)": lambda: make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-1, 4, 11))),
@@ -840,14 +1457,14 @@ def _ae_flood_probe(e, flood_df, n_splits=5, n_neighbors=20, seed=0):
             rows.append({"ingresso": inp, "modello": name, "rho": float(rho),
                          "se_rho": float((1 - rho ** 2) / np.sqrt(len(y) - 3)), "R2": float(r2), "n": int(len(y))})
     return pd.DataFrame(rows), cv_desc
-
-
+ 
+ 
 # ----------------------------------------------------------------------------------------------
 # esecuzione completa
 # ----------------------------------------------------------------------------------------------
 def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
         gamma_mults=(0.1, 0.25, 0.5, 1.0, 2.0, 4.0), nu_list=(0.01, 0.05, 0.2),
-        n_neighbors=(5, 20), otsu_bins=64, strat_top=3, n_bins=4,
+        n_neighbors=(5, 20), pca_components=(8, 16, 32, 64), otsu_bins=64, strat_top=3, n_bins=4,
         out_dir="analisi_embeddings", plot=True, show=False):
     os.makedirs(out_dir, exist_ok=True)
     e = _ae_load_embeddings(npz_path)
@@ -855,7 +1472,7 @@ def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
     D = e["fit_q"].shape[1]
     print(f"fit {n_fit} | normali {n_n} | anomale {n_a} | dim q = dim k = {D} | "
           f"SE sotto ipotesi nulla = {_ae_auroc_se_null(n_n, n_a):.4f}", flush=True)
-
+ 
     # parametri del job, se anomaly_results.json e' accanto all'npz: nu/standardize di default e controllo di riproduzione
     job = None
     jpath = os.path.join(os.path.dirname(os.path.abspath(npz_path)), "anomaly_results.json")
@@ -868,23 +1485,23 @@ def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
         standardize = job["ocsvm"]["standardize"] if job and "ocsvm" in job else True
     print(f"OC-SVM di riferimento: nu={nu}, standardize={standardize}"
           f"{' (dal job)' if job else ''}", flush=True)
-
+ 
     X = _ae_inputs(e)
     rows, scores = [], {}
     n0 = _ae_auroc_se_null(n_n, n_a)
-
-    def add(family, inp, params, sn, sa):
+ 
+    def add(family, inp, params, sn, sa, extra=None):
         a = _ae_auroc(sn, sa)
         se = _ae_auroc_se(a, len(sn), len(sa))
         label = f"{family} | {inp} | {params}"
         scores[label] = (np.asarray(sn), np.asarray(sa))
         rows.append({"famiglia": family, "ingresso": inp, "parametri": params,
-                     "auroc": a, "se": se, "sigma_dal_caso": (a - 0.5) / n0})
+                     "auroc": a, "se": se, "sigma_dal_caso": (a - 0.5) / n0, **(extra or {})})
         return label
-
+ 
     # 1) baseline: coseno tra q e k
     add("coseno", "q,k", "-", _ae_cosine_qk(e["normal_q"], e["normal_k"]), _ae_cosine_qk(e["anom_q"], e["anom_k"]))
-
+ 
     # 2) OC-SVM: ablazione degli ingressi x sensibilita' a gamma, poi sensibilita' a nu
     print("OC-SVM ...", flush=True)
     for inp, (xf, xn, xa) in X.items():
@@ -897,15 +1514,30 @@ def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
             continue
         sn, sa = _ae_ocsvm_normality(xf, xn, xa, nv, 1.0, standardize)
         add("OC-SVM", "[q;k]", f"gamma=scale x1.0 | nu={nv}", sn, sa)
-
+ 
     # 3) kNN coseno verso le serie di fit
     print("kNN coseno ...", flush=True)
     for inp, (xf, xn, xa) in X.items():
         for nn in n_neighbors:
             sn, sa = _ae_knn_cosine_normality(xf, xn, xa, nn, standardize)
             add("kNN coseno", inp, f"k={nn}", sn, sa)
-
-    # 4) binarizzazione per dimensione (soglie calcolate sul fit) + Hamming
+ 
+    # 4) Mahalanobis con covarianza Ledoit-Wolf (stimata sul fit)
+    print("Mahalanobis ...", flush=True)
+    for inp, (xf, xn, xa) in X.items():
+        sn, sa, info = _ae_mahalanobis_normality(xf, xn, xa, standardize)
+        add("Mahalanobis", inp, "Ledoit-Wolf", sn, sa, info)
+ 
+    # 5) errore di ricostruzione PCA (sottospazio stimato sul fit)
+    print("PCA ...", flush=True)
+    for inp, (xf, xn, xa) in X.items():
+        for nc in pca_components:
+            if nc >= min(xf.shape[0] - 1, xf.shape[1]):
+                continue                                                         # PCA completa: residuo nullo, inutile
+            sn, sa, info = _ae_pca_residual_normality(xf, xn, xa, nc, standardize)
+            add("PCA residuo", inp, f"n_comp={nc}", sn, sa, info)
+ 
+    # 6) binarizzazione per dimensione (soglie calcolate sul fit) + Hamming
     print("Binarizzazione + Hamming ...", flush=True)
     balance = {}
     for method in ("otsu", "median"):
@@ -926,15 +1558,15 @@ def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
         add("Hamming q-k", "q,k", f"{tag} | soglia condivisa",
             -((e["normal_q"] > thr_s) != (e["normal_k"] > thr_s)).mean(axis=1),
             -((e["anom_q"] > thr_s) != (e["anom_k"] > thr_s)).mean(axis=1))
-
+ 
     res = pd.DataFrame(rows)
-
+ 
     # ------------------------------------------------------------------ stampa
     pd.set_option("display.width", 200, "display.max_columns", 30, "display.max_colwidth", 80)
     print("\n=== AUROC (alto = distingue; 0.5 = caso) ===")
     base = res[res.famiglia == "coseno"].iloc[0]
     print(f"coseno q,k: {base.auroc:.3f} ± {base.se:.3f}\n")
-
+ 
     oc = res[res.famiglia == "OC-SVM"].copy()
     oc["gm"] = oc.parametri.str.extract(r"x([\d.]+)")[0].astype(float)
     oc["nu_"] = oc.parametri.str.extract(r"nu=([\d.]+)")[0].astype(float)
@@ -944,22 +1576,29 @@ def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
     print("OC-SVM [q;k], sensibilita' a nu (gamma=scale):")
     print(oc[(oc.ingresso == "[q;k]") & (oc.gm == 1.0)].sort_values("nu_")[["nu_", "auroc", "se"]]
           .rename(columns={"nu_": "nu"}).round(3).to_string(index=False), "\n")
-
+ 
     for fam in ("kNN coseno", "kNN Hamming", "Hamming q-k"):
         print(f"{fam}:")
         print(res[res.famiglia == fam][["ingresso", "parametri", "auroc", "se"]].round(3).to_string(index=False), "\n")
-
+ 
+    print("Mahalanobis (covarianza Ledoit-Wolf; shrinkage 0 = covarianza empirica, 1 = nessuna correlazione tra dimensioni):")
+    print(res[res.famiglia == "Mahalanobis"][["ingresso", "parametri", "auroc", "se", "shrinkage"]]
+          .round(3).to_string(index=False), "\n")
+    print("PCA, errore di ricostruzione (var_spiegata = quota della varianza delle normali di fit catturata dai componenti):")
+    print(res[res.famiglia == "PCA residuo"][["ingresso", "parametri", "var_spiegata", "auroc", "se"]]
+          .round(3).to_string(index=False), "\n")
+ 
     print("Bilanciamento dei bit sul fit (p_min_medio 0.5 = perfetto; bit sbilanciati = dimensioni quasi costanti):")
     bal = pd.DataFrame(balance).T
     bal[["dim", "bit_sbilanciati(<10% o >90%)"]] = bal[["dim", "bit_sbilanciati(<10% o >90%)"]].astype(int)
     print(bal.round(3).to_string(), "\n")
-
+ 
     if job and "auroc_ocsvm_low_anom" in job and job.get("ocsvm", {}).get("gamma") == "scale":
         mine = res[(res.famiglia == "OC-SVM") & (res.ingresso == "[q;k]") &
                    (res.parametri == f"gamma=scale x1.0 | nu={nu}")].auroc.iloc[0]
         print(f"Controllo di riproduzione: AUROC job = {job['auroc_ocsvm_low_anom']:.4f} | qui = {mine:.4f} "
               f"| differenza = {abs(job['auroc_ocsvm_low_anom'] - mine):.1e}\n")
-
+ 
     # ------------------------------------------------------------------ stratificazione per frazione di flood
     strat = None
     if flood_csv:
@@ -968,13 +1607,18 @@ def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
         labels = [f"coseno | q,k | -",
                   f"OC-SVM | [q;k] | gamma=scale x1.0 | nu={nu}"] + \
                  [f"{r.famiglia} | {r.ingresso} | {r.parametri}" for r in top.itertuples()]
+        for fam in ("Mahalanobis", "PCA residuo"):                              # il migliore di ogni famiglia nuova c'e' sempre
+            sub = res[res.famiglia == fam]
+            if len(sub):
+                b = sub.sort_values("auroc", ascending=False).iloc[0]
+                labels.append(f"{b.famiglia} | {b.ingresso} | {b.parametri}")
         labels = list(dict.fromkeys(labels))                                    # senza duplicati, ordine mantenuto
         strat, groups = _ae_stratify(scores, list(e["anom_ids"]), flood_df, labels, n_bins=n_bins)
         print("=== Per frazione di flood delle anomale (AUROC contro tutte le normali) ===")
         print("Se il segnale e' flood: rho < 0 e AUROC che sale con la frazione. Se e' dominio: rho ~ 0 e AUROC piatto.")
         print(strat.to_string(index=False), "\n")
         strat.to_csv(os.path.join(out_dir, "stratificazione_flood.csv"), index=False)
-
+ 
         # quanta informazione sul flood c'e' nei vettori (solo anomale, senza confusione di dominio)
         probe, cv_desc = _ae_flood_probe(e, flood_df)
         print("=== Quanta informazione sul flood c'e' nei vettori (solo anomale, nessuna normale) ===")
@@ -987,9 +1631,9 @@ def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
               f"Se il rho della regressione e' molto piu' alto, l'informazione c'e' e il rilevatore non la sfrutta. "
               f"Attenzione: nuvole e altre caratteristiche della scena correlate col flood possono contribuire.\n")
         probe.to_csv(os.path.join(out_dir, "diagnostica_flood.csv"), index=False)
-
+ 
     res.to_csv(os.path.join(out_dir, "auroc_metodi.csv"), index=False)
-
+ 
     # ------------------------------------------------------------------ grafico
     if plot:
         import matplotlib.pyplot as plt
@@ -1025,26 +1669,26 @@ def _ae_run(npz_path, flood_csv=None, nu=None, standardize=None,
         if show:
             plt.show()
         plt.close(fig)
-
+ 
     print(f"OK -> risultati in {os.path.abspath(out_dir)}", flush=True)
     return res, scores
-
-
+ 
+ 
 class _AeTee:
     """Scrive la stessa uscita sul log del job e su report.txt."""
     def __init__(self, *streams):
         self.streams = streams
-
+ 
     def write(self, s):
         for st in self.streams:
             st.write(s)
         return len(s)
-
+ 
     def flush(self):
         for st in self.streams:
             st.flush()
-
-
+ 
+ 
 @handler()
 def analyze_anomalies(
     results_job: str = "net_v3_ocsvm",      # job OC-SVM da analizzare: legge l'artifact anomaly_results_{results_job}
@@ -1058,8 +1702,9 @@ def analyze_anomalies(
 ):
     """
     Analisi offline degli embedding (q ottico, k SAR) salvati da train_anomaly_detection_ocsvm, senza GPU e senza MoCo:
-      - AUROC di coseno, OC-SVM (q / k / [q;k], sensibilita' a gamma e nu), kNN coseno, kNN Hamming e Hamming q-k
-        con soglie per dimensione di Otsu o mediana (calcolate sulle normali di fit);
+      - AUROC di coseno, OC-SVM (q / k / [q;k], sensibilita' a gamma e nu), kNN coseno, distanza di Mahalanobis
+        (covarianza Ledoit-Wolf), errore di ricostruzione PCA (8/16/32/64 componenti), kNN Hamming e Hamming q-k
+        con soglie per dimensione di Otsu o mediana (tutto stimato sulle sole normali di fit);
       - AUROC e correlazione di Spearman per frazione di flood delle anomale (pixel classe `flood_class` della maschera):
         se il segnale e' flood l'AUROC sale con la frazione, se e' dominio resta piatto;
       - diagnostica sul solo insieme delle anomale (nessuna normale, quindi senza confusione di dominio): quanta
@@ -1069,22 +1714,22 @@ def analyze_anomalies(
     """
     import matplotlib
     matplotlib.use("Agg")
-
+ 
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-
+ 
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
-
+ 
     work_dir = save_dir + "_" + job_name
     shutil.rmtree(work_dir, ignore_errors=True)
     in_dir = os.path.join(work_dir, "in")
     out_dir = os.path.join(work_dir, "out")
     os.makedirs(in_dir, exist_ok=True)
     os.makedirs(out_dir, exist_ok=True)
-
+ 
     # 1) risultati del job OC-SVM: embeddings.npz + anomaly_results.json
     print(f"Download: anomaly_results_{results_job}", flush=True)
     zip_in = project_work.get_artifact(f"anomaly_results_{results_job}").download(
@@ -1101,7 +1746,7 @@ def analyze_anomalies(
         job = json.load(f)
     print(f"OK -> job {job.get('job_name')} | n_fit {job.get('n_fit')} | n_normali {job.get('n_normali')} | "
           f"n_anomale {job.get('n_anomale')} | AUROC job {job.get('auroc_ocsvm_low_anom')}", flush=True)
-
+ 
     # 2) maschere delle anomale -> pixel flood per serie
     masks_name = dataset_masks or job.get("dataset_anomalies", "")
     if not masks_name:
@@ -1115,27 +1760,27 @@ def analyze_anomalies(
     flood_csv = os.path.join(out_dir, "flood_px.csv")
     flood_df = _ae_flood_px_from_masks(mask_dir, flood_class=flood_class, out_csv=flood_csv)
     print(f"OK -> {len(flood_df)} maschere lette da {masks_name}/MASK", flush=True)
-
+ 
     with np.load(npz_path) as d:
         anom_ids = set(d["anom_ids"].tolist())
     n_cov = len(anom_ids & set(flood_df.ID))
     print(f"OK -> maschera trovata per {n_cov}/{len(anom_ids)} serie anomale", flush=True)
     if n_cov == 0:
         raise RuntimeError("nessuna serie anomala ha una maschera: dataset_masks non corrisponde alle serie del job")
-
+ 
     # 3) analisi (stampa sul log e su report.txt)
     with open(os.path.join(out_dir, "report.txt"), "w") as rep:
         with contextlib.redirect_stdout(_AeTee(sys.stdout, rep)):
             res, scores = _ae_run(npz_path, flood_csv=flood_csv, nu=(nu if nu > 0 else None), standardize=None,
                                   otsu_bins=otsu_bins, n_bins=n_flood_bins, out_dir=out_dir, plot=True, show=False)
-
+ 
     best = res.sort_values("auroc", ascending=False).iloc[0]
     with open(os.path.join(out_dir, "riassunto.json"), "w") as f:
         json.dump({"results_job": results_job, "dataset_masks": masks_name, "n_maschere_anomale": int(n_cov),
                    "auroc_job": job.get("auroc_ocsvm_low_anom"),
                    "migliore": {"famiglia": best.famiglia, "ingresso": best.ingresso, "parametri": best.parametri,
                                 "auroc": float(best.auroc), "se": float(best.se)}}, f, indent=2)
-
+ 
     zip_base = work_dir.rstrip("/") + "_out"
     shutil.make_archive(zip_base, "zip", out_dir)
     project_work.log_artifact(
@@ -1144,5 +1789,6 @@ def analyze_anomalies(
         source=f"{zip_base}.zip",
     )
     print(f"OK -> artifact analisi_embeddings_{job_name}: {sorted(os.listdir(out_dir))}", flush=True)
-
-    return "TERMINATO"    
+ 
+    return "TERMINATO"
+    
