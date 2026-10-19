@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from .convlstm import ConvLSTM
-from .ltae import LTAE2d
+
 from .ltae import PositionalEncoder
-# from mambapy.mamba import MambaConfig, Mamba
+from .ltae import LTAE2d
+from .ltae import SpatialAttn2d
+
 
 class ConvBlock(nn.Module):
     
@@ -221,6 +224,73 @@ class CBAM(nn.Module):
         Ms = Ms.view(Ms.size(0), 1, 1, Ms.size(2), Ms.size(3))
         Mf2 = Ms * Mf1
         return Mf2
+
+
+class spatialCBAM(nn.Module):
+    def __init__(self, in_channel, reduction_ratio=16, dilation=1):
+        super(spatialCBAM, self).__init__()
+        self.hid_channel = max(in_channel // reduction_ratio, 1)   # riduzione canali feature, in temporal cbam era 1 perche solo 4 istanti
+        self.dilation = dilation
+
+        # blocco (t, H, W) compresso in un numero per canale
+        self.globalAvgPool = nn.AdaptiveAvgPool3d(1)    
+        self.globalMaxPool = nn.AdaptiveMaxPool3d(1)    
+
+        # come temporal ma su canali no tempo
+        self.mlp = nn.Sequential(
+            nn.Linear(in_features=in_channel, out_features=self.hid_channel),   
+            nn.ReLU(),
+            nn.Linear(in_features=self.hid_channel, out_features=in_channel)    
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+        # convoluzione (1x7x7), usata dopo per trovare pixel importanti
+        # kernel temporale 1 -> stessa conv 7x7 applicata a ogni istante separatamente
+        # out = (in + 2·padding − dilation·(kernel − 1) − 1) / stride + 1 da documentazione nn.conv2d
+        # per avere out = in da formula pad deve essere 3
+        self.conv1 = nn.Conv3d(2, 1, kernel_size=(1, 7, 7), stride=1,
+                               padding=(0, 3 * self.dilation, 3 * self.dilation),
+                               dilation=(1, self.dilation, self.dilation), bias=False)
+
+    def forward(self, x):
+
+        # cosa guardare: importanza ciascun canale
+        avgOut = self.globalAvgPool(x)
+        avgOut = avgOut.view(avgOut.size(0), -1)
+        avgOut = self.mlp(avgOut)
+
+        # max a mlp
+        maxOut = self.globalMaxPool(x)
+        maxOut = maxOut.view(maxOut.size(0), -1)
+        maxOut = self.mlp(maxOut)
+
+        # somma valori e applica sigmoid (percentuali da 0 a 1)
+        # moltiplica Mc (vettore percentuale per canale) con x: identifica canali utili
+        # Mc: (Batch, Canali, 1, 1, 1) * x: (Batch, Canali, Tempo, H, W)
+        Mc = self.sigmoid(avgOut + maxOut)
+        Mc = Mc.view(Mc.size(0), Mc.size(1), 1, 1, 1)
+        Mf1 = Mc * x
+
+        # dove guardare: mappa di calore per ogni istante
+        # schiaccia solo i canali di Mf1, il tempo resta separato
+
+        # sigmoid(conv1x7x7( [MaxPool(F); AvgPool(F)]))
+        # amax e mean su dim 1 = canali, keepdim lascia la dimensione a 1 -> (batch, 1, t, H, W)
+        # cat = concatenazione canali -> Ms = (batch, 2, t, H, W)
+        maxOut = torch.amax(Mf1, dim=1, keepdim=True)
+        avgOut = torch.mean(Mf1, dim=1, keepdim=True)
+        Ms = torch.cat((maxOut, avgOut), dim=1)
+
+        # prende mappa max e mappa avg di ogni istante e genera una mappa unica per istante
+        # sigmoid = Ms mappa di attenzione (pixel importanti 1, poco importanti 0) -> (batch, 1, t, H, W)
+        # già a 5 dimensioni
+        # moltiplica (1 + Ms) e Mf1: pixel importanti valori da 1 a 2, gli altri restano invariati
+        Ms = self.conv1(Ms)
+        Ms = self.sigmoid(Ms)
+        Mf2 = (1 + Ms) * Mf1
+        return Mf2    
 
 
 class Singlemodal_Encoder(nn.Module):
@@ -679,6 +749,157 @@ class Singlemodal_CAE_2d(nn.Module):
         x = self.stage6(x)                                          # (batch, 64, 4, 256, 256)
         x = self.conv1(x)       
         return x                                                 
+
+
+
+# con attention
+
+class Singlemodal_Encoder_attn(nn.Module):
+    def __init__(self, input_dim=2, output_dim=16, n_images=4, n_head=8, d_k=8, ltae=False, spac_net=False):
+        super(Singlemodal_Encoder_attn, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.n_images = n_images
+        self.ltae = ltae
+        self.spac_net = spac_net
+
+        # stage 0: scansione (1x7x7) considera un t alla volta
+        self.conv1 = nn.Sequential(
+            nn.Conv3d(input_dim, 16, kernel_size=(1, 7, 7), padding='same', stride=(1, 1, 1)),
+            nn.BatchNorm3d(16),
+            nn.ReLU()
+        )
+
+        # gate spaziale a 256x256, prima del primo stride
+        # reduction_ratio=4 
+        self.gate0 = spatialCBAM(16, reduction_ratio=4)
+
+        # stage 1-2: ridimensione spaziale H e W (256 -> 128 -> 64)
+        # CBAM(canali in uscita dal ConvBlock) = ultimo valore di filters
+        self.stage1 = nn.Sequential(ConvBlock(16, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)), spatialCBAM(64))
+        self.stage2 = nn.Sequential(ConvBlock(64, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)), spatialCBAM(64))
+
+        # stage 3-6: dim spaziale rimane 64x64, i canali aumentano a 256
+        self.stage3 = nn.Sequential(ConvBlock(64, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)), spatialCBAM(128))
+        self.stage4 = nn.Sequential(ConvBlock(128, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)), spatialCBAM(128))
+        self.stage5 = nn.Sequential(ConvBlock(128, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)), spatialCBAM(256))
+        self.stage6 = nn.Sequential(ConvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)), spatialCBAM(256))
+
+        # attn spaziale a 64x64: ogni pixel si confronta con tutta la mappa
+        # sr_ratio=4 -> key/value su mappa 16x16
+        if spac_net:
+            self.self_attn = SpatialAttn2d(256, n_head=8, sr_ratio=4)
+
+        # Ltae : attention e fusione 4 istanti, output canali = output_dim
+        if self.ltae:
+            self.temporal_attn = LTAE2d(
+                in_channels=256,
+                n_head=n_head,
+                d_k=d_k,
+                mlp=[256, output_dim],
+                d_model=256,
+                T=1000,
+                return_att=False,
+                positional_encoding=True,
+            )
+        else:
+            self.conv_lstm = ConvLSTM(input_dim=256, hidden_dim=output_dim, kernel_size=(3, 3),
+                                       num_layers=1, batch_first=True, bias=True, return_all_layers=False)
+
+    def forward(self, x):
+        x = self.conv1(x.float())               # (batch, 16, 4, 256, 256)
+
+        x = self.gate0(x)                   # stessa shape
+        x = self.stage1(x)                      # (batch, 64, 4, 128, 128)
+        x = self.stage2(x)                      # (batch, 64, 4, 64, 64)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.stage5(x)
+        x = self.stage6(x)                      # (batch, 256, 4, 64, 64)
+
+        if self.spac_net:
+            x = self.self_attn(x)               # stessa shape
+
+        x = x.permute(0, 2, 1, 3, 4)            # (batch, channels, time, H, W) -> (batch, time, channels, H, W)
+
+        if self.ltae:
+            batch_positions = torch.arange(self.n_images, device=x.device).float().unsqueeze(0).expand(x.size(0), -1)
+            x = self.temporal_attn(x, batch_positions=batch_positions)  # (batch, output_dim, 64, 64)
+        else:
+            _, last_states = self.conv_lstm(x)
+            x = last_states[0][0]               # (batch, output_dim, 64, 64)
+
+        return x
+
+
+class Singlemodal_CAE_attn(nn.Module):
+    def __init__(self, input_dim=2, output_dim=16, n_images=4, n_head=8, d_k=8, ltae=False, spac_net=False):
+        super(Singlemodal_CAE_attn, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.n_images = n_images
+        self.ltae = ltae
+        self.spac_net = spac_net
+
+        # i flag passano all'encoder: gate e self-attention stanno solo lì
+        self.encoder = Singlemodal_Encoder_attn(input_dim=input_dim, output_dim=output_dim, n_images=n_images, n_head=n_head, d_k=d_k, ltae=ltae, spac_net=spac_net)
+
+        if self.ltae:
+            self.decoder_pos_encoder = PositionalEncoder(d=self.output_dim, T=1000, repeat=None)
+
+        # ConvLSTM per ricreare dimensione temporale iniziale:
+        # stesso input ripetuto 4 volte (output encoder), hidden state genera istante 1, poi aggiorna il suo stato -> istante 2 è diverso anche se input è lo stesso
+        # lstm dovrebbe imparare evoluzione temporale e stagionale
+        self.conv_lstm = ConvLSTM(input_dim=output_dim, hidden_dim=256, kernel_size=(3, 3),
+                                  num_layers=1, batch_first=True, bias=True, return_all_layers=False)
+
+        # stage 1-4: solo canali, dim spaziale (64x64)
+        # CBAM(canali in uscita dal NewDeconvBlock) = ultimo valore di filters
+        self.stage1 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)), spatialCBAM(256))
+        self.stage2 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1, 3, 3), filters=[64, 64, 256], strides=(1, 1, 1)), spatialCBAM(256))
+        self.stage3 = nn.Sequential(NewDeconvBlock(256, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)), spatialCBAM(128))
+        self.stage4 = nn.Sequential(NewDeconvBlock(128, kernel_size=(1, 3, 3), filters=[32, 32, 128], strides=(1, 1, 1)), spatialCBAM(128))
+
+        # stage 5-6: dim spaziale 64 -> 128 -> 256
+        self.stage5 = nn.Sequential(NewDeconvBlock(128, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)), spatialCBAM(64))
+        self.stage6 = nn.Sequential(NewDeconvBlock(64, kernel_size=(1, 3, 3), filters=[16, 16, 64], strides=(1, 2, 2)), spatialCBAM(64))
+        self.conv1 = nn.Conv3d(64, input_dim, kernel_size=(1, 7, 7), padding='same', stride=(1, 1, 1))
+
+    def forward(self, x):
+        x = x.float()
+        x = self.encoder(x)                                         # (batch, output_dim, 64, 64)
+
+        x = x.unsqueeze(1).expand(-1, self.n_images, -1, -1, -1)    # stesso input 4 volte -> (batch, 4, output_dim, 64, 64)
+
+        if self.ltae:
+            batch_positions = torch.arange(self.n_images, device=x.device).float().unsqueeze(0)   # (1, 4)
+            pos = self.decoder_pos_encoder(batch_positions)          # (1, 4, output_dim)
+            pos = pos.unsqueeze(-1).unsqueeze(-1)                     # (1, 4, output_dim, 1, 1)
+            x = x + pos                                               # broadcasting su batch, H, W
+
+        x, _ = self.conv_lstm(x)
+        x = x[0]                                                    # (batch, 4, 256, 64, 64)
+
+        x = x.permute(0, 2, 1, 3, 4)                                # (batch, 256, 4, 64, 64)
+        x = self.stage1(x)                                          # (batch, 256, 4, 64, 64)
+        x = self.stage2(x)
+        x = self.stage3(x)                                          # (batch, 128, 4, 64, 64)
+        x = self.stage4(x)
+        x = self.stage5(x)                                          # (batch, 64, 4, 128, 128)
+        x = self.stage6(x)                                          # (batch, 64, 4, 256, 256)
+        x = self.conv1(x)                                           # (batch, input_dim, 4, 256, 256)
+        return x
+
+
+
+
+
+
+
+
+
+
+
 
 
 # DOMANDE

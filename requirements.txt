@@ -60,6 +60,7 @@ pydantic==2.13.4
 pydantic-core==2.46.4
 pygments==2.20.0
 pyparsing==3.3.2
+pyproj==3.8.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-slugify==8.0.4

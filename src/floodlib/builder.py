@@ -16,6 +16,8 @@
 import torch
 import torch.nn as nn
 
+from .multimodal_3Dconv_attention import spatialCBAM
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -231,7 +233,20 @@ class MoCo2encoders(nn.Module):
         return loss
 
 
-class MoCo2encoders_2d(nn.Module):
+class spatialCBAM2d(nn.Module):
+    """
+    spatialCBAM per tensori 2D (batch, C, H, W):
+    aggiunge T=1 -> (batch, C, 1, H, W), applica spatialCBAM, toglie T
+    """
+    def __init__(self, in_channel, reduction_ratio=16, dilation=1):
+        super(spatialCBAM2d, self).__init__()
+        self.cbam = spatialCBAM(in_channel, reduction_ratio=reduction_ratio, dilation=dilation)
+
+    def forward(self, x):
+        return self.cbam(x.unsqueeze(2)).squeeze(2)    
+
+
+class MoCo2encoders_attn(nn.Module):
     """
     Build a MoCo model with: a query encoder, a key encoder, and a queue
     https://arxiv.org/abs/1911.05722
@@ -250,10 +265,9 @@ class MoCo2encoders_2d(nn.Module):
         simple_proj: bool = True,
         attn: bool = False,
         pool_grid: int = 1,         
-        device='cuda',
     ) -> None:
         
-        super(MoCo2encoders_2d, self).__init__()
+        super(MoCo2encoders_attn, self).__init__()
  
         self.K = K
         self.m = m
@@ -311,19 +325,23 @@ class MoCo2encoders_2d(nn.Module):
         else:
             # hidden_channels_dim // 2
             self.conv_q = nn.Sequential(
-                nn.Conv2d(encoder_q_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),                  # dim 64->32, c 16->128 
-                nn.BatchNorm2d(hidden_channels_dim),
+                spatialCBAM2d(encoder_q_dim, reduction_ratio=4),                                                    # gate a 64x64, prima dello stride
+                nn.Conv2d(encoder_q_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),                  # dim 64->32
+                nn.BatchNorm2d(hidden_channels_dim//2),
                 nn.ReLU(),
-                
-                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16, c 128->128
+
+                spatialCBAM2d(hidden_channels_dim//2),                                                                 # gate a 32x32, prima dello stride
+                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
             )
             self.conv_k = nn.Sequential(
-                nn.Conv2d(encoder_k_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(hidden_channels_dim),
+                spatialCBAM2d(encoder_k_dim, reduction_ratio=4),
+                nn.Conv2d(encoder_k_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(hidden_channels_dim//2),
                 nn.ReLU(),
-                
+
+                spatialCBAM2d(hidden_channels_dim//2),
                 nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),

@@ -17,6 +17,7 @@ import zarr
 import traceback
 import tarfile
 import io
+import csv
 from glob import glob
 from digitalhub_runtime_python import handler
 
@@ -290,12 +291,14 @@ def visual_series(
 
 
 @handler()
-def visualize_flood_overlay(
+def visualize_mask(
     dataset: str = "Floods_Anomalies_v2_crop_norm_full",   # artifact con SAR/, OPT/, OPT_RGB/, MASK/ (partNN.zip di .npy)
     n_samples: int = 10,
     min_flood_pixels: int = 1000,    # considera solo serie con almeno questi pixel classe flood (0 = nessun filtro)
     flood_class: int = 2,            # valore della classe flood nella maschera
-    flood_instant: int = 3,          # istante (1-4) mostrato con la maschera nella seconda riga; gli altri restano bianchi
+    flood_instant: int = 3,          # istante (1-4) mostrato con la maschera nella terza riga
+    print_mask: bool = True,         # True: terza riga con la maschera sull'ottico di flood_instant; False: solo 2 righe
+    sar_channel: int = 0,            # canale SAR in scala di grigi (0 = VV, 1 = VH)
     stored_gamma: float = 2.2,       # rgb_gamma con cui e' stato costruito OPT_RGB: serve per tornare ai valori lineari
     display_gamma: float = 2.0,      # gamma in visualizzazione (>1 schiarisce i mezzi toni, 1.0 = lineare)
     display_stretch: bool = True,    # stira il contrasto (percentili 1-99) sui 4 istanti insieme
@@ -305,36 +308,38 @@ def visualize_flood_overlay(
     save_dir: str = "/data/flood_overlay",
 ):
     """
-    Per ogni serie campionata salva un PNG 2x4 (solo ottico, da OPT_RGB):
-      riga 0 = i 4 istanti in input (true color)
-      riga 1 = solo l'istante `flood_instant` (default 3) con i pixel flood (MASK) in magenta,
-               gli altri tre riquadri restano bianchi (ne' immagine ne' maschera).
+    Per ogni serie campionata salva un PNG con una colonna per istante:
+      riga 0 = serie SAR, canale `sar_channel` in scala di grigi (come visual_series)
+      riga 1 = serie ottica true color (da OPT_RGB)
+      riga 2 = solo con print_mask=True: l'istante `flood_instant` ottico con i pixel flood
+               (MASK) in magenta; gli altri riquadri restano bianchi.
+    Con print_mask=False il PNG ha solo le prime due righe.
     La maschera e' una sola per serie (annotazione dell'evento).
- 
-    I colori sono regolati solo in visualizzazione, senza ricostruire l'artifact: si torna ai
+
+    I colori dell'ottico sono regolati solo in visualizzazione, senza ricostruire l'artifact: si torna ai
     valori lineari (stored_gamma), si stira il contrasto sui 4 istanti insieme, si applica
     display_gamma e si aumenta la saturazione. Stessa trasformazione per i tre canali e per
     tutti gli istanti, quindi i colori restano coerenti tra un istante e l'altro.
- 
-    OPT_RGB e MASK vengono letti direttamente dagli zip, una serie alla volta, senza estrarli su
+
+    SAR, OPT_RGB e MASK vengono letti direttamente dagli zip, una serie alla volta, senza estrarli su
     disco: l'uso di disco extra e' solo quello dei PNG (piu' lo zip finale), anche con migliaia di serie.
     """
     import traceback
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
- 
+
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
- 
+
     print(f"Download: {dataset}", flush=True)
     dataset_path = project_data.get_artifact(dataset).download("/data/dataset_floods_overlay")
     print(f"OK -> {dataset_path}", flush=True)
- 
+
     save_dir = save_dir + "_" + job_name
     shutil.rmtree(save_dir, ignore_errors=True)
     os.makedirs(save_dir, exist_ok=True)
- 
+
     # elenco dei partNN.zip di una modalita', senza glob (nome condiviso tra file in src)
     def _list_parts(modality):
         mod_dir = os.path.join(dataset_path, modality)
@@ -348,7 +353,7 @@ def visualize_flood_overlay(
         )
         print(f"OK -> {modality}: {len(parts)} part*.zip trovati", flush=True)
         return parts
- 
+
     def _enhance(rgb_arr):
         """(3, T, H, W) in [0,1] come salvato in OPT_RGB -> stessa forma, solo per la visualizzazione."""
         x = np.clip(rgb_arr, 0.0, 1.0).astype(np.float32)
@@ -363,33 +368,48 @@ def visualize_flood_overlay(
             lum = (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2])[None]
             x = np.clip(lum + display_saturation * (x - lum), 0.0, 1.0)
         return x
- 
-    def _plot(rgb_arr, flood_mask, ID, n_flood, out_path):
-        """rgb_arr: (3, T, H, W) in [0,1] gia' regolato per la visualizzazione; flood_mask: (H, W) bool."""
+
+    def _plot(sar_arr, rgb_arr, flood_mask, ID, n_flood, out_path):
+        """
+        sar_arr: (T, H, W) in [0,1], gia' ridotto al canale sar_channel
+        rgb_arr: (3, T, H, W) in [0,1] gia' regolato per la visualizzazione
+        flood_mask: (H, W) bool
+        """
         try:
             T = rgb_arr.shape[1]
             t_flood = flood_instant - 1
-            if not 0 <= t_flood < T:
+            if print_mask and not 0 <= t_flood < T:
                 raise ValueError(f"flood_instant={flood_instant} fuori da 1..{T}")
- 
-            fig, axes = plt.subplots(2, T, figsize=(4 * T, 8), squeeze=False)
+
+            n_rows = 3 if print_mask else 2
+            fig, axes = plt.subplots(n_rows, T, figsize=(4 * T, 4 * n_rows), squeeze=False)
             pct = 100.0 * n_flood / flood_mask.size
-            fig.suptitle(f"Serie: {ID} | flood: {n_flood} px ({pct:.1f}%), magenta = classe {flood_class}", fontsize=14)
- 
+            title = f"Serie: {ID} | flood: {n_flood} px ({pct:.1f}%)"
+            if print_mask:
+                title += f", magenta = classe {flood_class}"
+            fig.suptitle(title, fontsize=14)
+
             for t in range(T):
-                rgb = np.clip(np.transpose(rgb_arr[:, t], (1, 2, 0)), 0.0, 1.0)     # (H, W, 3)
- 
-                axes[0, t].imshow(rgb)
-                axes[0, t].set_title(f"Input t{t + 1}")
+                # riga 0: SAR in scala di grigi
+                axes[0, t].imshow(sar_arr[t], cmap="gray", vmin=0, vmax=1)
+                axes[0, t].set_title(f"SAR t{t + 1}")
                 axes[0, t].axis('off')
- 
-                if t == t_flood:
-                    over = rgb.copy()
-                    over[flood_mask] = [1.0, 0.0, 1.0]
-                    axes[1, t].imshow(over)
-                    axes[1, t].set_title(f"Input t{t + 1} + flood")
-                axes[1, t].axis('off')          # gli altri riquadri restano bianchi
- 
+
+                # riga 1: ottico true color
+                rgb = np.clip(np.transpose(rgb_arr[:, t], (1, 2, 0)), 0.0, 1.0)     # (H, W, 3)
+                axes[1, t].imshow(rgb)
+                axes[1, t].set_title(f"OPT t{t + 1}")
+                axes[1, t].axis('off')
+
+                # riga 2 (opzionale): maschera sull'ottico di flood_instant, il resto bianco
+                if print_mask:
+                    if t == t_flood:
+                        over = rgb.copy()
+                        over[flood_mask] = [1.0, 0.0, 1.0]
+                        axes[2, t].imshow(over)
+                        axes[2, t].set_title(f"OPT t{t + 1} + flood")
+                    axes[2, t].axis('off')
+
             plt.tight_layout()
             plt.savefig(out_path, bbox_inches='tight', dpi=dpi, facecolor="white")
             plt.close(fig)
@@ -399,16 +419,26 @@ def visualize_flood_overlay(
             print(traceback.format_exc(), flush=True)
             plt.close('all')
             return False
- 
+
     # ------------------------------------------------------------------
-    # 1) ID presenti in OPT_RGB e in MASK, e pixel flood di ogni maschera
+    # 1) ID presenti in SAR, OPT_RGB e MASK, e pixel flood di ogni maschera
     # ------------------------------------------------------------------
     rgb_ids = set()
     for part_path in _list_parts("OPT_RGB"):
         with zipfile.ZipFile(part_path, 'r') as z:
             rgb_ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
     print(f"{len(rgb_ids)} serie OPT_RGB trovate", flush=True)
- 
+
+    # SAR: indice {ID: (zip aperto, nome)} per leggere una serie alla volta piu' avanti
+    sar_handles, sar_index = [], {}
+    for part_path in _list_parts("SAR"):
+        z = zipfile.ZipFile(part_path, 'r')
+        sar_handles.append(z)
+        for n in z.namelist():
+            if n.endswith('.npy'):
+                sar_index[n[:-4]] = (z, n)
+    print(f"{len(sar_index)} serie SAR trovate", flush=True)
+
     flood_counts = {}
     for part_path in _list_parts("MASK"):
         with zipfile.ZipFile(part_path, 'r') as z:
@@ -417,81 +447,100 @@ def visualize_flood_overlay(
                     m = np.load(io.BytesIO(z.read(n)))
                     flood_counts[n[:-4]] = int((m == flood_class).sum())
     print(f"{len(flood_counts)} maschere trovate", flush=True)
- 
-    common = rgb_ids & set(flood_counts)
+
+    common = rgb_ids & set(sar_index) & set(flood_counts)
     candidates = sorted(ID for ID in common if flood_counts[ID] >= max(min_flood_pixels, 0))
-    print(f"{len(common)} serie con OPT_RGB e maschera, {len(candidates)} con >= {min_flood_pixels} px flood", flush=True)
- 
+    print(f"{len(common)} serie con SAR, OPT_RGB e maschera, {len(candidates)} con >= {min_flood_pixels} px flood", flush=True)
+
     if not candidates:
+        for z in sar_handles:
+            z.close()
         raise RuntimeError("Nessuna serie candidata: abbassa min_flood_pixels o controlla che l'artifact "
-                           "contenga OPT_RGB/ e MASK/ (va costruito con la nuova crop_norm_artifact_anomalies)")
- 
+                           "contenga SAR/, OPT_RGB/ e MASK/")
+
     sampled = random.sample(candidates, min(n_samples, len(candidates)))
     print(f"ID campionati: {sampled}", flush=True)
- 
+
     # ------------------------------------------------------------------
-    # 2) maschere dei campionati in memoria; OPT_RGB letto direttamente
+    # 2) maschere dei campionati in memoria; OPT_RGB e SAR letti direttamente
     #    dagli zip, una serie alla volta (niente estrazione su disco)
     # ------------------------------------------------------------------
     wanted = {f"{ID}.npy" for ID in sampled}
- 
+
     masks = {}
     for part_path in _list_parts("MASK"):
         with zipfile.ZipFile(part_path, 'r') as z:
             for n in z.namelist():
                 if n in wanted:
                     masks[n[:-4]] = np.load(io.BytesIO(z.read(n)))
- 
+
     verbose = len(sampled) <= 50          # con molte serie: un log ogni 100
     done, n_fail = set(), 0
     t_start = time.time()
- 
-    for part_path in _list_parts("OPT_RGB"):
-        with zipfile.ZipFile(part_path, 'r') as z:
-            for n in z.namelist():
-                if n not in wanted:
-                    continue
-                ID = n[:-4]
-                if ID not in masks:
-                    n_fail += 1
-                    print(f"EXC -> {ID}: maschera non trovata, salto", flush=True)
-                    continue
- 
-                rgb_arr = _enhance(np.load(io.BytesIO(z.read(n))))     # (3, T, H, W)
-                mask = masks[ID]                                       # (H, W)
-                H, W = rgb_arr.shape[2], rgb_arr.shape[3]
- 
-                if mask.shape != (H, W):
-                    print(f"ATTENZIONE -> {ID}: maschera {mask.shape} diversa dall'immagine {(H, W)}, "
-                          f"ridimensiono (nearest): controlla che siano davvero allineate", flush=True)
-                    rows = (np.arange(H) * mask.shape[0]) // H
-                    cols = (np.arange(W) * mask.shape[1]) // W
-                    mask = mask[rows][:, cols]
- 
-                flood_mask = (mask == flood_class)
-                n_flood = int(flood_mask.sum())
-                ok = _plot(rgb_arr, flood_mask, ID, n_flood, os.path.join(save_dir, f"OPT_{ID}_flood.png"))
-                done.add(ID)
-                if not ok:
-                    n_fail += 1
- 
-                if verbose:
-                    print(f"{'OK' if ok else 'EXC'} -> {ID} | rgb {rgb_arr.shape} | flood px: {n_flood}", flush=True)
-                elif len(done) % 100 == 0 or len(done) == len(sampled):
-                    el = time.time() - t_start
-                    print(f"{len(done)}/{len(sampled)} serie | {el / 60:.1f} min trascorsi | "
-                          f"~{el / len(done) * (len(sampled) - len(done)) / 60:.1f} min rimanenti | "
-                          f"{n_fail} errori", flush=True)
- 
+
+    try:
+        for part_path in _list_parts("OPT_RGB"):
+            with zipfile.ZipFile(part_path, 'r') as z:
+                for n in z.namelist():
+                    if n not in wanted:
+                        continue
+                    ID = n[:-4]
+                    if ID not in masks:
+                        n_fail += 1
+                        print(f"EXC -> {ID}: maschera non trovata, salto", flush=True)
+                        continue
+
+                    rgb_arr = _enhance(np.load(io.BytesIO(z.read(n))))     # (3, T, H, W)
+                    mask = masks[ID]                                       # (H, W)
+                    H, W = rgb_arr.shape[2], rgb_arr.shape[3]
+
+                    # SAR della stessa serie, solo il canale richiesto
+                    sar_full = np.load(io.BytesIO(sar_index[ID][0].read(sar_index[ID][1])))   # (C, T, H, W)
+                    if not 0 <= sar_channel < sar_full.shape[0]:
+                        n_fail += 1
+                        print(f"EXC -> {ID}: sar_channel={sar_channel} fuori da 0..{sar_full.shape[0] - 1}", flush=True)
+                        continue
+                    sar_arr = np.clip(sar_full[sar_channel], 0.0, 1.0)            # (T, H, W)
+                    if sar_arr.shape != (rgb_arr.shape[1], H, W):
+                        print(f"ATTENZIONE -> {ID}: SAR {sar_arr.shape} diverso da OPT_RGB "
+                              f"{(rgb_arr.shape[1], H, W)}", flush=True)
+
+                    if mask.shape != (H, W):
+                        print(f"ATTENZIONE -> {ID}: maschera {mask.shape} diversa dall'immagine {(H, W)}, "
+                              f"ridimensiono (nearest): controlla che siano davvero allineate", flush=True)
+                        rows = (np.arange(H) * mask.shape[0]) // H
+                        cols = (np.arange(W) * mask.shape[1]) // W
+                        mask = mask[rows][:, cols]
+
+                    flood_mask = (mask == flood_class)
+                    n_flood = int(flood_mask.sum())
+                    ok = _plot(sar_arr, rgb_arr, flood_mask, ID, n_flood,
+                               os.path.join(save_dir, f"SAR_OPT_{ID}_flood.png"))
+                    done.add(ID)
+                    if not ok:
+                        n_fail += 1
+
+                    if verbose:
+                        print(f"{'OK' if ok else 'EXC'} -> {ID} | sar {sar_arr.shape} | rgb {rgb_arr.shape} | "
+                              f"flood px: {n_flood}", flush=True)
+                    elif len(done) % 100 == 0 or len(done) == len(sampled):
+                        el = time.time() - t_start
+                        print(f"{len(done)}/{len(sampled)} serie | {el / 60:.1f} min trascorsi | "
+                              f"~{el / len(done) * (len(sampled) - len(done)) / 60:.1f} min rimanenti | "
+                              f"{n_fail} errori", flush=True)
+    finally:
+        for z in sar_handles:
+            z.close()
+
     missing = [ID for ID in sampled if ID not in done]
     if missing:
         print(f"EXC -> {len(missing)} serie campionate non trovate in OPT_RGB, esempio: {missing[:5]}", flush=True)
- 
+
     n_png = len([f for f in os.listdir(save_dir) if f.endswith(".png")])
     print(f"PNG prodotti: {n_png}", flush=True)
     if n_png == 0:
         raise RuntimeError("Nessun PNG generato: cerca nel log le righe 'EXC ->' qui sopra.")
- 
+
     zip_base = save_dir.rstrip("/")
     zip_path = f"{zip_base}.zip"
     shutil.make_archive(zip_base, 'zip', save_dir)
@@ -501,7 +550,7 @@ def visualize_flood_overlay(
         source=zip_path,
     )
     print(f"OK -> {zip_path} caricato come artifact ({n_png} PNG)", flush=True)
- 
+
     return "TERMINATO"
 
 
@@ -1306,3 +1355,215 @@ def debug_ocsvm(
               f"fuori dal confine (score < 0): fit {(score_fit < 0).mean():.3f}, normali {(score_normal < 0).mean():.3f}, anomale {(score_anom < 0).mean():.3f}", flush=True)
 
     return "TERMINATO -> debug ocsvm"    
+
+
+
+
+def _index_parts(root, modality):
+    """
+    Trova la cartella {modality}/ dentro l'artifact scaricato e indicizza tutte le
+    partNN.zip: {ID: (zipfile aperto, nome membro)}. Gli handle vanno chiusi dal chiamante.
+    """
+    mod_dir = None
+    for dirpath, _, _ in os.walk(root):
+        if os.path.basename(dirpath) == modality:      # confronto esatto: "OPT" != "OPT_RGB"
+            mod_dir = dirpath
+            break
+    if mod_dir is None:
+        raise FileNotFoundError(f"cartella {modality}/ non trovata in {root}")
+
+    handles, index = [], {}
+    for n in sorted(os.listdir(mod_dir)):
+        if n.endswith(".zip"):
+            zf = zipfile.ZipFile(os.path.join(mod_dir, n), 'r')
+            handles.append(zf)
+            for name in zf.namelist():
+                if name.endswith(".npy"):
+                    index[os.path.basename(name)[:-4]] = (zf, name)
+    return handles, index
+
+
+def _load_npy(zf, name):
+    """Legge un .npy da dentro uno zip direttamente in memoria, senza estrarlo su disco."""
+    return np.load(io.BytesIO(zf.read(name)))
+
+
+def _split_in_4(arr, tile=128):
+    """
+    (..., 2*tile, 2*tile) -> [k0 alto-sx, k1 alto-dx, k2 basso-sx, k3 basso-dx],
+    ognuno (..., tile, tile). Taglia solo gli ultimi due assi: canali e istanti restano intatti.
+    """
+    h, w = arr.shape[-2:]
+    if (h, w) != (2 * tile, 2 * tile):
+        raise ValueError(f"forma spaziale {(h, w)}, attesa {(2 * tile, 2 * tile)}")
+    return [arr[..., y:y + tile, x:x + tile] for y in (0, tile) for x in (0, tile)]
+
+
+@handler()
+def split_tiles_artifact(
+    input_artifact: str = "Floods_Anomalies_v2_crop_norm_full",
+    stats_name: str = "Floods_Anomalies_v2_tiles128_stats",   # artifact con il CSV di tutti i tasselli
+    output_name: str = "Floods_Anomalies_v2_tiles128",        # artifact con i tasselli selezionati
+    tile: int = 128,
+    max_part_gb: float = 15.0,
+    max_series: int = 0,          # 0 = tutte; N > 0 = solo le prime N serie originali per una prova
+    min_flood_pct: float = 5.0,   # tiene i tasselli con flood_pct >= questo valore
+    max_per_event: int = 0,       # tetto di tasselli per evento (codice EMSR); 0 = nessun tetto
+    seed: int = 0,                # seme del campionamento per evento: stessa selezione a ogni run
+):
+    """
+    Divide ogni serie in 4 nuove serie tile x tile ({ID}_k0..k3), ognuna con tutti gli istanti
+    originali, e salva solo quelle selezionate:
+      - flood_pct (classe 2 della maschera) >= min_flood_pct
+      - al massimo max_per_event per evento, campionate a caso con `seed` (0 = nessun tetto)
+    Output (stessa organizzazione dell'artifact di partenza, un {ID}_k{k}.npy per serie in partNN.zip):
+      SAR/ (2, 4, tile, tile), OPT/ (10, 4, tile, tile), OPT_RGB/ (3, 4, tile, tile), MASK/ (tile, tile)
+    In piu' carica stats_name: CSV con le statistiche di TUTTI i tasselli e la colonna `selected`.
+    """
+    project_data = dh.get_project("datasets")
+    max_part_bytes = int(max_part_gb * 1024 ** 3)
+    modalities = ["SAR", "OPT", "OPT_RGB", "MASK"]
+
+    local_root = "/data/tiles_upload"
+    shutil.rmtree(local_root, ignore_errors=True)
+    os.makedirs(local_root, exist_ok=True)
+    cache_dirs = {m: f"/data/cache_tiles_{m}" for m in modalities}
+    for d in cache_dirs.values():
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+
+    print(f"Download: {input_artifact}", flush=True)
+    in_path = project_data.get_artifact(input_artifact).download("/data/tiles_input", overwrite=True)
+    print("OK -> Download terminato", flush=True)
+
+    handles, indexes = [], {}
+    rows, selected = [], []
+    n_ok, n_failed, n_saved, n_save_failed = 0, 0, 0, 0
+    try:
+        for m in modalities:
+            h, idx = _index_parts(in_path, m)
+            handles += h
+            indexes[m] = idx
+
+        # --- serie originali ---
+        all_ids = set().union(*(set(indexes[m]) for m in modalities))
+        print(f"SERIE ORIGINALI -> {len(all_ids)} ID distinti in totale", flush=True)
+        for m in modalities:
+            print(f"  {m}: {len(indexes[m])} serie", flush=True)
+
+        # --- serie presenti in tutte le cartelle ---
+        ids = sorted(set.intersection(*(set(indexes[m]) for m in modalities)))
+        print(f"SERIE IN TUTTE LE CARTELLE -> {len(ids)}", flush=True)
+        escluse = sorted(all_ids - set(ids))
+        if escluse:
+            print(f"  {len(escluse)} escluse perche' mancanti in almeno una cartella, esempio: {escluse[:10]}", flush=True)
+        if max_series > 0:
+            ids = ids[:max_series]
+            print(f"  limitate a {len(ids)} per la prova (max_series={max_series})", flush=True)
+
+        # ------------------------------------------------------------------
+        # PASSO 1: statistiche di tutti i tasselli (legge solo la maschera)
+        # ------------------------------------------------------------------
+        for ID in ids:
+            try:
+                for k, mk in enumerate(_split_in_4(_load_npy(*indexes["MASK"][ID]), tile)):
+                    rows.append({
+                        "tile_id": f"{ID}_k{k}", "ID": ID, "evento": ID.split("_")[0], "k": k,
+                        "flood_pct": round(100.0 * float((mk == 2).mean()), 3),
+                        "water_pct": round(100.0 * float((mk == 1).mean()), 3),
+                        "selected": False,
+                    })
+                n_ok += 1
+            except Exception as e:
+                n_failed += 1
+                print(f"EXC -> maschera {ID}: {e}", flush=True)
+        print(f"TASSELLI TOTALI -> {len(rows)} da {n_ok} serie ({n_failed} fallite)", flush=True)
+
+        # ------------------------------------------------------------------
+        # PASSO 2: selezione (soglia flood + tetto per evento)
+        # ------------------------------------------------------------------
+        by_event = {}
+        for r in rows:
+            if r["flood_pct"] >= min_flood_pct:
+                by_event.setdefault(r["evento"], []).append(r)
+        n_candidates = sum(len(g) for g in by_event.values())
+
+        rng = random.Random(seed)
+        n_cut = 0
+        for ev in sorted(by_event):                                  # ordine fisso -> campionamento ripetibile
+            group = sorted(by_event[ev], key=lambda r: r["tile_id"])
+            if max_per_event > 0 and len(group) > max_per_event:
+                group = rng.sample(group, max_per_event)
+                n_cut += 1
+            selected += group
+        for r in selected:
+            r["selected"] = True
+
+        counts = {}
+        for r in selected:
+            counts[r["evento"]] = counts.get(r["evento"], 0) + 1
+        tetto = max_per_event if max_per_event > 0 else "nessuno"
+        print(f"CANDIDATI (flood_pct >= {min_flood_pct}) -> {n_candidates} tasselli, {len(by_event)} eventi", flush=True)
+        print(f"SELEZIONATI (tetto {tetto}, {n_cut} eventi tagliati) -> {len(selected)} tasselli, "
+              f"{len(counts)} eventi", flush=True)
+        if counts:
+            top = sorted(counts.items(), key=lambda x: -x[1])
+            print(f"  evento piu' grande: {top[0][0]} = {top[0][1]} ({100 * top[0][1] / len(selected):.1f}%), "
+                  f"primi 10: {100 * sum(n for _, n in top[:10]) / len(selected):.1f}%", flush=True)
+
+        # ------------------------------------------------------------------
+        # PASSO 3: salvataggio dei tasselli selezionati, tutte le modalita'
+        # ------------------------------------------------------------------
+        sel_by_id = {}
+        for r in selected:
+            sel_by_id.setdefault(r["ID"], []).append(r["k"])
+
+        for i, ID in enumerate(sorted(sel_by_id), 1):
+            try:
+                # carico e divido tutto prima di scrivere: se una modalita' fallisce non resta nulla a meta'
+                tiles = {m: _split_in_4(_load_npy(*indexes[m][ID]), tile) for m in modalities}
+                for k in sorted(sel_by_id[ID]):
+                    for m in modalities:
+                        np.save(os.path.join(cache_dirs[m], f"{ID}_k{k}.npy"), tiles[m][k])
+                    n_saved += 1
+                if i <= 3 or i % 500 == 0:
+                    print(f"  [{i}/{len(sel_by_id)}] {ID} | k salvati {sorted(sel_by_id[ID])} | "
+                          f"forma OPT {tiles['OPT'][0].shape}", flush=True)
+            except Exception as e:
+                n_save_failed += len(sel_by_id[ID])
+                print(f"EXC -> salvataggio {ID}: {e}", flush=True)
+    finally:
+        for zf in handles:
+            zf.close()
+
+    # l'input non serve piu': libero disco prima di creare i nuovi zip
+    shutil.rmtree("/data/tiles_input", ignore_errors=True)
+    print(f"SERIE FINALI -> {n_saved} tasselli salvati ({n_save_failed} falliti)", flush=True)
+
+    if not rows:
+        return "TERMINATO -> nessuna serie divisa: controlla i log EXC sopra"
+
+    # --- CSV con le statistiche di tutti i tasselli + colonna selected ---
+    csv_path = "/data/tiles_stats.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    project_data.log_artifact(name=stats_name, kind='artifact', source=csv_path)
+    print(f"OK -> CSV caricato come artifact '{stats_name}' ({len(rows)} righe)", flush=True)
+    os.remove(csv_path)
+
+    if n_saved == 0:
+        return f"TERMINATO -> nessun tassello selezionato/salvato, artifact '{output_name}' non creato"
+
+    # --- artifact con i tasselli selezionati, stessa struttura dell'originale ---
+    for label in cache_dirs:
+        _write_cache_parts(cache_dirs[label], local_root, label, max_part_bytes)
+
+    print("Upload dell'intera cartella come artifact unico...", flush=True)
+    project_data.log_artifact(name=output_name, kind='artifact', source=local_root)
+    print(f"OK -> artifact unico caricato ({output_name})", flush=True)
+    shutil.rmtree(local_root, ignore_errors=True)
+
+    return (f"TERMINATO -> {n_saved} tasselli salvati in '{output_name}' "
+            f"(flood >= {min_flood_pct}%, tetto {tetto}), {len(counts)} eventi, CSV in '{stats_name}'")
