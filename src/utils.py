@@ -23,13 +23,15 @@ from digitalhub_runtime_python import handler
 
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_2d
+from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_attn
+
 
 matplotlib.use("Agg")  
 
 
 
 @handler()
-def visual_series(
+def visualize_series(
     patch_size: int = 256,
     n_images1: int = 4,
     n_channels1: int = 2,
@@ -45,10 +47,11 @@ def visual_series(
     n_samples: int = 10,
     job_name: str = "nome",
     ltae: bool = False,
+    spac_net: bool = False,
     monodimensional: bool = False,
-    sar_channel: int = 0,                 # NUOVO: quale canale SAR mostrare in scala di grigi
-    recon_channels: list | None = None,   # ORA: terna di indici canale OPT per l'RGB, default [2,1,0] = B4,B3,B2
-    save_dir: str = "/data/debug_recon",
+    sar_channel: int = 0,                 
+    recon_channels: list | None = None,   
+    save_dir: str = "/data/visual_series",
 ):
  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -74,11 +77,8 @@ def visual_series(
  
     save_dir = save_dir + "_" + job_name
     os.makedirs(save_dir, exist_ok=True)
+
  
-    # ------------------------------------------------------------------
-    # visualizzazione input vs ricostruzione: griglia 2x4, riga 0 = input,
-    # riga 1 = ricostruito, una colonna per istante temporale
-    # ------------------------------------------------------------------
     def _visualizza_input_ricostruzione(input_arr, recon_arr, nome_serie, nome_output, is_sar):
         """
         input_arr, recon_arr: array (n_channels, 4, H, W), gia' in [0,1] (cache crop_norm)
@@ -131,9 +131,7 @@ def visual_series(
                     opt_available.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
             print(f"{len(opt_available)} serie OPT trovate", flush=True)
  
-        # NUOVO: se testo entrambe le modalita', campiono UNA SOLA VOLTA dalle
-        # serie presenti in entrambe, cosi' SAR e OPT mostrano le stesse ID -
-        # altrimenti (solo una modalita' richiesta) campiono dal suo solo pool
+
         if test_sar and test_opt:
             common_available = sar_available & opt_available
             sampled = random.sample(sorted(common_available), min(n_samples, len(common_available))) if common_available else []
@@ -177,8 +175,12 @@ def visual_series(
             if monodimensional:
                 modelSAR = Singlemodal_CAE(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, mamba=mamba).to(device)
  
+            elif ltae:
+                modelSAR = Singlemodal_CAE_attn(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=ltae, spac_net=spac_net).to(device)
+
             else:
                 modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=output_dim, n_images=n_images1, n_head=8, d_k=8, ltae=ltae).to(device)
+
  
             state_dict = torch.load(sar_path, map_location=device)
             if all(k.startswith('module.') for k in state_dict.keys()):
@@ -230,7 +232,10 @@ def visual_series(
  
             if monodimensional:
                 modelOPT = Singlemodal_CAE(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, mamba=mamba).to(device)
- 
+
+            elif ltae:
+                modelOPT = Singlemodal_CAE_attn(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=ltae, spac_net=spac_net).to(device)
+
             else:
                 modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=output_dim, n_images=n_images2, n_head=8, d_k=8, ltae=ltae).to(device)
  

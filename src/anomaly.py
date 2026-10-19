@@ -723,7 +723,8 @@ def ad_ocsvm(
     batch_size: int = 32,
     workers: int = 0,
     min_flood_area: float = 10.0,     
-    old_vectors: str = ""                                 
+    old_vectors: str = "",
+    n_series_thr: int = 500,                                
 ):
  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -797,11 +798,13 @@ def ad_ocsvm(
     normal_ids = ids_per_sensor_normal["SAR"] & ids_per_sensor_normal["OPT"]
  
     shuffled_test_ids = [ID for ID in shuffled_test_ids if ID in normal_ids]
-    normal_fit_ids = shuffled_test_ids[:num_fit_series]                                             # fit -> iperpiano
-    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]              # anomaly detection 
+
+    normal_fit_ids  = shuffled_test_ids[:num_fit_series - n_series_thr]                            # fit -> iperpiano
+    normal_thr_ids  = shuffled_test_ids[num_fit_series - n_series_thr:num_fit_series]              # calcolo soglie
+    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]             # anomaly detection            
  
  
-    print(f"OK -> {len(test_ids)} serie normali tot, {len(normal_fit_ids)} serie fit, {len(normal_test_ids)} serie test normali")
+    print(f"OK -> {len(test_ids)} serie normali tot, {len(normal_fit_ids)} serie fit, {len(normal_thr_ids)} serie thr, {len(normal_test_ids)} serie test normali")
  
     if old_vectors:
         print(f"Upload embedding: anomaly_results_ocsvm_{old_vectors}", flush=True)
@@ -816,7 +819,7 @@ def ad_ocsvm(
  
         old = np.load("/data/old_vectors/embeddings.npz")
         lookup = {}
-        for g in ("fit", "normal", "anom"):
+        for g in ("fit", "thr", "normal", "anom"):
             for i, ID in enumerate(old[f"{g}_ids"]):
                 lookup[str(ID)] = (old[f"{g}_q"][i], old[f"{g}_k"][i])
  
@@ -827,9 +830,10 @@ def ad_ocsvm(
             return np.stack([lookup[ID][0] for ID in ids]), np.stack([lookup[ID][1] for ID in ids])
  
         q_fit, k_fit = take(normal_fit_ids, "fit")
+        q_thr, k_thr = take(normal_thr_ids, "thr")
         q_normal, k_normal = take(normal_test_ids, "normali test")
         q_anom, k_anom = take(anom_ids, "anomale")
-        print(f"OK -> embedding caricatu: {len(q_fit)} fit, {len(q_normal)} normali, {len(q_anom)} anomale", "\n", flush=True)
+        print(f"OK -> embedding caricatu: {len(q_fit)} fit,  {len(q_thr)} thr, {len(q_normal)} normali, {len(q_anom)} anomale", "\n", flush=True)
  
     else:
  
@@ -841,7 +845,7 @@ def ad_ocsvm(
  
         os.makedirs(sar_dir, exist_ok=True)
         os.makedirs(opt_dir, exist_ok=True)
-        wanted_normal_series = {f"{ID}.npy" for ID in set(normal_fit_ids) | set(normal_test_ids)}
+        wanted_normal_series = {f"{ID}.npy" for ID in set(normal_fit_ids) | set(normal_thr_ids) | set(normal_test_ids)}       
         for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
             for part_path in sorted(glob(os.path.join(normal_path, modality, "part*.zip"))):
                 with zipfile.ZipFile(part_path, 'r') as z:
@@ -900,6 +904,11 @@ def ad_ocsvm(
         print("Embedding MoCo: serie di fit ocsvm", flush=True)
         q_fit, k_fit = embed(normal_fit_ids)
         print(f"OK -> normali fit: {len(q_fit)} serie, q {q_fit.shape[1]} + k {k_fit.shape[1]} = {q_fit.shape[1] + k_fit.shape[1]} dim", "\n", flush=True)
+
+        # embedding serie thr 
+        print("Embedding MoCo: serie thr ocsvm", flush=True)
+        q_thr, k_thr = embed(normal_thr_ids)
+        print(f"OK -> normali thr: {len(q_thr)} serie, q {q_thr.shape[1]} + k {k_thr.shape[1]} = {q_thr.shape[1] + k_thr.shape[1]} dim", "\n", flush=True)
  
         # embedding serie normali
         print("Embedding MoCo: serie normali", flush=True)
@@ -929,17 +938,19 @@ def ad_ocsvm(
  
     # concatenazione
     w_fit = np.concatenate([q_fit, k_fit], axis=1).astype(np.float64)
+    w_thr = np.concatenate([q_thr, k_thr], axis=1).astype(np.float64)
     w_normal = np.concatenate([q_normal, k_normal], axis=1).astype(np.float64)
     w_anom = np.concatenate([q_anom, k_anom],axis=1).astype(np.float64)
  
     if standardize:
         scaler = StandardScaler().fit(w_fit)
-        w_fit, w_normal, w_anom = scaler.transform(w_fit), scaler.transform(w_normal), scaler.transform(w_anom)
+        w_fit, w_thr, w_normal, w_anom = scaler.transform(w_fit), scaler.transform(w_thr), scaler.transform(w_normal), scaler.transform(w_anom)
 
     pw = PCA(whiten=True).fit(w_fit)
-    z_fit    = pw.transform(w_fit)
+    z_fit = pw.transform(w_fit)
+    z_thr = pw.transform(w_thr)
     z_normal = pw.transform(w_normal)
-    z_anom   = pw.transform(w_anom)    
+    z_anom = pw.transform(w_anom)    
  
     gamma = ocsvm_gamma if ocsvm_gamma in ("scale", "auto") else float(ocsvm_gamma)
     print(f"nu={ocsvm_nu}, gamma={gamma}, standardize={standardize})", flush=True)
@@ -948,11 +959,13 @@ def ad_ocsvm(
  
     # punteggi: decision_function > 0 dentro il confine , < 0 fuori
     score_fit = ocsvm.decision_function(z_fit).astype(np.float64)
+    score_thr = ocsvm.decision_function(z_thr).astype(np.float64)
     score_normal = ocsvm.decision_function(z_normal).astype(np.float64)
     score_anom = ocsvm.decision_function(z_anom).astype(np.float64)
  
     y = np.r_[np.zeros(len(score_normal)), np.ones(len(score_anom))]
-    auroc = roc_auc_score(y, -np.r_[score_normal, score_anom])      
+    auroc = roc_auc_score(y, -np.r_[score_normal, score_anom])  
+
     frac_outside_fit = float((score_fit < 0).mean())
     print(f"auroc: {auroc:.4f} | fuori dal confine (fit): {frac_outside_fit:.3f}", flush=True)
  
@@ -968,27 +981,35 @@ def ad_ocsvm(
         "score": np.concatenate([score_normal, score_anom]),
     })
     df.to_csv(os.path.join(out_dir, "scores.csv"), index=False)
+    pd.DataFrame({"ID": normal_thr_ids, "score": score_thr}).to_csv(os.path.join(out_dir, "scores_thr.csv"), index=False)   # nuovo
+
  
-    # soglia: confine dell'OC-SVM (score < 0)
-    anom = score_anom
-    norm = score_normal
-    thr = 0.0
+    # soglia
+    false_allarms = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)                             
+    thr_scores = score_thr        
+    eval_norm = score_normal                          
+    anom = df[df.label == 1].score.values
+    
     rules = {}
-    tp = int((anom < thr).sum()); fn = len(anom) - tp
-    fp = int((norm < thr).sum()); tn = len(norm) - fp
-    prec = tp / (tp + fp) if tp + fp else 0.0
-    rec = tp / (tp + fn)
-    rules["ocsvm score < 0"] = {
-        "soglia": thr, "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-        "FA_rate": fp / (fp + tn), "MA_rate": fn / (fn + tp), "REC": rec, "PREC": prec,
-        "F1": 2 * prec * rec / (prec + rec) if tp > 0 else 0.0,
-    }
-    print(f"score < 0: TP {tp} FP {fp} FN {fn} TN {tn} | FA {fp/(fp+tn):.3f} REC {rec:.3f} PREC {prec:.3f}", flush=True)
+    for fa in false_allarms:
+        thr = float(np.quantile(thr_scores, fa))
+        tp = int((anom < thr).sum()); fn = len(anom) - tp
+        fp = int((eval_norm < thr).sum()); tn = len(eval_norm) - fp
+        prec = tp / (tp + fp) if tp + fp else 0.0
+        rec = tp / (tp + fn)
+
+        rules[f"score < FA {fa:.0%})"] = {
+            "soglia": thr, "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+            "FA_rate": fp / (fp + tn), "MA_rate": fn / (fn + tp), "REC": rec, "PREC": prec,
+            "F1": 2 * prec * rec / (prec + rec) if tp > 0 else 0.0,
+        }
+        print(f"FA {fa:.0%}: soglia {thr:.4f} | TP {tp} FP {fp} FN {fn} TN {tn} | FA {fp/(fp+tn):.3f} REC {rec:.3f} PREC {prec:.3f}", flush=True)
  
     # vettori 
     np.savez_compressed(
         os.path.join(out_dir, "embeddings.npz"),
         fit_ids=np.array(normal_fit_ids), fit_q=q_fit, fit_k=k_fit,
+        thr_ids=np.array(normal_thr_ids), thr_q=q_thr, thr_k=k_thr,                                 
         normal_ids=np.array(normal_test_ids), normal_q=q_normal, normal_k=k_normal,
         anom_ids=np.array(anom_ids), anom_q=q_anom, anom_k=k_anom,
     )
@@ -998,7 +1019,7 @@ def ad_ocsvm(
         "job_name": job_name, "metodo": "ocsvm", "dataset_anomalies": dataset_anomalies,
         "moco_version": moco_version, "min_flood_area": min_flood_area, "standardize": standardize,
         "ocsvm": {"nu": ocsvm_nu, "gamma": gamma, "dim": int(z_fit.shape[1]), "frac_outside_fit": frac_outside_fit},
-        "n_fit": len(normal_fit_ids), "n_normali": len(normal_test_ids), "n_anomale": len(anom_ids),
+        "n_fit": len(normal_fit_ids), "n_thr": len(normal_thr_ids), "n_normali": len(normal_test_ids), "n_anomale": len(anom_ids),   
         "auroc": float(auroc),
         "rules": rules,
     }
@@ -1040,6 +1061,7 @@ def ad_pca(
     workers: int = 0,
     min_flood_area: float = 10.0,                    
     k_pca: int = 8,
+    n_series_thr: int = 500,
 ):
  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1110,13 +1132,15 @@ def ad_pca(
         ids_per_sensor_normal[sensor] = ids
  
     normal_ids = ids_per_sensor_normal["SAR"] & ids_per_sensor_normal["OPT"]
- 
+
     shuffled_test_ids = [ID for ID in shuffled_test_ids if ID in normal_ids]
-    normal_fit_ids = shuffled_test_ids[:num_fit_series]                                             # fit -> k_pca
-    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]              # anomaly detection 
+
+    normal_fit_ids  = shuffled_test_ids[:num_fit_series - n_series_thr]                            # fit -> k_pca
+    normal_thr_ids  = shuffled_test_ids[num_fit_series - n_series_thr:num_fit_series]              # calcolo soglie
+    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]             # anomaly detection 
 
 
-    print(f"OK -> {len(test_ids)} serie normali tot, {len(normal_fit_ids)} serie fit, {len(normal_test_ids)} serie test normali")
+    print(f"OK -> {len(test_ids)} serie normali tot, {len(normal_fit_ids)} serie fit, {len(normal_thr_ids)} serie thr, {len(normal_test_ids)} serie test normali")
 
     if old_vectors:
         print(f"Upload embedding: anomaly_results_pca_{old_vectors}", flush=True)
@@ -1131,7 +1155,7 @@ def ad_pca(
 
         old = np.load("/data/old_vectors/embeddings.npz")
         lookup = {}
-        for g in ("fit", "normal", "anom"):
+        for g in ("fit", "thr", "normal", "anom"):
             for i, ID in enumerate(old[f"{g}_ids"]):
                 lookup[str(ID)] = (old[f"{g}_q"][i], old[f"{g}_k"][i])
 
@@ -1142,9 +1166,10 @@ def ad_pca(
             return np.stack([lookup[ID][0] for ID in ids]), np.stack([lookup[ID][1] for ID in ids])
 
         q_fit, k_fit = take(normal_fit_ids, "fit")
+        q_thr, k_thr = take(normal_thr_ids, "thr")
         q_normal, k_normal = take(normal_test_ids, "normali test")
         q_anom, k_anom = take(anom_ids, "anomale")
-        print(f"OK -> embedding caricatu: {len(q_fit)} fit, {len(q_normal)} normali, {len(q_anom)} anomale", "\n", flush=True)
+        print(f"OK -> embedding caricatu: {len(q_fit)} fit,  {len(q_thr)} thr, {len(q_normal)} normali, {len(q_anom)} anomale", "\n", flush=True)
 
     else:
 
@@ -1156,7 +1181,7 @@ def ad_pca(
 
         os.makedirs(sar_dir, exist_ok=True)
         os.makedirs(opt_dir, exist_ok=True)
-        wanted_normal_series = {f"{ID}.npy" for ID in set(normal_fit_ids) | set(normal_test_ids)}
+        wanted_normal_series = {f"{ID}.npy" for ID in set(normal_fit_ids) | set(normal_thr_ids) | set(normal_test_ids)}       
         for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
             for part_path in sorted(glob(os.path.join(normal_path, modality, "part*.zip"))):
                 with zipfile.ZipFile(part_path, 'r') as z:
@@ -1216,6 +1241,11 @@ def ad_pca(
         q_fit, k_fit = embed(normal_fit_ids)
         print(f"OK -> normali fit: {len(q_fit)} serie, q {q_fit.shape[1]} + k {k_fit.shape[1]} = {q_fit.shape[1] + k_fit.shape[1]} dim", "\n", flush=True)
 
+        # embedding serie thr 
+        print("Embedding MoCo: serie thr pac", flush=True)
+        q_thr, k_thr = embed(normal_thr_ids)
+        print(f"OK -> normali thr: {len(q_thr)} serie, q {q_thr.shape[1]} + k {k_thr.shape[1]} = {q_thr.shape[1] + k_thr.shape[1]} dim", "\n", flush=True)
+ 
         # embedding serie normali
         print("Embedding MoCo: serie normali", flush=True)
         q_normal, k_normal = embed(normal_test_ids)
@@ -1244,12 +1274,13 @@ def ad_pca(
  
     # concatenazione
     z_fit = np.concatenate([q_fit, k_fit], axis=1)
+    z_thr = np.concatenate([q_thr, k_thr], axis=1)
     z_normal = np.concatenate([q_normal, k_normal], axis=1)
     z_anom = np.concatenate([q_anom, k_anom],axis=1)
 
     if standardize:
         scaler = StandardScaler().fit(z_fit)
-        z_fit, z_normal, z_anom = scaler.transform(z_fit), scaler.transform(z_normal), scaler.transform(z_anom)
+        z_fit, z_thr, z_normal, z_anom = scaler.transform(z_fit), scaler.transform(z_thr), scaler.transform(z_normal), scaler.transform(z_anom)
 
     pca = PCA().fit(z_fit)                      
     cum = np.cumsum(pca.explained_variance_ratio_)
@@ -1257,6 +1288,7 @@ def ad_pca(
     # [ 1  2  5  9 13 19 25 43 55 63 73]
 
     pca = PCA(n_components=k_pca).fit(z_fit)
+    res_thr = ((z_thr - pca.inverse_transform(pca.transform(z_thr))) ** 2).sum(axis=1)             
     res_normal = ((z_normal - pca.inverse_transform(pca.transform(z_normal))) ** 2).sum(axis=1)
     res_anom = ((z_anom - pca.inverse_transform(pca.transform(z_anom))) ** 2).sum(axis=1)
 
@@ -1271,6 +1303,7 @@ def ad_pca(
     # punteggi
     score_normal = -res_normal.astype(np.float64)
     score_anom = -res_anom.astype(np.float64)
+    score_thr = -res_thr.astype(np.float64) 
     auroc = roc_auc_score(np.r_[np.zeros(len(res_normal)), np.ones(len(res_anom))], np.r_[res_normal, res_anom])
     
     df = pd.DataFrame({
@@ -1279,33 +1312,35 @@ def ad_pca(
         "score": np.concatenate([score_normal, score_anom]),
     })
     df.to_csv(os.path.join(out_dir, "scores.csv"), index=False)
+    pd.DataFrame({"ID": normal_thr_ids, "score": score_thr}).to_csv(os.path.join(out_dir, "scores_thr.csv"), index=False)   # nuovo
+
     
     # soglia
     false_allarms = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)                             
-    normali = df[df.label == 0].sample(frac=1, random_state=0)        
-    meta = len(normali) // 2
-    thr_scores = normali.score.values[:meta]                          
-    eval_norm = normali.score.values[meta:]                           
+    thr_scores = score_thr        
+    eval_norm = score_normal                          
     anom = df[df.label == 1].score.values
     
     rules = {}
     for fa in false_allarms:
-        thr = float(np.quantile(thr_scores, fa))                        
-        tp = int((anom < thr).sum()); fn = len(anom) - tp               
-        fp = int((eval_norm < thr).sum()); tn = len(eval_norm) - fp     
+        thr = float(np.quantile(thr_scores, fa))
+        tp = int((anom < thr).sum()); fn = len(anom) - tp
+        fp = int((eval_norm < thr).sum()); tn = len(eval_norm) - fp
         prec = tp / (tp + fp) if tp + fp else 0.0
         rec = tp / (tp + fn)
-        rules[f"pca score < soglia (FA {fa:.0%})"] = {
+
+        rules[f"score < FA {fa:.0%})"] = {
             "soglia": thr, "TP": tp, "FP": fp, "FN": fn, "TN": tn,
             "FA_rate": fp / (fp + tn), "MA_rate": fn / (fn + tp), "REC": rec, "PREC": prec,
             "F1": 2 * prec * rec / (prec + rec) if tp > 0 else 0.0,
         }
         print(f"FA {fa:.0%}: soglia {thr:.4f} | TP {tp} FP {fp} FN {fn} TN {tn} | FA {fp/(fp+tn):.3f} REC {rec:.3f} PREC {prec:.3f}", flush=True)
-    
+
     # vettori 
     np.savez_compressed(
         os.path.join(out_dir, "embeddings.npz"),
         fit_ids=np.array(normal_fit_ids), fit_q=q_fit, fit_k=k_fit,
+        thr_ids=np.array(normal_thr_ids), thr_q=q_thr, thr_k=k_thr,                                 
         normal_ids=np.array(normal_test_ids), normal_q=q_normal, normal_k=k_normal,
         anom_ids=np.array(anom_ids), anom_q=q_anom, anom_k=k_anom,
     )
@@ -1314,8 +1349,8 @@ def ad_pca(
     results = {
         "job_name": job_name, "metodo": "pca_residuo", "dataset_anomalies": dataset_anomalies,
         "moco_version": moco_version, "min_flood_area": min_flood_area, "standardize": standardize,
-        "k": int(k_pca), "varianza_spiegata": float(cum[k_pca - 1]),
-        "n_fit": len(normal_fit_ids), "n_normali": len(normal_test_ids), "n_anomale": len(anom_ids),
+        "k": int(k_pca), "varianza": float(cum[k_pca - 1]),
+        "n_fit": len(normal_fit_ids), "n_thr": len(normal_thr_ids), "n_normali": len(normal_test_ids), "n_anomale": len(anom_ids),   
         "auroc": float(auroc),
         "rules": rules,
     }
