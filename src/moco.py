@@ -21,7 +21,7 @@ from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_attn
 from floodlib.loader import MoCo2encodersLoader
 
 from floodlib.builder import MoCo2encoders
-from floodlib.builder import MoCo2encoders_2d
+# from floodlib.builder import MoCo2encoders_2d
 from floodlib.builder import MoCo2encoders_attn
 
 matplotlib.use("Agg")  
@@ -477,7 +477,7 @@ def train_moco_2D(
     # TRAINING MOCO 2D
     
     print("--- Training MoCo 2D ---")
-    model = MoCo2encoders_2d(
+    model = MoCo2encoders_attn(
         base_encoder_q=modelOPT.encoder,
         base_encoder_k=modelSAR.encoder,
         dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
@@ -701,8 +701,8 @@ def train_moco_2D(
 def train_moco_attn(
     job_name: str = "nome_job",
     dataset: str = "Test",
-    weights_encoder_sar: str = "train_sar_1D_v1_Standard_200",
-    weights_encoder_opt: str = "train_opt_1D_v1_Standard_200",
+    weights_encoder_sar: str = "autoencoder_attn_SAR_weights_v1",
+    weights_encoder_opt: str = "autoencoder_attn_OPT_weights_v1",
     hidden_channels_dim: int = 64,
     attn: bool = False,
     ltae: bool = True,
@@ -796,14 +796,14 @@ def train_moco_attn(
     with open(f'train_ids_{job_name}.json', 'w') as f:
         json.dump(train_ids, f)
     try:
-        project_work.log_artifact(name=f"moco_2D_trainIdsList_{job_name}", source=f'train_ids_{job_name}.json', kind='artifact')
+        project_work.log_artifact(name=f"moco_attn_trainIdsList_{job_name}", source=f'train_ids_{job_name}.json', kind='artifact')
     except Exception as e:
         print(f"EXC -> upload train_ids: {e}", flush=True)
  
     with open(f'test_ids_{job_name}.json', 'w') as f:
         json.dump(test_ids, f)
     try:
-        project_work.log_artifact(name=f"moco_2D_testIdsList_{job_name}", source=f'test_ids_{job_name}.json', kind='artifact')
+        project_work.log_artifact(name=f"moco_attn_testIdsList_{job_name}", source=f'test_ids_{job_name}.json', kind='artifact')
     except Exception as e:
         print(f"EXC -> upload test: {e}", flush=True)
  
@@ -829,7 +829,7 @@ def train_moco_attn(
         base_encoder_q=modelOPT.encoder,
         base_encoder_k=modelSAR.encoder,
         dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-        symmetric=symmetric, device=device,
+        symmetric=symmetric, 
         hidden_channels_dim=hidden_channels_dim,
         pool_grid=pool_grid,
         simple_proj=False,
@@ -1045,7 +1045,7 @@ def train_moco_attn(
     return "TERMINATO -> training moco attn"
 
 
-
+"""
 @handler()
 def moco_eval(
     job_name: str = "nome_job",         
@@ -1269,3 +1269,4 @@ def moco_eval(
 
 
 
+"""

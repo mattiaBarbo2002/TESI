@@ -1572,3 +1572,14 @@ def split_tiles_artifact(
 
     return (f"TERMINATO -> {n_saved} tasselli salvati in '{output_name}' "
             f"(flood >= {min_flood_pct}%, tetto {tetto}), {len(counts)} eventi, CSV in '{stats_name}'")
+
+
+
+@handler()
+def FloodsImage(
+    version: str = "v1",
+):
+    print(f"versione: {version}")
+    print("passaporto")
+
+    return("TERMINATO")

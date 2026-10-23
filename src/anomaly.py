@@ -24,8 +24,10 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
 
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_2d
+from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_attn
 from floodlib.loader import MoCo2encodersLoader
 from floodlib.builder import MoCo2encoders_2d
+from floodlib.builder import MoCo2encoders_attn
 
 
 matplotlib.use("Agg") 
@@ -54,7 +56,8 @@ def ad_cosine(
     batch_size: int = 32,
     workers: int = 0,
     min_flood_area: float = 10.0, 
-    old_vectors: str = ""                   
+    old_vectors: str = "",
+    moco_attn: bool = False                
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
@@ -106,7 +109,11 @@ def ad_cosine(
     normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
  
     # import ids lits from moco training
-    p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    if moco_attn:
+        p = project_work.get_artifact(f"moco_attn_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    else:
+        p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+
     with open(p, 'r') as f:
         test_ids = json.load(f)
     print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
@@ -181,21 +188,40 @@ def ad_cosine(
  
         # caricamento pesi moco
         try:
-            encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
-            encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
- 
-            model = MoCo2encoders_2d(
-                base_encoder_q=encoderOPT.encoder,
-                base_encoder_k=encoderSAR.encoder,
-                dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-                symmetric=False, device=device,
-                hidden_channels_dim=hidden_channels_dim,
-                simple_proj=simple_proj,
-                pool_grid=pool_grid,
-                attn=attn
-            ).to(device)
- 
-            w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+            if moco_attn:
+                encoderSAR = Singlemodal_CAE_attn(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
+                encoderOPT = Singlemodal_CAE_attn(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
+
+                model = MoCo2encoders_attn(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, 
+                    hidden_channels_dim=hidden_channels_dim,
+                    pool_grid=pool_grid,
+                    simple_proj=False,
+                    attn=attn
+                ).to(device)
+
+                w_path = project_work.get_artifact(f"moco_attn_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+
+            else:
+                encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+                encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+
+                model = MoCo2encoders_2d(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, device=device,
+                    hidden_channels_dim=hidden_channels_dim,
+                    simple_proj=simple_proj,
+                    pool_grid=pool_grid,
+                    attn=attn
+                ).to(device)
+
+                w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)               
+
             checkpoint = torch.load(w_path, map_location=device)
             state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
             model.load_state_dict(state_dict)
@@ -361,7 +387,8 @@ def ad_bin(
     batch_size: int = 32,
     workers: int = 0,
     min_flood_area: float = 10.0,                    
-    k_bin: int = 1,                                  
+    k_bin: int = 1,         
+    moco_attn: bool = False                         
 ):
  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -413,7 +440,11 @@ def ad_bin(
     normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
  
     # import ids lits from moco training
-    p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    if moco_attn:
+        p = project_work.get_artifact(f"moco_attn_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    else:
+        p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    
     with open(p, 'r') as f:
         test_ids = json.load(f)
     print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
@@ -503,21 +534,40 @@ def ad_bin(
  
         # caricamento pesi moco
         try:
-            encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
-            encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
- 
-            model = MoCo2encoders_2d(
-                base_encoder_q=encoderOPT.encoder,
-                base_encoder_k=encoderSAR.encoder,
-                dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-                symmetric=False, device=device,
-                hidden_channels_dim=hidden_channels_dim,
-                simple_proj=simple_proj,
-                pool_grid=pool_grid,
-                attn=attn
-            ).to(device)
- 
-            w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+            if moco_attn:
+                encoderSAR = Singlemodal_CAE_attn(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
+                encoderOPT = Singlemodal_CAE_attn(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
+
+                model = MoCo2encoders_attn(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, 
+                    hidden_channels_dim=hidden_channels_dim,
+                    pool_grid=pool_grid,
+                    simple_proj=False,
+                    attn=attn
+                ).to(device)
+
+                w_path = project_work.get_artifact(f"moco_attn_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+
+            else:
+                encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+                encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+
+                model = MoCo2encoders_2d(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, device=device,
+                    hidden_channels_dim=hidden_channels_dim,
+                    simple_proj=simple_proj,
+                    pool_grid=pool_grid,
+                    attn=attn
+                ).to(device)
+
+                w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)               
+            
             checkpoint = torch.load(w_path, map_location=device)
             state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
             model.load_state_dict(state_dict)
@@ -724,7 +774,8 @@ def ad_ocsvm(
     workers: int = 0,
     min_flood_area: float = 10.0,     
     old_vectors: str = "",
-    n_series_thr: int = 500,                                
+    n_series_thr: int = 500,
+    moco_attn: bool = False,                                
 ):
  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -777,7 +828,11 @@ def ad_ocsvm(
     normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
  
     # import ids lits from moco training
-    p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    if moco_attn:
+        p = project_work.get_artifact(f"moco_attn_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    else:
+        p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    
     with open(p, 'r') as f:
         test_ids = json.load(f)
     print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
@@ -855,21 +910,40 @@ def ad_ocsvm(
  
         # caricamento pesi moco
         try:
-            encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
-            encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
- 
-            model = MoCo2encoders_2d(
-                base_encoder_q=encoderOPT.encoder,
-                base_encoder_k=encoderSAR.encoder,
-                dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-                symmetric=False, device=device,
-                hidden_channels_dim=hidden_channels_dim,
-                simple_proj=simple_proj,
-                pool_grid=pool_grid,
-                attn=attn
-            ).to(device)
- 
-            w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+            if moco_attn:
+                encoderSAR = Singlemodal_CAE_attn(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
+                encoderOPT = Singlemodal_CAE_attn(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
+
+                model = MoCo2encoders_attn(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, 
+                    hidden_channels_dim=hidden_channels_dim,
+                    pool_grid=pool_grid,
+                    simple_proj=False,
+                    attn=attn
+                ).to(device)
+
+                w_path = project_work.get_artifact(f"moco_attn_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+
+            else:
+                encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+                encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+
+                model = MoCo2encoders_2d(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, device=device,
+                    hidden_channels_dim=hidden_channels_dim,
+                    simple_proj=simple_proj,
+                    pool_grid=pool_grid,
+                    attn=attn
+                ).to(device)
+
+                w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)               
+            
             checkpoint = torch.load(w_path, map_location=device)
             state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
             model.load_state_dict(state_dict)
@@ -998,7 +1072,7 @@ def ad_ocsvm(
         prec = tp / (tp + fp) if tp + fp else 0.0
         rec = tp / (tp + fn)
 
-        rules[f"score < FA {fa:.0%})"] = {
+        rules[f"FA {fa:.0%}"] = {
             "soglia": thr, "TP": tp, "FP": fp, "FN": fn, "TN": tn,
             "FA_rate": fp / (fp + tn), "MA_rate": fn / (fn + tp), "REC": rec, "PREC": prec,
             "F1": 2 * prec * rec / (prec + rec) if tp > 0 else 0.0,
@@ -1062,6 +1136,7 @@ def ad_pca(
     min_flood_area: float = 10.0,                    
     k_pca: int = 8,
     n_series_thr: int = 500,
+    moco_attn: bool = False,
 ):
  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1113,7 +1188,11 @@ def ad_pca(
     normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
 
     # import ids lits from moco training
-    p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    if moco_attn:
+        p = project_work.get_artifact(f"moco_attn_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    else:
+        p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    
     with open(p, 'r') as f:
         test_ids = json.load(f)
     print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
@@ -1191,21 +1270,40 @@ def ad_pca(
 
         # caricamento pesi moco
         try:
-            encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
-            encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+            if moco_attn:
+                encoderSAR = Singlemodal_CAE_attn(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
+                encoderOPT = Singlemodal_CAE_attn(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
 
-            model = MoCo2encoders_2d(
-                base_encoder_q=encoderOPT.encoder,
-                base_encoder_k=encoderSAR.encoder,
-                dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-                symmetric=False, device=device,
-                hidden_channels_dim=hidden_channels_dim,
-                simple_proj=simple_proj,
-                pool_grid=pool_grid,
-                attn=attn
-            ).to(device)
+                model = MoCo2encoders_attn(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, 
+                    hidden_channels_dim=hidden_channels_dim,
+                    pool_grid=pool_grid,
+                    simple_proj=False,
+                    attn=attn
+                ).to(device)
 
-            w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+                w_path = project_work.get_artifact(f"moco_attn_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+
+            else:
+                encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+                encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+
+                model = MoCo2encoders_2d(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, device=device,
+                    hidden_channels_dim=hidden_channels_dim,
+                    simple_proj=simple_proj,
+                    pool_grid=pool_grid,
+                    attn=attn
+                ).to(device)
+
+                w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)               
+            
             checkpoint = torch.load(w_path, map_location=device)
             state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
             model.load_state_dict(state_dict)
@@ -1384,7 +1482,9 @@ def ad_md(
     standardize: bool = True,                       
     batch_size: int = 32,
     workers: int = 0,
-    min_flood_area: float = 10.0,                    
+    min_flood_area: float = 10.0,
+    n_series_thr: int = 500,   
+    moco_attn: bool = False,                 
 ):
  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1436,7 +1536,11 @@ def ad_md(
     normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
 
     # import ids lits from moco training
-    p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    if moco_attn:
+        p = project_work.get_artifact(f"moco_attn_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+    else:
+        p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+
     with open(p, 'r') as f:
         test_ids = json.load(f)
     print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
@@ -1457,8 +1561,10 @@ def ad_md(
     normal_ids = ids_per_sensor_normal["SAR"] & ids_per_sensor_normal["OPT"]
  
     shuffled_test_ids = [ID for ID in shuffled_test_ids if ID in normal_ids]
-    normal_fit_ids = shuffled_test_ids[:num_fit_series]                                             # fit -> var
-    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]              # anomaly detection 
+
+    normal_fit_ids  = shuffled_test_ids[:num_fit_series - n_series_thr]                            # fit -> var
+    normal_thr_ids  = shuffled_test_ids[num_fit_series - n_series_thr:num_fit_series]              # calcolo soglie
+    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]             # anomaly detection 
 
 
     print(f"OK -> {len(test_ids)} serie normali tot, {len(normal_fit_ids)} serie fit, {len(normal_test_ids)} serie test normali")
@@ -1476,7 +1582,7 @@ def ad_md(
 
         old = np.load("/data/old_vectors/embeddings.npz")
         lookup = {}
-        for g in ("fit", "normal", "anom"):
+        for g in ("fit", "thr", "normal", "anom"):
             for i, ID in enumerate(old[f"{g}_ids"]):
                 lookup[str(ID)] = (old[f"{g}_q"][i], old[f"{g}_k"][i])
 
@@ -1487,9 +1593,10 @@ def ad_md(
             return np.stack([lookup[ID][0] for ID in ids]), np.stack([lookup[ID][1] for ID in ids])
 
         q_fit, k_fit = take(normal_fit_ids, "fit")
+        q_thr, k_thr = take(normal_thr_ids, "thr")
         q_normal, k_normal = take(normal_test_ids, "normali test")
         q_anom, k_anom = take(anom_ids, "anomale")
-        print(f"OK -> embedding caricati: {len(q_fit)} fit, {len(q_normal)} normali, {len(q_anom)} anomale", "\n", flush=True)
+        print(f"OK -> embedding caricatu: {len(q_fit)} fit,  {len(q_thr)} thr, {len(q_normal)} normali, {len(q_anom)} anomale", "\n", flush=True)
 
     else:
 
@@ -1501,7 +1608,7 @@ def ad_md(
 
         os.makedirs(sar_dir, exist_ok=True)
         os.makedirs(opt_dir, exist_ok=True)
-        wanted_normal_series = {f"{ID}.npy" for ID in set(normal_fit_ids) | set(normal_test_ids)}
+        wanted_normal_series = {f"{ID}.npy" for ID in set(normal_fit_ids) | set(normal_thr_ids) | set(normal_test_ids)}       
         for modality, cache_dir in [("SAR", sar_dir), ("OPT", opt_dir)]:
             for part_path in sorted(glob(os.path.join(normal_path, modality, "part*.zip"))):
                 with zipfile.ZipFile(part_path, 'r') as z:
@@ -1511,21 +1618,40 @@ def ad_md(
 
         # caricamento pesi moco
         try:
-            encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
-            encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+            if moco_attn:
+                encoderSAR = Singlemodal_CAE_attn(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
+                encoderOPT = Singlemodal_CAE_attn(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
 
-            model = MoCo2encoders_2d(
-                base_encoder_q=encoderOPT.encoder,
-                base_encoder_k=encoderSAR.encoder,
-                dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-                symmetric=False, device=device,
-                hidden_channels_dim=hidden_channels_dim,
-                simple_proj=simple_proj,
-                pool_grid=pool_grid,
-                attn=attn
-            ).to(device)
+                model = MoCo2encoders_attn(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, 
+                    hidden_channels_dim=hidden_channels_dim,
+                    pool_grid=pool_grid,
+                    simple_proj=False,
+                    attn=attn
+                ).to(device)
 
-            w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+                w_path = project_work.get_artifact(f"moco_attn_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+
+            else:
+                encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+                encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+
+                model = MoCo2encoders_2d(
+                    base_encoder_q=encoderOPT.encoder,
+                    base_encoder_k=encoderSAR.encoder,
+                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                    symmetric=False, device=device,
+                    hidden_channels_dim=hidden_channels_dim,
+                    simple_proj=simple_proj,
+                    pool_grid=pool_grid,
+                    attn=attn
+                ).to(device)
+
+                w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)               
+            
             checkpoint = torch.load(w_path, map_location=device)
             state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
             model.load_state_dict(state_dict)
@@ -1561,6 +1687,11 @@ def ad_md(
         q_fit, k_fit = embed(normal_fit_ids)
         print(f"OK -> normali fit: {len(q_fit)} serie, q {q_fit.shape[1]} + k {k_fit.shape[1]} = {q_fit.shape[1] + k_fit.shape[1]} dim", "\n", flush=True)
 
+        # embedding serie thr 
+        print("Embedding MoCo: serie thr pac", flush=True)
+        q_thr, k_thr = embed(normal_thr_ids)
+        print(f"OK -> normali thr: {len(q_thr)} serie, q {q_thr.shape[1]} + k {k_thr.shape[1]} = {q_thr.shape[1] + k_thr.shape[1]} dim", "\n", flush=True)
+ 
         # embedding serie normali
         print("Embedding MoCo: serie normali", flush=True)
         q_normal, k_normal = embed(normal_test_ids)
@@ -1589,15 +1720,17 @@ def ad_md(
  
     # concatenazione
     z_fit = np.concatenate([q_fit, k_fit], axis=1)
+    z_thr = np.concatenate([q_thr, k_thr], axis=1)
     z_normal = np.concatenate([q_normal, k_normal], axis=1)
     z_anom = np.concatenate([q_anom, k_anom],axis=1)
 
     if standardize:
         scaler = StandardScaler().fit(z_fit)
-        z_fit, z_normal, z_anom = scaler.transform(z_fit), scaler.transform(z_normal), scaler.transform(z_anom)
+        z_fit, z_thr, z_normal, z_anom = scaler.transform(z_fit), scaler.transform(z_thr), scaler.transform(z_normal), scaler.transform(z_anom)
 
     # distanza mahalanobis
     pca = PCA(whiten=True).fit(z_fit.astype(np.float64))
+    res_thr = (pca.transform(z_thr.astype(np.float64)) ** 2).sum(axis=1)
     res_normal = (pca.transform(z_normal.astype(np.float64)) ** 2).sum(axis=1)
     res_anom = (pca.transform(z_anom.astype(np.float64)) ** 2).sum(axis=1)
 
@@ -1612,6 +1745,7 @@ def ad_md(
     # punteggi
     score_normal = -res_normal.astype(np.float64)
     score_anom = -res_anom.astype(np.float64)
+    score_thr = -res_thr.astype(np.float64)
     auroc = roc_auc_score(np.r_[np.zeros(len(res_normal)), np.ones(len(res_anom))], np.r_[res_normal, res_anom])
     
     df = pd.DataFrame({
@@ -1623,20 +1757,19 @@ def ad_md(
     
     # soglia
     false_allarms = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)                             
-    normali = df[df.label == 0].sample(frac=1, random_state=0)        
-    meta = len(normali) // 2
-    thr_scores = normali.score.values[:meta]                          
-    eval_norm = normali.score.values[meta:]                           
+    thr_scores = score_thr        
+    eval_norm = score_normal                          
     anom = df[df.label == 1].score.values
     
     rules = {}
     for fa in false_allarms:
-        thr = float(np.quantile(thr_scores, fa))                        
-        tp = int((anom < thr).sum()); fn = len(anom) - tp               
-        fp = int((eval_norm < thr).sum()); tn = len(eval_norm) - fp     
+        thr = float(np.quantile(thr_scores, fa))
+        tp = int((anom < thr).sum()); fn = len(anom) - tp
+        fp = int((eval_norm < thr).sum()); tn = len(eval_norm) - fp
         prec = tp / (tp + fp) if tp + fp else 0.0
         rec = tp / (tp + fn)
-        rules[f"md score < soglia (FA {fa:.0%})"] = {
+
+        rules[f"FA {fa:.0%}"] = {
             "soglia": thr, "TP": tp, "FP": fp, "FN": fn, "TN": tn,
             "FA_rate": fp / (fp + tn), "MA_rate": fn / (fn + tp), "REC": rec, "PREC": prec,
             "F1": 2 * prec * rec / (prec + rec) if tp > 0 else 0.0,
@@ -1647,6 +1780,7 @@ def ad_md(
     np.savez_compressed(
         os.path.join(out_dir, "embeddings.npz"),
         fit_ids=np.array(normal_fit_ids), fit_q=q_fit, fit_k=k_fit,
+        thr_ids=np.array(normal_thr_ids), thr_q=q_thr, thr_k=k_thr,                                 
         normal_ids=np.array(normal_test_ids), normal_q=q_normal, normal_k=k_normal,
         anom_ids=np.array(anom_ids), anom_q=q_anom, anom_k=k_anom,
     )
@@ -1656,7 +1790,7 @@ def ad_md(
         "job_name": job_name, "metodo": "md", "dataset_anomalies": dataset_anomalies,
         "moco_version": moco_version, "min_flood_area": min_flood_area, "standardize": standardize,
         "whitening": True, "n_componenti": int(pca.n_components_),
-        "n_fit": len(normal_fit_ids), "n_normali": len(normal_test_ids), "n_anomale": len(anom_ids),
+        "n_fit": len(normal_fit_ids), "n_thr": len(normal_thr_ids), "n_normali": len(normal_test_ids), "n_anomale": len(anom_ids),
         "auroc": float(auroc),
         "rules": rules,
     }
