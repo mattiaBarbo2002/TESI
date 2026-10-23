@@ -271,7 +271,7 @@ class spatialCBAM(nn.Module):
         # Mc: (Batch, Canali, 1, 1, 1) * x: (Batch, Canali, Tempo, H, W)
         Mc = self.sigmoid(avgOut + maxOut)
         Mc = Mc.view(Mc.size(0), Mc.size(1), 1, 1, 1)
-        Mf1 = Mc * x
+        Mf1 = (1 + Mc) * x
 
         # dove guardare: mappa di calore per ogni istante
         # schiaccia solo i canali di Mf1, il tempo resta separato

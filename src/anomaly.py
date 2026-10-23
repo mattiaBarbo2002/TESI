@@ -22,6 +22,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 from sklearn.decomposition import PCA 
 from sklearn.metrics import roc_auc_score
+from scipy.stats import spearmanr
+from sklearn.linear_model import RidgeCV
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import KFold, cross_val_predict
 
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_2d
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_attn
@@ -1800,6 +1804,137 @@ def ad_md(
     shutil.make_archive(out_dir, "zip", out_dir)
     project_work.log_artifact(name=f"anomaly_results_md_{job_name}", source=f"{out_dir}.zip", kind="artifact")
 
+
+
+
+
+
+
+@handler()
+def linear_probe(
+    job_name: str = "probe_v1",
+    results_artifacts: list | None = None,   # es. ["anomaly_results_md_net_v3", "anomaly_results_md_attn_v2"]
+    include_normals: bool = True,            # True -> anche prova "anomale + normali" (normali con area 0)
+    n_folds: int = 5,
+    seed: int = 0,
+):
+    project_work = dh.get_project("floods")
+    project_data = dh.get_project("datasets")
+
+    if not results_artifacts:
+        raise ValueError("results_artifacts vuoto: passa la lista degli artifact con gli embedding")
+
+    work_dir = "/data/probe"
+    shutil.rmtree(work_dir, ignore_errors=True)
+    os.makedirs(work_dir)
+
+    # ------------------------------------------------------------------
+    # 1. embedding di ogni versione: dizionari ID -> (q ottico, k sar)
+    # ------------------------------------------------------------------
+    versions = {}
+    dataset_anomalies = None
+
+    for art in results_artifacts:
+        p = project_work.get_artifact(art).download(os.path.join(work_dir, f"{art}.zip"), overwrite=True)
+        out = os.path.join(work_dir, art)
+        with zipfile.ZipFile(p) as z:
+            z.extractall(out)
+
+        with open(os.path.join(out, "anomaly_results.json")) as f:
+            res = json.load(f)
+
+        # tutte le versioni devono usare lo stesso dataset di anomalie
+        if dataset_anomalies is None:
+            dataset_anomalies = res["dataset_anomalies"]
+        elif res["dataset_anomalies"] != dataset_anomalies:
+            raise ValueError(f"{art} usa {res['dataset_anomalies']}, le altre {dataset_anomalies}")
+
+        emb = np.load(os.path.join(out, "embeddings.npz"))
+        versions[art] = {
+            "anom":   {str(ID): (q, k) for ID, q, k in zip(emb["anom_ids"],   emb["anom_q"],   emb["anom_k"])},
+            "normal": {str(ID): (q, k) for ID, q, k in zip(emb["normal_ids"], emb["normal_q"], emb["normal_k"])},
+        }
+        print(f"OK -> {art}: {len(versions[art]['anom'])} anomale, {len(versions[art]['normal'])} normali", flush=True)
+
+    # stesse serie per tutte le versioni (intersezione), ordinate per ID
+    anom_ids = sorted(set.intersection(*(set(v["anom"]) for v in versions.values())))
+    normal_ids = sorted(set.intersection(*(set(v["normal"]) for v in versions.values())))
+    print(f"OK -> serie comuni: {len(anom_ids)} anomale, {len(normal_ids)} normali", "\n", flush=True)
+
+    # ------------------------------------------------------------------
+    # 2. percentuale allagata dalla MASK (classe 2 = acqua da alluvione)
+    # ------------------------------------------------------------------
+    print(f"Download maschere: {dataset_anomalies}", flush=True)
+    anom_path = project_data.get_artifact(dataset_anomalies).download(f"/data/{dataset_anomalies}", overwrite=True)
+
+    wanted = set(anom_ids)
+    flood_area = {}
+    for part_path in sorted(glob(os.path.join(anom_path, "MASK", "part*.zip"))):
+        with zipfile.ZipFile(part_path, "r") as z:
+            for name in z.namelist():
+                if name.endswith(".npy") and name[:-4] in wanted:
+                    mask = np.load(io.BytesIO(z.read(name)))
+                    flood_area[name[:-4]] = 100.0 * float((mask == 2).sum()) / mask.size
+
+    missing = [ID for ID in anom_ids if ID not in flood_area]
+    if missing:
+        print(f"ATTENZIONE -> {len(missing)} serie senza maschera, escluse (es. {missing[:3]})", flush=True)
+        anom_ids = [ID for ID in anom_ids if ID in flood_area]
+
+    y_anom = np.array([flood_area[ID] for ID in anom_ids])
+    print(f"OK -> area allagata: media {y_anom.mean():.2f}% | mediana {np.median(y_anom):.2f}% | max {y_anom.max():.2f}%", "\n", flush=True)
+
+    # ------------------------------------------------------------------
+    # 3. linear probe
+    # ------------------------------------------------------------------
+    bins = [(0, 0), (0, 5), (5, 20), (20, 100)]      # fasce per l'errore medio (0 = solo normali)
+
+    def probe(X, y):
+        cv = KFold(n_folds, shuffle=True, random_state=seed)       # stessi fold per ogni prova
+        model = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 13)))
+        pred = cross_val_predict(model, X, y, cv=cv)
+
+        out = {
+            "R2": 1 - ((y - pred) ** 2).sum() / ((y - y.mean()) ** 2).sum(),
+            "MAE": float(np.abs(y - pred).mean()),
+            "Spearman": float(spearmanr(y, pred).correlation),
+        }
+        for lo, hi in bins:
+            sel = (y == 0) if hi == 0 else ((y > lo) & (y <= hi))
+            out[f"MAE_{lo}-{hi}%" if hi else "MAE_0%"] = float(np.abs(y[sel] - pred[sel]).mean()) if sel.any() else np.nan
+        return out
+
+    settings = [("anomale", False)] + ([("anomale+normali", True)] if include_normals else [])
+    rows = []
+
+    for art, v in versions.items():
+        for setting, with_normals in settings:
+            ids = anom_ids + (normal_ids if with_normals else [])
+            src = [v["anom"][ID] if i < len(anom_ids) else v["normal"][ID] for i, ID in enumerate(ids)]
+            q = np.stack([s[0] for s in src])          # ottico
+            k = np.stack([s[1] for s in src])          # sar
+            y = np.r_[y_anom, np.zeros(len(normal_ids))] if with_normals else y_anom
+
+            for modalita, X in (("SAR", k), ("OTTICO", q), ("SAR+OTTICO", np.concatenate([q, k], axis=1))):
+                m = probe(X, y)
+                rows.append({"versione": art, "serie": setting, "modalita": modalita, "n": len(y), "dim": X.shape[1], **m})
+                print(f"{art} | {setting:15s} | {modalita:10s} | R² {m['R2']:.3f} | MAE {m['MAE']:.2f}% | Spearman {m['Spearman']:.3f}", flush=True)
+        print(flush=True)
+
+    # ------------------------------------------------------------------
+    # 4. salvataggio (un solo upload)
+    # ------------------------------------------------------------------
+    df = pd.DataFrame(rows)
+    csv_path = f"linear_probe_{job_name}.csv"
+    df.to_csv(csv_path, index=False)
+
+    try:
+        project_work.log_artifact(name=f"linear_probe_{job_name}", source=csv_path, kind="artifact")
+        print(f"OK -> risultati salvati: linear_probe_{job_name}", flush=True)
+    except Exception as e:
+        print(f"EXC -> upload risultati: {e}", flush=True)
+
+    return "TERMINATO -> linear probe"
 
 
 
