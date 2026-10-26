@@ -21,8 +21,9 @@ from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_attn
 from floodlib.loader import MoCo2encodersLoader
 
 from floodlib.builder import MoCo2encoders
-# from floodlib.builder import MoCo2encoders_2d
+from floodlib.builder import MoCo2encoders_2d
 from floodlib.builder import MoCo2encoders_attn
+
 
 matplotlib.use("Agg")  
 
@@ -358,7 +359,6 @@ def train_moco_2D(
     weights_encoder_opt: str = "train_opt_1D_v1_Standard_200",
     hidden_channels_dim: int = 64,
     simple_proj: bool = True,
-    attn: bool = False,
     pool_grid: int = 1,
     resume: bool = True,  
     lr_min: float = 0.0003,   
@@ -464,10 +464,10 @@ def train_moco_2D(
         path_sar = project_work.get_artifact(weights_encoder_sar).download(f"{weights_encoder_sar}.pth")
         path_opt = project_work.get_artifact(weights_encoder_opt).download(f"{weights_encoder_opt}.pth")
  
-        modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=attn).to(device)
+        modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
         modelSAR.load_state_dict(torch.load(path_sar, map_location=device))
  
-        modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=attn).to(device)
+        modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
         modelOPT.load_state_dict(torch.load(path_opt, map_location=device))
         print(f"OK -> Pesi encoders caricati: {weights_encoder_sar}, {weights_encoder_opt}", "\n", flush=True)
     except Exception as e:
@@ -477,7 +477,7 @@ def train_moco_2D(
     # TRAINING MOCO 2D
     
     print("--- Training MoCo 2D ---")
-    model = MoCo2encoders_attn(
+    model = MoCo2encoders_2d(
         base_encoder_q=modelOPT.encoder,
         base_encoder_k=modelSAR.encoder,
         dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
@@ -485,7 +485,6 @@ def train_moco_2D(
         hidden_channels_dim=hidden_channels_dim,
         pool_grid=pool_grid,
         simple_proj=simple_proj,
-        attn=attn
     ).to(device)
  
     results = {'lr': [], 'train_loss': []}

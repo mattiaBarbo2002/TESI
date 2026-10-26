@@ -251,7 +251,6 @@ class MoCo2encoders_2d(nn.Module):
         symmetric: bool = False,
         hidden_channels_dim: int = 64,
         simple_proj: bool = True,
-        attn: bool = False,
         pool_grid: int = 1,         
         device='cuda',
     ) -> None:
@@ -268,7 +267,6 @@ class MoCo2encoders_2d(nn.Module):
         self.symmetric = symmetric
  
         self.simple_proj = simple_proj
-        self.attn = attn
         self.pool_grid = pool_grid   
  
         # pesi encoder congelati, entrambi false, alleno solo MLP
@@ -332,13 +330,7 @@ class MoCo2encoders_2d(nn.Module):
                 nn.ReLU(),
             )
  
-            # attention tipo CBAM, in più non so se serve
-            if attn:
-                self.attn_q = nn.Conv2d(hidden_channels_dim, 1, kernel_size=1)
-                self.attn_k = nn.Conv2d(hidden_channels_dim, 1, kernel_size=1)
-                proj_in = hidden_channels_dim   
-            else:
-                proj_in = hidden_channels_dim * pool_grid * pool_grid   
+            proj_in = hidden_channels_dim * pool_grid * pool_grid   
  
             self.proj_q = nn.Sequential(
                 nn.Linear(proj_in, dim),
@@ -356,11 +348,6 @@ class MoCo2encoders_2d(nn.Module):
             for param_q, param_k in zip(self.conv_q.parameters(), self.conv_k.parameters()):
                 param_k.data.copy_(param_q.data)
                 param_k.requires_grad = False
- 
-            if attn:
-                for param_q, param_k in zip(self.attn_q.parameters(), self.attn_k.parameters()):
-                    param_k.data.copy_(param_q.data)
-                    param_k.requires_grad = False
  
             for param_q, param_k in zip(self.proj_q.parameters(), self.proj_k.parameters()):
                 param_k.data.copy_(param_q.data)
@@ -389,10 +376,6 @@ class MoCo2encoders_2d(nn.Module):
         else:
             for param_q, param_k in zip(self.conv_q.parameters(), self.conv_k.parameters()):
                 param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
- 
-            if self.attn:
-                for param_q, param_k in zip(self.attn_q.parameters(), self.attn_k.parameters()):
-                    param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
  
             for param_q, param_k in zip(self.proj_q.parameters(), self.proj_k.parameters()):
                 param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
@@ -454,11 +437,7 @@ class MoCo2encoders_2d(nn.Module):
             q = self.pool_q(q).flatten(1)
         else:
             q = self.conv_q(q) 
-            if self.attn:                                                               # (batch, hidden_channels_dim, 16, 16)
-                q_scores = self.attn_q(q).flatten(2).softmax(dim=-1)                    # (batch, 1, 256)
-                q = torch.einsum('bcn,bkn->bck', q.flatten(2), q_scores).squeeze(-1)    # (batch, hidden_channels_dim)
-            else:
-                q = self.pool_q(q).flatten(1)
+            q = self.pool_q(q).flatten(1)
  
         q = nn.functional.normalize(self.proj_q(q), dim=1)  
         #print("contrastive_loss: q.shape:", q.shape)    
@@ -474,11 +453,7 @@ class MoCo2encoders_2d(nn.Module):
                 k = self.pool_k(k).flatten(1) 
             else:   
                 k = self.conv_k(k)   
-                if self.attn:                                           
-                    k_scores = self.attn_k(k).flatten(2).softmax(dim=-1)
-                    k = torch.einsum('bcn,bkn->bck', k.flatten(2), k_scores).squeeze(-1) 
-                else:
-                    k = self.pool_k(k).flatten(1)
+                k = self.pool_k(k).flatten(1)
  
             k = nn.functional.normalize(self.proj_k(k), dim=1) 
  
@@ -649,25 +624,33 @@ class MoCo2encoders_attn(nn.Module):
         else:
             # hidden_channels_dim // 2
             self.conv_q = nn.Sequential(
-                spatialCBAM2d(encoder_q_dim, reduction_ratio=4),                                                    # gate a 64x64, prima dello stride
-                nn.Conv2d(encoder_q_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),                  # dim 64->32
-                nn.BatchNorm2d(hidden_channels_dim//2),
+                #spatialCBAM2d(encoder_q_dim, reduction_ratio=4),                                                    # gate a 64x64, prima dello stride
+                #nn.Conv2d(encoder_q_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),                  # dim 64->32
+                nn.Conv2d(encoder_q_dim, encoder_q_dim, kernel_size=3, stride=1, padding=1),
+                #nn.BatchNorm2d(hidden_channels_dim//2),
+                nn.BatchNorm2d(encoder_q_dim),
                 nn.ReLU(),
 
-                spatialCBAM2d(hidden_channels_dim//2),                                                                 # gate a 32x32, prima dello stride
-                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16
-                nn.BatchNorm2d(hidden_channels_dim),
+                #spatialCBAM2d(hidden_channels_dim//2),                                                                 # gate a 32x32, prima dello stride
+                #nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16
+                nn.Conv2d(encoder_q_dim, encoder_q_dim, kernel_size=3, stride=1, padding=1),
+                #nn.BatchNorm2d(hidden_channels_dim),
+                nn.BatchNorm2d(encoder_q_dim),
                 nn.ReLU(),
             )
             self.conv_k = nn.Sequential(
-                spatialCBAM2d(encoder_k_dim, reduction_ratio=4),
-                nn.Conv2d(encoder_k_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(hidden_channels_dim//2),
+                #spatialCBAM2d(encoder_k_dim, reduction_ratio=4),
+                #nn.Conv2d(encoder_k_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(encoder_k_dim, encoder_k_dim, kernel_size=3, stride=1, padding=1),
+                #nn.BatchNorm2d(hidden_channels_dim//2),
+                nn.BatchNorm2d(encoder_k_dim),
                 nn.ReLU(),
 
-                spatialCBAM2d(hidden_channels_dim//2),
-                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(hidden_channels_dim),
+                #spatialCBAM2d(hidden_channels_dim//2),
+                #nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(encoder_k_dim, encoder_k_dim, kernel_size=3, stride=1, padding=1),
+                #nn.BatchNorm2d(hidden_channels_dim),
+                nn.BatchNorm2d(encoder_k_dim),
                 nn.ReLU(),
             )
  
