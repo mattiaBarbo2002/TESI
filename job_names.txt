@@ -41,3 +41,13 @@ moco_2D_net_v3 -> 4.832832649458059 -> 0,7963% ~32,6
 
 
 
+net_v5 -> 2 layer out 128
+net_v6 -> attn
+net_v7 -> 3 layer doppio 64
+net_v8 -> 3 layer out 128
+net_v9_64 -> 3 layer 128 conv1x1 out 64
+
+
+
+
+

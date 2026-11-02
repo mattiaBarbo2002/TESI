@@ -28,6 +28,7 @@ from scipy.stats import spearmanr
 from sklearn.linear_model import RidgeCV
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.covariance import LedoitWolf
 
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_2d
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_attn
@@ -928,7 +929,6 @@ def ad_ocsvm(
                     hidden_channels_dim=hidden_channels_dim,
                     pool_grid=pool_grid,
                     simple_proj=False,
-                    attn=attn
                 ).to(device)
 
                 w_path = project_work.get_artifact(f"moco_attn_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
@@ -945,7 +945,6 @@ def ad_ocsvm(
                     hidden_channels_dim=hidden_channels_dim,
                     simple_proj=simple_proj,
                     pool_grid=pool_grid,
-                    attn=attn
                 ).to(device)
 
                 w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)               
@@ -987,6 +986,7 @@ def ad_ocsvm(
                         k = model.pool_k(model.conv_k(k)).flatten(1)
                     q = model.proj_q(q)
                     k = model.proj_k(k)
+                    
                     
                     out_q.append(q.float().flatten(1).cpu())
                     out_k.append(k.float().flatten(1).cpu())
@@ -1038,11 +1038,25 @@ def ad_ocsvm(
         scaler = StandardScaler().fit(w_fit)
         w_fit, w_thr, w_normal, w_anom = scaler.transform(w_fit), scaler.transform(w_thr), scaler.transform(w_normal), scaler.transform(w_anom)
 
+    """
     pw = PCA(whiten=True).fit(w_fit)
     z_fit = pw.transform(w_fit)
     z_thr = pw.transform(w_thr)
     z_normal = pw.transform(w_normal)
     z_anom = pw.transform(w_anom)    
+    """
+
+    lw = LedoitWolf().fit(w_fit)
+    lam, V = np.linalg.eigh(lw.covariance_)           
+    W = V / np.sqrt(lam)                              
+    z_fit = (w_fit - lw.location_) @ W
+    z_thr = (w_thr - lw.location_) @ W
+    z_normal = (w_normal - lw.location_) @ W
+    z_anom = (w_anom - lw.location_) @ W
+    n_componenti = w_fit.shape[1]
+    shrinkage = float(lw.shrinkage_)
+    print(f"Ledoit-Wolf: {n_componenti} dimensioni | shrinkage {shrinkage:.3f} | "
+            f"autovalore min {lam.min():.4f} max {lam.max():.2f}", flush=True)
  
     gamma = ocsvm_gamma if ocsvm_gamma in ("scale", "auto") else float(ocsvm_gamma)
     print(f"nu={ocsvm_nu}, gamma={gamma}, standardize={standardize})", flush=True)
@@ -1665,7 +1679,6 @@ def ad_md(
                     hidden_channels_dim=hidden_channels_dim,
                     simple_proj=simple_proj,
                     pool_grid=pool_grid,
-                    attn=attn
                 ).to(device)
 
                 w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)               
@@ -1678,6 +1691,7 @@ def ad_md(
 
         except Exception as e:
             print(f"EXC -> caricamento modello MoCo: {e}", flush=True)
+            raise
 
         # embedding moco: pesi congelati
         # 2 matrici: rows = serie, cols = dim
@@ -1947,7 +1961,7 @@ def linear_regression(
                 device=device,
                 hidden_channels_dim=hidden_channels_dim, 
                 simple_proj=v.get("simple_proj", False),
-                pool_grid=v["pool_grid"], attn=v["attn"],
+                pool_grid=v["pool_grid"], 
             ).to(device)
 
             w_name = f"moco_2D_weights_{v['moco_version']}"
@@ -1982,8 +1996,11 @@ def linear_regression(
         f_pre = h                                               
 
         # moco 2 dopo proj -> (B, moco_dim)
-        f_post = F.normalize(proj(h), dim=1)                    
-        return f_enc, f_pre, f_post
+        f_raw = proj(h)
+
+        # moco 3 dopo proj e normalizzazione -> (B, moco_dim)
+        f_post = F.normalize(f_raw, dim=1)
+        return f_enc, f_pre, f_raw, f_post 
 
 
     # estrazione serie
@@ -1994,11 +2011,11 @@ def linear_regression(
         )
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
 
-        out = {(p, m): [] for p in ("encoder", "pre_proj", "post_proj") for m in ("OTTICO", "SAR")}
+        out = {(p, m): [] for p in ("encoder", "pre_proj", "proj_raw", "post_proj") for m in ("OTTICO", "SAR")}
         with torch.no_grad(), torch.cuda.amp.autocast():
             for im_q, im_k in tqdm(loader, mininterval=30.0):   # im_q = ottico, im_k = sar
                 for ramo, mod, x in (("q", "OTTICO", im_q), ("k", "SAR", im_k)):
-                    for p, f in zip(("encoder", "pre_proj", "post_proj"), branch_features(model, x.to(device), ramo)):
+                    for p, f in zip(("encoder", "pre_proj", "proj_raw", "post_proj"), branch_features(model, x.to(device), ramo)):
                         out[(p, mod)].append(f.float().cpu())
         return {key: torch.cat(val).numpy() for key, val in out.items()}
 
@@ -2061,7 +2078,7 @@ def linear_regression(
 
     for v in versions:
         f_v = feats[v["name"]]
-        for punto in ("encoder", "pre_proj", "post_proj"):
+        for punto in ("encoder", "pre_proj", "proj_raw", "post_proj"):
             for setting, with_normals in settings:
                 y = np.r_[y_anom, np.zeros(len(normal_ids))] if with_normals else y_anom
 

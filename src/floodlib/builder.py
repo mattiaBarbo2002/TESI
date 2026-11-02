@@ -20,6 +20,95 @@ from .multimodal_3Dconv_attention import spatialCBAM
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+"""
+class Bottleneck(nn.Module):
+    # Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
+    # while original implementation places the stride at the first 1x1 convolution(self.conv1)
+    # according to "Deep residual learning for image recognition" https://arxiv.org/abs/1512.03385.
+    # This variant is also known as ResNet V1.5 and improves accuracy according to
+    # https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch.
+
+    expansion: int = 4
+
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        width = int(planes * (base_width / 64.0)) * groups
+        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv1x1(inplanes, width)
+        self.bn1 = norm_layer(width)
+        self.conv2 = conv3x3(width, width, stride, groups, dilation)
+        self.bn2 = norm_layer(width)
+        self.conv3 = conv1x1(width, planes * self.expansion)
+        self.bn3 = norm_layer(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+"""        
+
+
+class Bottleneck(nn.Module):
+    def __init__(
+            self, 
+            input_channels, 
+            reduction=4
+    ):
+
+        super().__init__()
+
+        block_channels = max(input_channels // reduction, 1)
+
+        self.block = nn.Sequential(
+            nn.Conv2d(input_channels, block_channels, kernel_size=1, stride=1, bias=False),               
+            nn.BatchNorm2d(block_channels),
+            nn.ReLU(),
+
+            nn.Conv2d(block_channels, block_channels, kernel_size=3, stride=1, padding=1, bias=False),        
+            nn.BatchNorm2d(block_channels),
+            nn.ReLU(),
+
+            nn.Conv2d(block_channels, input_channels, kernel_size=1, stride=1, bias=False),              
+            nn.BatchNorm2d(input_channels),
+        )
+        nn.init.zeros_(self.block[-1].weight)       
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(x + self.block(x)) 
+
 
 class MoCo2encoders(nn.Module):
     """
@@ -310,28 +399,47 @@ class MoCo2encoders_2d(nn.Module):
                 param_proj_k.requires_grad = False 
  
         else:
-            # hidden_channels_dim // 2
+            # hidden_channels_dim //2
             self.conv_q = nn.Sequential(
-                nn.Conv2d(encoder_q_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),                  # dim 64->32, c 16->128 
-                nn.BatchNorm2d(hidden_channels_dim),
+                nn.Conv2d(encoder_q_dim, hidden_channels_dim//4, kernel_size=3, stride=1, padding=1),                  # dim 64->32, c 16->128 
+                nn.BatchNorm2d(hidden_channels_dim//4),
                 nn.ReLU(),
                 
-                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16, c 128->128
+                nn.Conv2d(hidden_channels_dim//4, hidden_channels_dim//2, kernel_size=3, stride=1, padding=1),            # dim 32->16, c 128->128
+                nn.BatchNorm2d(hidden_channels_dim//2),
+                nn.ReLU(),
+
+                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=1, padding=1),            # dim 32->16, c 128->128
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
+
+                #nn.Conv2d(hidden_channels_dim, 64, kernel_size=1),                                   
+                #nn.BatchNorm2d(64),
+                #nn.ReLU(),
+    
             )
             self.conv_k = nn.Sequential(
-                nn.Conv2d(encoder_k_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(hidden_channels_dim),
+                nn.Conv2d(encoder_k_dim, hidden_channels_dim//4, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(hidden_channels_dim//4),
                 nn.ReLU(),
                 
-                nn.Conv2d(hidden_channels_dim, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(hidden_channels_dim//4, hidden_channels_dim//2, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(hidden_channels_dim//2),
+                nn.ReLU(),
+
+                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=1, padding=1),
                 nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
+
+                #nn.Conv2d(hidden_channels_dim, 64, kernel_size=1),                                   
+                #nn.BatchNorm2d(64),
+                #nn.ReLU(),
+                
             )
  
             proj_in = hidden_channels_dim * pool_grid * pool_grid   
- 
+            #proj_in = 64 * pool_grid * pool_grid   
+
             self.proj_q = nn.Sequential(
                 nn.Linear(proj_in, dim),
                 nn.ReLU(),
@@ -624,33 +732,25 @@ class MoCo2encoders_attn(nn.Module):
         else:
             # hidden_channels_dim // 2
             self.conv_q = nn.Sequential(
-                #spatialCBAM2d(encoder_q_dim, reduction_ratio=4),                                                    # gate a 64x64, prima dello stride
-                #nn.Conv2d(encoder_q_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),                  # dim 64->32
-                nn.Conv2d(encoder_q_dim, encoder_q_dim, kernel_size=3, stride=1, padding=1),
-                #nn.BatchNorm2d(hidden_channels_dim//2),
-                nn.BatchNorm2d(encoder_q_dim),
+                spatialCBAM2d(encoder_q_dim, reduction_ratio=4),                                                    # gate a 64x64, prima dello stride
+                nn.Conv2d(encoder_q_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),                  # dim 64->32
+                nn.BatchNorm2d(hidden_channels_dim//2),
                 nn.ReLU(),
 
-                #spatialCBAM2d(hidden_channels_dim//2),                                                                 # gate a 32x32, prima dello stride
-                #nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16
-                nn.Conv2d(encoder_q_dim, encoder_q_dim, kernel_size=3, stride=1, padding=1),
-                #nn.BatchNorm2d(hidden_channels_dim),
-                nn.BatchNorm2d(encoder_q_dim),
+                spatialCBAM2d(hidden_channels_dim//2),                                                                 # gate a 32x32, prima dello stride
+                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),            # dim 32->16
+                nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
             )
             self.conv_k = nn.Sequential(
-                #spatialCBAM2d(encoder_k_dim, reduction_ratio=4),
-                #nn.Conv2d(encoder_k_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),
-                nn.Conv2d(encoder_k_dim, encoder_k_dim, kernel_size=3, stride=1, padding=1),
-                #nn.BatchNorm2d(hidden_channels_dim//2),
-                nn.BatchNorm2d(encoder_k_dim),
+                spatialCBAM2d(encoder_k_dim, reduction_ratio=4),
+                nn.Conv2d(encoder_k_dim, hidden_channels_dim//2, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(hidden_channels_dim//2),
                 nn.ReLU(),
 
-                #spatialCBAM2d(hidden_channels_dim//2),
-                #nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
-                nn.Conv2d(encoder_k_dim, encoder_k_dim, kernel_size=3, stride=1, padding=1),
-                #nn.BatchNorm2d(hidden_channels_dim),
-                nn.BatchNorm2d(encoder_k_dim),
+                spatialCBAM2d(hidden_channels_dim//2),
+                nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(hidden_channels_dim),
                 nn.ReLU(),
             )
  
