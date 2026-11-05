@@ -32,10 +32,14 @@ from sklearn.covariance import LedoitWolf
 
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_2d
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_attn
+
 from floodlib.loader import MoCo2encodersLoader
+
 from floodlib.builder import MoCo2encoders_2d
 from floodlib.builder import MoCo2encoders_attn
+from floodlib.builder import MoCo2encoders_Bot
 
+from floodlib.mocoDense import MoCo2encoders_dense 
 
 matplotlib.use("Agg") 
 
@@ -988,8 +992,11 @@ def ad_ocsvm2(
 
 
 
+
+
+
 @handler()
-def ad_md(
+def ad_ocsvm3(
     job_name: str = "nome_job",
     dataset_standard: str = "Standard",
     dataset_anomalies: str = "test",
@@ -1004,6 +1011,8 @@ def ad_md(
     patch_size: int = 256,
     n_images1: int = 4, n_channels1: int = 2,       # sar
     n_images2: int = 4, n_channels2: int = 10,      # ottico
+    ocsvm_nu: float = 0.05,
+    ocsvm_gamma: str = "scale",
     standardize: bool = True,
     batch_size: int = 32,
     workers: int = 0,
@@ -1011,6 +1020,7 @@ def ad_md(
     old_vectors: str = "",
     n_series_thr: int = 500,                        # usato solo con fit_on_train=False
     moco_attn: bool = False,
+    moco_bot: bool = False,
 
     do_encoder: bool = True,                        # latente autoencoder + pooling di moco
     do_pre_proj: bool = True,                       # dopo conv + pooling, prima del proiettore
@@ -1022,7 +1032,7 @@ def ad_md(
     pca_proj_raw: float | int | None = None,
     pca_post_proj: float | int | None = None,
 
-    whitening: str = "pca",                         # "pca" | "lw"
+    whitening: str = "pca",                         # "pca" | "ledoitwolf"
     fit_on_train: bool = True,                      # True: fit su tutte le serie di train di moco
     max_fit_series: int = 0,                        # 0 = tutte; altrimenti campione casuale (ocsvm lento con molte serie)
 ):
@@ -1031,159 +1041,161 @@ def ad_md(
     print('Using device:', device, "\n", flush=True)
 
     # punti selezionati e componenti pca per punto
-    punti = []
-
-    if do_encoder:
-        punti.append("encoder")
-    if do_pre_proj:
-        punti.append("pre_proj")
-    if do_proj_raw:
-        punti.append("proj_raw")
-    if do_post_proj:
-        punti.append("post_proj")
-
+    punti = [p for p, do in (("encoder", do_encoder), ("pre_proj", do_pre_proj), ("proj_raw", do_proj_raw), ("post_proj", do_post_proj)) if do]
     pca_punto = {"encoder": pca_encoder, "pre_proj": pca_pre_proj, "proj_raw": pca_proj_raw, "post_proj": pca_post_proj}
+
+    if not punti:
+        raise ValueError("nessun punto selezionato: attiva almeno un do_*")
     
+    if whitening not in ("pca", "lw"):
+        raise ValueError(f"whitening non valido: {whitening}")
     print(f"punti: {', '.join(punti)} | whitening: {whitening} | fit_on_train: {fit_on_train}", "\n", flush=True)
 
     project_work = dh.get_project("floods")
-    project_data = dh.get_project("datasets")
-
-    # lettura ids serie anomale
-    print(f"Lettura serie anomale: {dataset_anomalies}", flush=True)
-    anom_path = project_data.get_artifact(f"{dataset_anomalies}").download(f"/data/{dataset_anomalies}")
-    ids_per_sensor_anom = {}
-
-    for sensor in ("SAR", "OPT"):
-        ids = set()
-        for part_path in sorted(glob(os.path.join(anom_path, sensor, "part*.zip"))):
-            with zipfile.ZipFile(part_path, 'r') as z:
-                ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
-        ids_per_sensor_anom[sensor] = ids
-
-    anom_ids = ids_per_sensor_anom["SAR"] & ids_per_sensor_anom["OPT"]
-    num_fit_series = len(anom_ids)
-    n_anom_tot = len(anom_ids)
-
-    # filtro superficie alluvione
-    if min_flood_area > 0:
-        try:
-            mask_parts = sorted(glob(os.path.join(anom_path, "MASK", "part*.zip")))
-
-            flood_area = {}
-            for part_path in mask_parts:
-                with zipfile.ZipFile(part_path, 'r') as z:
-                    for name in z.namelist():
-                        if name.endswith('.npy') and name[:-4] in anom_ids:
-                            mask = np.load(io.BytesIO(z.read(name)))
-                            flood_area[name[:-4]] = 100.0 * float((mask == 2).sum()) / mask.size
-
-            anom_ids = {ID for ID in anom_ids if flood_area.get(ID, 0.0) >= min_flood_area}
-            print(f"OK -> flood >= {min_flood_area:g}%: {len(anom_ids)} serie su {n_anom_tot}", flush=True)
-
-        except Exception as e:
-            print(f"EXC -> flood: {e}", flush=True)
-
-    anom_ids = sorted(anom_ids)
-    print(f"OK -> {len(anom_ids)} serie anomale", "\n", flush=True)
-
-
-    # lettura serie normali
-    print(f"Lettura serie normali: Floods_{dataset_standard}_crop_norm", flush=True)
-    normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
-
-    # import ids lits from moco training
-    if moco_attn:
-        p = project_work.get_artifact(f"moco_attn_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
-    else:
-        p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
-
-    with open(p, 'r') as f:
-        test_ids = json.load(f)
-    print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
-    num_fit_series = len(test_ids) - num_fit_series
-
-    random.seed(0)
-    shuffled_test_ids = random.sample(test_ids, len(test_ids))
-
-    ids_per_sensor_normal = {}
-
-    for sensor in ("SAR", "OPT"):
-        ids = set()
-        for part_path in sorted(glob(os.path.join(normal_path, sensor, "part*.zip"))):
-            with zipfile.ZipFile(part_path, 'r') as z:
-                ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
-        ids_per_sensor_normal[sensor] = ids
-
-    normal_ids = ids_per_sensor_normal["SAR"] & ids_per_sensor_normal["OPT"]
-
-    shuffled_test_ids = [ID for ID in shuffled_test_ids if ID in normal_ids]
-
-    normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]             # anomaly detection
-
-    if fit_on_train:
-        #fit su tutte le serie di train di moco
-        if moco_attn:
-            p_train = project_work.get_artifact(f"moco_attn_trainIdsList_{moco_version}").download("/data/det_train_ids.json", overwrite=True)
-        else:
-            p_train = project_work.get_artifact(f"moco_2D_trainIdsList_{moco_version}").download("/data/det_train_ids.json", overwrite=True)
-        with open(p_train, 'r') as f:
-            train_ids = json.load(f)
-
-        normal_fit_ids = [ID for ID in train_ids if ID in normal_ids]                              # fit -> iperpiano
-        if max_fit_series > 0 and len(normal_fit_ids) > max_fit_series:
-            random.seed(1)
-            normal_fit_ids = random.sample(normal_fit_ids, max_fit_series)
-
-        test_set = set(normal_test_ids)
-        normal_thr_ids = [ID for ID in shuffled_test_ids if ID not in test_set]                    # calcolo soglie
-    else:
-        normal_fit_ids  = shuffled_test_ids[:num_fit_series - n_series_thr]                        # fit -> iperpiano
-        normal_thr_ids  = shuffled_test_ids[num_fit_series - n_series_thr:num_fit_series]          # calcolo soglie
-
-    assert not (set(normal_fit_ids) & set(normal_thr_ids)), "serie in comune tra fit e soglia"
-    assert not (set(normal_fit_ids) & set(normal_test_ids)), "serie in comune tra fit e test"
-    assert not (set(normal_thr_ids) & set(normal_test_ids)), "serie in comune tra soglia e test"
-
-    print(f"OK -> {len(normal_fit_ids)} serie fit, {len(normal_thr_ids)} serie thr, {len(normal_test_ids)} serie test normali", "\n", flush=True)
 
     # embedding per punto -> E[punto] = {"fit": (q, k), "thr": (q, k), "normal": (q, k), "anom": (q, k)}
-    emb = {punto: {} for punto in punti}
+    E = {punto: {} for punto in punti}
 
     if old_vectors:
         print(f"Upload embedding: anomaly_results_ocsvm_{old_vectors}", flush=True)
         p = project_work.get_artifact(f"anomaly_results_ocsvm_{old_vectors}").download("/data/old_vectors.zip", overwrite=True)
         with zipfile.ZipFile(p) as z:
-            old_results = json.loads(z.read("summary.json"))
+            old_summary = json.loads(z.read("summary.json"))
+            mancanti = [punto for punto in punti if f"{punto}/embeddings.npz" not in z.namelist()]
+            if mancanti:
+                raise ValueError(f"punti non presenti in {old_vectors}: {mancanti}")
             for punto in punti:
                 z.extract(f"{punto}/embeddings.npz", "/data/old_vectors")
+                z.extract(f"{punto}/anomaly_results.json", "/data/old_vectors")
 
-        for key, value in (("moco_version", moco_version), ("dataset_anomalies", dataset_anomalies),
-                           ("fit_on_train", fit_on_train)):                                         
-            if old_results.get(key) != value:
-                raise ValueError(f"old_vectors={old_vectors} ha {key}={old_results.get(key)}, questo job ha {value}")
+        moco_version = old_summary["moco_version"]
+        dataset_anomalies = old_summary["dataset_anomalies"]
+        fit_on_train = old_summary.get("fit_on_train", False)
+        with open(f"/data/old_vectors/{punti[0]}/anomaly_results.json") as f:
+            min_flood_area = json.load(f)["min_flood_area"]
 
+        ids_rif = None
         for punto in punti:
             old = np.load(f"/data/old_vectors/{punto}/embeddings.npz")
-            lookup = {}
             for g in ("fit", "thr", "normal", "anom"):
-                for i, ID in enumerate(old[f"{g}_ids"]):
-                    lookup[str(ID)] = (old[f"{g}_q"][i], old[f"{g}_k"][i])
+                E[punto][g] = (old[f"{g}_q"], old[f"{g}_k"])
 
-            def take(ids, nome):
-                missing = [ID for ID in ids if ID not in lookup]
-                if missing:
-                    raise ValueError(f"{len(missing)} serie {nome} non presenti in {old_vectors} (es. {missing[:3]})")
-                return np.stack([lookup[ID][0] for ID in ids]), np.stack([lookup[ID][1] for ID in ids])
-
-            emb[punto]["fit"] = take(normal_fit_ids, "fit")
-            emb[punto]["thr"] = take(normal_thr_ids, "thr")
-            emb[punto]["normal"] = take(normal_test_ids, "normali test")
-            emb[punto]["anom"] = take(anom_ids, "anomale")
+            ids = {g: [str(ID) for ID in old[f"{g}_ids"]] for g in ("fit", "thr", "normal", "anom")}
+            if ids_rif is None:
+                ids_rif = ids
+            elif ids != ids_rif:
+                raise ValueError(f"il punto {punto} ha serie diverse dagli altri punti")
             print(f"OK -> {punto}: embedding caricati", flush=True)
-        print(flush=True)
+
+        normal_fit_ids, normal_thr_ids = ids_rif["fit"], ids_rif["thr"]
+        normal_test_ids, anom_ids = ids_rif["normal"], ids_rif["anom"]
+        print(f"OK -> {len(normal_fit_ids)} serie fit, {len(normal_thr_ids)} serie thr, {len(normal_test_ids)} serie test normali, "
+              f"{len(anom_ids)} anomale | moco {moco_version} | flood >= {min_flood_area:g}%", "\n", flush=True)
 
     else:
+        project_data = dh.get_project("datasets")
+
+        # lettura ids serie anomale
+        print(f"Lettura serie anomale: {dataset_anomalies}", flush=True)
+        anom_path = project_data.get_artifact(f"{dataset_anomalies}").download(f"/data/{dataset_anomalies}")
+        ids_per_sensor_anom = {}
+
+        for sensor in ("SAR", "OPT"):
+            ids = set()
+            for part_path in sorted(glob(os.path.join(anom_path, sensor, "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+            ids_per_sensor_anom[sensor] = ids
+
+        anom_ids = ids_per_sensor_anom["SAR"] & ids_per_sensor_anom["OPT"]
+        num_fit_series = len(anom_ids)
+        n_anom_tot = len(anom_ids)
+
+        # filtro superficie alluvione
+        if min_flood_area > 0:
+            try:
+                mask_parts = sorted(glob(os.path.join(anom_path, "MASK", "part*.zip")))
+
+                flood_area = {}
+                for part_path in mask_parts:
+                    with zipfile.ZipFile(part_path, 'r') as z:
+                        for name in z.namelist():
+                            if name.endswith('.npy') and name[:-4] in anom_ids:
+                                mask = np.load(io.BytesIO(z.read(name)))
+                                flood_area[name[:-4]] = 100.0 * float((mask == 2).sum()) / mask.size
+
+                anom_ids = {ID for ID in anom_ids if flood_area.get(ID, 0.0) >= min_flood_area}
+                print(f"OK -> flood >= {min_flood_area:g}%: {len(anom_ids)} serie su {n_anom_tot}", flush=True)
+
+            except Exception as e:
+                print(f"EXC -> flood: {e}", flush=True)
+
+        anom_ids = sorted(anom_ids)
+        print(f"OK -> {len(anom_ids)} serie anomale", "\n", flush=True)
+
+
+        # lettura serie normali
+        print(f"Lettura serie normali: Floods_{dataset_standard}_crop_norm", flush=True)
+        normal_path = project_data.get_artifact(f"Floods_{dataset_standard}_crop_norm").download(f"/data/Floods_{dataset_standard}_crop_norm")
+
+        # import ids lits from moco training
+        if moco_attn:
+            p = project_work.get_artifact(f"moco_attn_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+        elif moco_bot:
+            p = project_work.get_artifact(f"moco_bot_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+        else:    
+            p = project_work.get_artifact(f"moco_2D_testIdsList_{moco_version}").download("/data/det_test_ids.json", overwrite=True)
+
+        with open(p, 'r') as f:
+            test_ids = json.load(f)
+        print(f"OK -> liste normali caricate: {len(test_ids)} test", flush=True)
+        num_fit_series = len(test_ids) - num_fit_series
+
+        random.seed(0)
+        shuffled_test_ids = random.sample(test_ids, len(test_ids))
+
+        ids_per_sensor_normal = {}
+
+        for sensor in ("SAR", "OPT"):
+            ids = set()
+            for part_path in sorted(glob(os.path.join(normal_path, sensor, "part*.zip"))):
+                with zipfile.ZipFile(part_path, 'r') as z:
+                    ids.update(n[:-4] for n in z.namelist() if n.endswith('.npy'))
+            ids_per_sensor_normal[sensor] = ids
+
+        normal_ids = ids_per_sensor_normal["SAR"] & ids_per_sensor_normal["OPT"]
+
+        shuffled_test_ids = [ID for ID in shuffled_test_ids if ID in normal_ids]
+
+        normal_test_ids = shuffled_test_ids[num_fit_series:(num_fit_series+len(anom_ids))]             # anomaly detection
+
+        if fit_on_train:
+            #fit su tutte le serie di train di moco
+            if moco_attn:
+                p_train = project_work.get_artifact(f"moco_attn_trainIdsList_{moco_version}").download("/data/det_train_ids.json", overwrite=True)
+            elif moco_bot:
+                p_train = project_work.get_artifact(f"moco_bot_trainIdsList_{moco_version}").download("/data/det_train_ids.json", overwrite=True)
+            else:    
+                p_train = project_work.get_artifact(f"moco_2D_trainIdsList_{moco_version}").download("/data/det_train_ids.json", overwrite=True)
+            with open(p_train, 'r') as f:
+                train_ids = json.load(f)
+
+            normal_fit_ids = [ID for ID in train_ids if ID in normal_ids]                              # fit -> iperpiano
+            if max_fit_series > 0 and len(normal_fit_ids) > max_fit_series:
+                random.seed(1)
+                normal_fit_ids = random.sample(normal_fit_ids, max_fit_series)
+
+            test_set = set(normal_test_ids)
+            normal_thr_ids = [ID for ID in shuffled_test_ids if ID not in test_set]                    # calcolo soglie
+        else:
+            normal_fit_ids  = shuffled_test_ids[:num_fit_series - n_series_thr]                        # fit -> iperpiano
+            normal_thr_ids  = shuffled_test_ids[num_fit_series - n_series_thr:num_fit_series]          # calcolo soglie
+
+        assert not (set(normal_fit_ids) & set(normal_thr_ids)), "serie in comune tra fit e soglia"
+        assert not (set(normal_fit_ids) & set(normal_test_ids)), "serie in comune tra fit e test"
+        assert not (set(normal_thr_ids) & set(normal_test_ids)), "serie in comune tra soglia e test"
+
+        print(f"OK -> {len(normal_fit_ids)} serie fit, {len(normal_thr_ids)} serie thr, {len(normal_test_ids)} serie test normali", "\n", flush=True)
 
         print("calcolo vettori MoCo", flush = True)
 
@@ -1224,17 +1236,31 @@ def ad_md(
                 encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
                 encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
 
-                model = MoCo2encoders_2d(
-                    base_encoder_q=encoderOPT.encoder,
-                    base_encoder_k=encoderSAR.encoder,
-                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-                    symmetric=False, device=device,
-                    hidden_channels_dim=hidden_channels_dim,
-                    simple_proj=simple_proj,
-                    pool_grid=pool_grid,
-                ).to(device)
+                if moco_bot:
+                    model = MoCo2encoders_Bot(
+                            base_encoder_q=encoderOPT.encoder,
+                            base_encoder_k=encoderSAR.encoder,
+                            dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                            symmetric=False, device=device,
+                            hidden_channels_dim=hidden_channels_dim,
+                            pool_grid=pool_grid,
+                            simple_proj=simple_proj,
+                        ).to(device)
+                    
+                    w_path = project_work.get_artifact(f"moco_bot_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
 
-                w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+                else:
+                    model = MoCo2encoders_2d(
+                        base_encoder_q=encoderOPT.encoder,
+                        base_encoder_k=encoderSAR.encoder,
+                        dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                        symmetric=False, device=device,
+                        hidden_channels_dim=hidden_channels_dim,
+                        simple_proj=simple_proj,
+                        pool_grid=pool_grid,
+                    ).to(device)
+
+                    w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
 
             checkpoint = torch.load(w_path, map_location=device)
             state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
@@ -1297,21 +1323,21 @@ def ad_md(
             print(f"OK -> {nome}: {len(next(iter(emb.values()))[0])} serie | {dims}", "\n", flush=True)
 
         # embedding serie di fit
-        print("Embedding MoCo: serie di fit pca_md", flush=True)
+        print("Embedding MoCo: serie di fit ocsvm", flush=True)
         emb = embed(normal_fit_ids)
-        for punto in punti: emb[punto]["fit"] = emb[punto]
+        for punto in punti: E[punto]["fit"] = emb[punto]
         print_dim("normali fit", emb)
 
         # embedding serie thr
-        print("Embedding MoCo: serie thr pca_md", flush=True)
+        print("Embedding MoCo: serie thr ocsvm", flush=True)
         emb = embed(normal_thr_ids)
-        for punto in punti: emb[punto]["thr"] = emb[punto]
+        for punto in punti: E[punto]["thr"] = emb[punto]
         print_dim("normali thr", emb)
 
         # embedding serie normali
         print("Embedding MoCo: serie normali", flush=True)
         emb = embed(normal_test_ids)
-        for punto in punti: emb[punto]["normal"] = emb[punto]
+        for punto in punti: E[punto]["normal"] = emb[punto]
         print_dim("normali test", emb)
 
         # pulizia cartelle
@@ -1345,10 +1371,10 @@ def ad_md(
     # anomaly detection ripetuta per ogni punto
     for punto in punti:
         print(f"===== {punto} =====", flush=True)
-        q_fit, k_fit = emb[punto]["fit"]
-        q_thr, k_thr = emb[punto]["thr"]
-        q_normal, k_normal = emb[punto]["normal"]
-        q_anom, k_anom = emb[punto]["anom"]
+        q_fit, k_fit = E[punto]["fit"]
+        q_thr, k_thr = E[punto]["thr"]
+        q_normal, k_normal = E[punto]["normal"]
+        q_anom, k_anom = E[punto]["anom"]
 
         # concatenazione
         w_fit = np.concatenate([q_fit, k_fit], axis=1).astype(np.float64)
@@ -1382,6 +1408,10 @@ def ad_md(
             shrinkage = None
             print(f"PCA: {n_componenti} componenti su {w_fit.shape[1]} dimensioni", flush=True)
 
+        gamma = ocsvm_gamma if ocsvm_gamma in ("scale", "auto") else float(ocsvm_gamma)
+        print(f"nu={ocsvm_nu}, gamma={gamma}, standardize={standardize})", flush=True)
+
+        ocsvm = OneClassSVM(kernel="rbf", nu=ocsvm_nu, gamma=gamma).fit(z_fit)
 
         # punteggi: decision_function > 0 dentro il confine , < 0 fuori
         score_fit = ocsvm.decision_function(z_fit).astype(np.float64)
@@ -1474,10 +1504,8 @@ def ad_md(
 
 
 
-
-
 @handler()
-def ad_ocsvm3(
+def ad_ocsvm4(
     job_name: str = "nome_job",
     dataset_standard: str = "Standard",
     dataset_anomalies: str = "test",
@@ -1515,14 +1543,25 @@ def ad_ocsvm3(
     whitening: str = "pca",                         # "pca" | "ledoitwolf"
     fit_on_train: bool = True,                      # True: fit su tutte le serie di train di moco
     max_fit_series: int = 0,                        # 0 = tutte; altrimenti campione casuale (ocsvm lento con molte serie)
+
+    dense: bool = False,                            # True -> modello di train_moco_dense
+    do_dense: bool = False,                         # mappa densa (dense_q/dense_k) + pooling
+    do_sim_stats: bool = False,                     # statistiche della mappa di similarità SAR-ottico
+    pca_dense: float | int | None = None,
+    pca_sim_stats: float | int | None = None,
 ):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
 
     # punti selezionati e componenti pca per punto
-    punti = [p for p, do in (("encoder", do_encoder), ("pre_proj", do_pre_proj), ("proj_raw", do_proj_raw), ("post_proj", do_post_proj)) if do]
-    pca_punto = {"encoder": pca_encoder, "pre_proj": pca_pre_proj, "proj_raw": pca_proj_raw, "post_proj": pca_post_proj}
+    punti = [p for p, do in (("encoder", do_encoder), ("pre_proj", do_pre_proj), ("proj_raw", do_proj_raw),
+                             ("post_proj", do_post_proj), ("dense", do_dense), ("sim_stats", do_sim_stats)) if do]
+    pca_punto = {"encoder": pca_encoder, "pre_proj": pca_pre_proj, "proj_raw": pca_proj_raw, "post_proj": pca_post_proj,
+                 "dense": pca_dense, "sim_stats": pca_sim_stats}
+
+    if (do_dense or do_sim_stats) and not dense:
+        raise ValueError("do_dense e do_sim_stats richiedono dense=True")
 
     if not punti:
         raise ValueError("nessun punto selezionato: attiva almeno un do_*")
@@ -1712,15 +1751,25 @@ def ad_ocsvm3(
                 encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
                 encoderOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
 
-                model = MoCo2encoders_2d(
-                    base_encoder_q=encoderOPT.encoder,
-                    base_encoder_k=encoderSAR.encoder,
-                    dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-                    symmetric=False, device=device,
-                    hidden_channels_dim=hidden_channels_dim,
-                    simple_proj=simple_proj,
-                    pool_grid=pool_grid,
-                ).to(device)
+                if dense:
+                    model = MoCo2encoders_dense(
+                        base_encoder_q=encoderOPT.encoder,
+                        base_encoder_k=encoderSAR.encoder,
+                        dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                        hidden_channels_dim=hidden_channels_dim,
+                        pool_grid=pool_grid,
+                    ).to(device)
+                else:
+                    model = MoCo2encoders_2d(
+                        base_encoder_q=encoderOPT.encoder,
+                        base_encoder_k=encoderSAR.encoder,
+                        dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                        symmetric=False, device=device,
+                        hidden_channels_dim=hidden_channels_dim,
+                        simple_proj=simple_proj,
+                        pool_grid=pool_grid,
+                    ).to(device)
+                print(f"classe: {type(model).__name__}", flush=True)
 
                 w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
 
@@ -1758,12 +1807,14 @@ def ad_ocsvm3(
                     fk = {"encoder": model.pool_k(zk).flatten(1)}
 
                     # pre_proj: conv + pooling (come contrastive_loss)
-                    if model.simple_proj:
+                    if getattr(model, "simple_proj", False):
                         hq = model.pool_q(zq).flatten(1)
                         hk = model.pool_k(zk).flatten(1)
                     else:
-                        hq = model.pool_q(model.conv_q(zq)).flatten(1)
-                        hk = model.pool_k(model.conv_k(zk)).flatten(1)
+                        cq = model.conv_q(zq)                                    # (B, C, 64, 64)
+                        ck = model.conv_k(zk)
+                        hq = model.pool_q(cq).flatten(1)
+                        hk = model.pool_k(ck).flatten(1)
                     fq["pre_proj"], fk["pre_proj"] = hq, hk
 
                     # proj_raw: proiettore senza normalizzazione
@@ -1774,6 +1825,27 @@ def ad_ocsvm3(
                     # post_proj: proiettore + normalizzazione (uguale a contrastive_loss)
                     fq["post_proj"] = nn.functional.normalize(pq, dim=1)
                     fk["post_proj"] = nn.functional.normalize(pk, dim=1)
+
+                    # punti densi: solo per il modello di train_moco_dense
+                    if dense:
+                        dq = nn.functional.normalize(model.dense_q(cq), dim=1)        # (B, dim, 64, 64)
+                        dk = nn.functional.normalize(model.dense_k(ck), dim=1)
+
+                        # dense: mappa densa ridotta con il pooling, come pre_proj
+                        fq["dense"] = model.pool_q(dq).flatten(1)
+                        fk["dense"] = model.pool_k(dk).flatten(1)
+
+                        # sim_stats: statistiche della similarità SAR-ottico posizione per posizione
+                        s = (dq * dk).sum(dim=1).flatten(1).float()                     # (B, 4096)
+                        fq["sim_stats"] = torch.stack([
+                            s.min(dim=1).values,
+                            torch.quantile(s, 0.01, dim=1),
+                            torch.quantile(s, 0.05, dim=1),
+                            torch.quantile(s, 0.10, dim=1),
+                            s.mean(dim=1),
+                            s.std(dim=1),
+                        ], dim=1)                                                        # (B, 6)
+                        fk["sim_stats"] = s[:, :0]
 
                     for punto in punti:
                         out[punto][0].append(fq[punto].float().flatten(1).cpu())

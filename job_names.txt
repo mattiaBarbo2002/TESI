@@ -50,4 +50,12 @@ net_v9_64 -> 3 layer 128 conv1x1 out 64
 
 
 
+9baf5e5af0694bd5b9bc2013a8b32be2 circa 21
+23ae42cc25ca4a8daa76074eafbf5f11 25
+2937d575dea5499dafa026b0e96eb54c 50
+aeffa92ad7404e6d977544554b5cbe21 75
+fddbf84cf7db490f9d2acbfb01b56e45 100
+
+
+
 
