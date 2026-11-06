@@ -27,6 +27,7 @@ from floodlib.builder import MoCo2encoders_2d
 from floodlib.builder import MoCo2encoders_Bot
 from floodlib.builder import MoCo2encoders_attn
 from floodlib.builder import MoCo2encoders_ms
+from floodlib.builder import MoCo2encoders_ms_pre
 
 from floodlib.mocoDense import MoCo2encoders_dense
 from floodlib.mocoDense import MoCo2encoders_dense3
@@ -544,7 +545,7 @@ def train_moco_bot(
     # una epoca contiene 1243 batch
  
     epoch_lenght = None
-    steps_total = None   # NUOVO: step totali del run, serve al coseno
+    steps_total = None   
     base_lr = lr
     batch_step = 0
 
@@ -735,15 +736,15 @@ def prova(
 
 @handler()
 def diagnosi_dense(
-    moco_version: str = "net_dense_v4",                                         # MODIFICATO: default
+    moco_version: str = "net_dense_v4",                                         
     dataset: str = "Test",
     hidden_channels_dim: int = 128,
     pool_grid: int = 4,
     moco_dim: int = 128,
     moco_k: int = 4096,
-    grid_dense: int = 8,                                                        # NUOVO
-    T_dense: float = 0.2,                                                       # NUOVO
-    n_neg: int = 4,                                                             # NUOVO
+    grid_dense: int = 8,                                                       
+    T_dense: float = 0.2,                                                       
+    n_neg: int = 4,                                                             
     batch_size: int = 16,
     n_batch: int = 20,
     patch_size: int = 256,
@@ -780,16 +781,16 @@ def diagnosi_dense(
     ids = sorted(ids_sar & ids_opt)[: batch_size * n_batch]
     print(f"OK -> {len(ids)} serie per il test", "\n", flush=True)
 
-    # ---------- modello: gli encoder vengono caricati dal checkpoint di moco ----------
+    
     enc_opt = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False)
     enc_sar = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False)
-    model = MoCo2encoders_dense3(                                               # MODIFICATO: classe
+    model = MoCo2encoders_dense3(                                               
         base_encoder_q=enc_opt.encoder,
         base_encoder_k=enc_sar.encoder,
         dim=moco_dim, K=moco_k,
         hidden_channels_dim=hidden_channels_dim,
         pool_grid=pool_grid,
-        n_neg=n_neg, grid_dense=grid_dense, T_dense=T_dense,                    # NUOVO
+        n_neg=n_neg, grid_dense=grid_dense, T_dense=T_dense,                    
     ).to(device)
 
     try:
@@ -843,17 +844,17 @@ def diagnosi_dense(
 
         # --- vettori densi: per cella e medie per scena ---
         with torch.no_grad():
-            cq = model.pool_dense(model.conv_q(model.encoder_q(im_q)))                                 # NUOVO: (B, c, 8, 8)
-            ck = model.pool_dense(model.conv_k(model.encoder_k(im_k)))                                 # NUOVO
-            dq = nn.functional.normalize(model.dense_q(cq), dim=1)                                     # MODIFICATO: (B, D, 8, 8)
-            dk = nn.functional.normalize(model.dense_k(ck), dim=1)                                     # MODIFICATO
+            cq = model.pool_dense(model.conv_q(model.encoder_q(im_q)))                                 
+            ck = model.pool_dense(model.conv_k(model.encoder_k(im_k)))                                 
+            dq = nn.functional.normalize(model.dense_q(cq), dim=1)                                   
+            dk = nn.functional.normalize(model.dense_k(ck), dim=1)                                     
             B, D, H, W = dq.shape
 
-            # vettori delle singole celle: con 8x8 sono B*64 vettori, li uso tutti        # MODIFICATO
+            # vettori delle singole celle: con 8x8 sono B*64 vettori, li uso tutti       
             vq = dq.permute(0, 2, 3, 1).reshape(-1, D)
             vk = dk.permute(0, 2, 3, 1).reshape(-1, D)
-            dim_pos_q.append(dim_effettiva(vq))                                                        # MODIFICATO: senza campione
-            dim_pos_k.append(dim_effettiva(vk))                                                        # MODIFICATO
+            dim_pos_q.append(dim_effettiva(vq))                                                        
+            dim_pos_k.append(dim_effettiva(vk))                                                       
 
             # medie per scena: un vettore per serie
             medie = nn.functional.normalize(dk.mean(dim=(2, 3)), dim=1)                               # (B, D)
@@ -862,25 +863,25 @@ def diagnosi_dense(
             # similarità positiva: ottico e sar nella stessa cella
             sim_pos.append((dq * dk).sum(dim=1).mean().item())
 
-            # similarità tra celle diverse della stessa scena: tutte le H*W celle               # MODIFICATO
+            # similarità tra celle diverse della stessa scena: tutte le H*W celle               
             v_scena = dk.flatten(2).permute(0, 2, 1)                                                  # (B, H*W, D)
             S = v_scena @ v_scena.transpose(1, 2)                                                     # (B, H*W, H*W)
             maschera = ~torch.eye(H * W, dtype=torch.bool, device=device)
             sim_stessa_scena.append(S[:, maschera].mean().item())
 
-            # ReLU del proiettore denso: ora è in posizione 2 (dopo conv e batchnorm)            # MODIFICATO
+            # ReLU del proiettore denso: ora è in posizione 2 (dopo conv e batchnorm)            
             h = model.dense_q[2](model.dense_q[1](model.dense_q[0](cq)))
             frac_zero = (h == 0).float().mean().item()
             canali_morti = int((h.amax(dim=(0, 2, 3)) == 0).sum())
             print(f"ReLU proiettore denso: {frac_zero:.1%} valori a zero | canali morti {canali_morti} su {h.shape[1]}")
 
             # parte comune e parte che varia dell'uscita (dopo la batchnorm finale)
-            r = model.dense_q(cq)                                                                      # MODIFICATO
+            r = model.dense_q(cq)                                                                      
             v = r.permute(0, 2, 3, 1).reshape(-1, r.shape[1])
             media = v.mean(dim=0)
             variazione = (v - media).norm(dim=1).mean()
             print(f"|parte comune| {media.norm():.3f} | |parte che varia| {variazione:.3f} | "
-                  f"|W ultima conv| {model.dense_q[3].weight.norm():.3f}")                            # MODIFICATO: niente bias
+                  f"|W ultima conv| {model.dense_q[3].weight.norm():.3f}")                           
 
         print(f"batch {i:2d} | loss_g {loss_g.item():.3f} | loss_d {loss_d.item():.3f} | "
               f"coseno grad {cos:+.3f} | |g_d|/|g_g| {rapporto:.2f} | "
@@ -1050,8 +1051,12 @@ def train_moco_2D(
         mancanti, inattesi = model.load_state_dict(state_dict, strict=False)
         print(f"non caricati: {mancanti}", flush=True)
         print(f"inattesi: {inattesi}", flush=True)
-        if inattesi or any(".block." not in k for k in mancanti):
-            raise ValueError(f"i pesi di {init_from} non corrispondono alla classe {classe_moco.__name__}")
+
+        # ammessi: chiavi nuove della classe (coda e centri) e coda vecchia della v5
+        nuove_ammesse = ("queue2", "queue2_ptr", "center_q", "center_k")
+        vecchie_ammesse = ("queue", "queue_ptr")
+        if any(k not in nuove_ammesse for k in mancanti) or any(k not in vecchie_ammesse for k in inattesi):
+            raise ValueError(f"i pesi di {init_from} non corrispondono alla classe {type(model).__name__}")
         queue_restored = True
         print(f"OK -> pesi iniziali caricati da {init_from}", "\n", flush=True)
  
@@ -1099,7 +1104,7 @@ def train_moco_2D(
     # una epoca contiene 1243 batch
  
     epoch_lenght = None
-    steps_total = None   # NUOVO: step totali del run, serve al coseno
+    steps_total = None   
     base_lr = lr
     batch_step = 0
 
@@ -1450,7 +1455,7 @@ def train_moco_dense(
     # una epoca contiene 1243 batch
  
     epoch_lenght = None
-    steps_total = None   # NUOVO: step totali del run, serve al coseno
+    steps_total = None   
     base_lr = lr
     batch_step = 0
 
@@ -1804,7 +1809,7 @@ def train_moco_attn(
     # una epoca contiene 1243 batch
  
     epoch_lenght = None
-    steps_total = None   # NUOVO: step totali del run, serve al coseno
+    steps_total = None  
     base_lr = lr
     batch_step = 0
 
@@ -2002,12 +2007,13 @@ def train_moco_ms(
     workers: int = 0,
     patience: int = 20,
     min_delta: float = 1e-4,
-    
-    init_version: str = "",                         
-    
+
+    init_version: str = "",
+    center_m: float = 1.0,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
+    print("handler train_moco_ms: controlli prima del dataset", "\n", flush=True)      
 
     torch.backends.cudnn.benchmark = True
 
@@ -2018,12 +2024,92 @@ def train_moco_ms(
     project_work = dh.get_project("floods")
     project_data = dh.get_project("datasets")
 
+    
+    try:
+        path_sar = project_work.get_artifact(weights_encoder_sar).download(f"{weights_encoder_sar}.pth")
+        path_opt = project_work.get_artifact(weights_encoder_opt).download(f"{weights_encoder_opt}.pth")
+
+        modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
+        modelSAR.load_state_dict(torch.load(path_sar, map_location=device))
+
+        modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
+        modelOPT.load_state_dict(torch.load(path_opt, map_location=device))
+        print(f"OK -> Pesi encoders caricati: {weights_encoder_sar}, {weights_encoder_opt}", "\n", flush=True)
+    except Exception as e:
+        print(f"EXC -> caricamento pesi encoders: {e}", "\n", flush=True)
+        raise
+
+    
+    print("--- Training MoCo MS ---", flush=True)
+    model = MoCo2encoders_ms_pre(
+        base_encoder_q=modelOPT.encoder,
+        base_encoder_k=modelSAR.encoder,
+        dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+        hidden_channels_dim=hidden_channels_dim,
+        pool_grid=pool_grid,
+        center_m=center_m,
+    ).to(device)
+    print(f"classe: {type(model).__name__} | center_m {center_m}", flush=True)
+
+    results = {'lr': [], 'train_loss': []}
+    best_loss = float('inf')
+    epochs_no_improve = 0
+
+    start_epoch = 1
+    queue_restored = False
+
+   
+    if init_from:
+        try:
+            if init_version:
+                art = dh.get_artifact(init_from, project="floods", entity_id=init_version)
+            else:
+                art = project_work.get_artifact(init_from)
+            p = art.download(f"/data/{init_from}.pth", overwrite=True)
+            state_dict = torch.load(p, map_location=device)
+            mancanti, inattesi = model.load_state_dict(state_dict, strict=False)
+            print(f"non caricati: {mancanti}", flush=True)
+            print(f"inattesi: {inattesi}", flush=True)
+
+            nuove_ammesse = ("queue2", "queue2_ptr", "center_q", "center_k")
+            vecchie_ammesse = ("queue", "queue_ptr")
+            mancanti_extra = [k for k in mancanti if k not in nuove_ammesse]
+            inattesi_extra = [k for k in inattesi if k not in vecchie_ammesse]
+            if mancanti_extra or inattesi_extra:
+                print(f"mancanti non ammesse: {mancanti_extra}", flush=True)
+                print(f"inattesi non ammessi: {inattesi_extra}", flush=True)
+                raise ValueError(f"i pesi di {init_from} non corrispondono alla classe {type(model).__name__}")
+            print(f"OK -> pesi iniziali caricati da {init_from} (versione {init_version or 'ultima'})", "\n", flush=True)
+        except Exception as e:
+            print(f"EXC -> init_from: {e}", flush=True)
+            raise
+
+    if resume:
+        try:
+            w_path = project_work.get_artifact(f"moco_2D_weights_{job_name}").download("/data", overwrite=True)
+            model.load_state_dict(torch.load(w_path, map_location=device))
+            queue_restored = True
+            print("OK -> pesi MoCo caricati", flush=True)
+        except Exception as e:
+            print(f"EXC -> resume: pesi MoCo non caricati: {e}", flush=True)
+            raise
+
+        try:
+            m_path = project_work.get_artifact(f"moco_2D_metrics_{job_name}").download("/data", overwrite=True)
+            prev_df = pd.read_csv(m_path)
+            results = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
+            start_epoch = len(prev_df) + 1
+            valid_losses = prev_df['train_loss'].iloc[1:]
+            best_loss = valid_losses.min() if len(valid_losses) > 0 else float('inf')
+            print(f"OK -> metriche MoCo caricate: {len(prev_df)} epoche, best_loss={best_loss}", flush=True)
+        except Exception as e:
+            print(f"EXC -> resume: metriche MoCo non caricate: {e}", flush=True)
+            raise
+
+    # download dataset (lento: solo dopo che modello e pesi sono a posto)
     sar_zip_map = {}
     opt_zip_map = {}
-    train_data_SAR_IDS = []
-    train_data_OPT_IDS = []
 
-    # download dataset
     print(f"Download dataset: {dataset}", flush=True)
     dataset_path = project_data.get_artifact(f"Floods_{dataset}_crop_norm").download("/data/dataset_floods")
     print("OK -> Download terminato", flush=True)
@@ -2066,81 +2152,6 @@ def train_moco_ms(
     with open(f'test_ids_{job_name}.json', 'w') as f:
         json.dump(test_ids, f)
     project_work.log_artifact(name=f"moco_2D_testIdsList_{job_name}", source=f'test_ids_{job_name}.json', kind='artifact')
-
-    # caricamento pesi encoders
-    try:
-        path_sar = project_work.get_artifact(weights_encoder_sar).download(f"{weights_encoder_sar}.pth")
-        path_opt = project_work.get_artifact(weights_encoder_opt).download(f"{weights_encoder_opt}.pth")
-
-        modelSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
-        modelSAR.load_state_dict(torch.load(path_sar, map_location=device))
-
-        modelOPT = Singlemodal_CAE_2d(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=False).to(device)
-        modelOPT.load_state_dict(torch.load(path_opt, map_location=device))
-        print(f"OK -> Pesi encoders caricati: {weights_encoder_sar}, {weights_encoder_opt}", "\n", flush=True)
-    except Exception as e:
-        print(f"EXC -> caricamento pesi encoders: {e}", "\n", flush=True)
-        raise
-
-    # MODELLO
-    print("--- Training MoCo MS ---", flush=True)
-    model = MoCo2encoders_ms(
-        base_encoder_q=modelOPT.encoder,
-        base_encoder_k=modelSAR.encoder,
-        dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
-        hidden_channels_dim=hidden_channels_dim,
-        pool_grid=pool_grid,
-    ).to(device)
-    print(f"classe: {type(model).__name__}", flush=True)
-
-    results = {'lr': [], 'train_loss': []}
-    best_loss = float('inf')
-    epochs_no_improve = 0
-
-    start_epoch = 1
-    queue_restored = False
-
-    # pesi di partenza da un altro training (es. v5): mancano solo i centri, la coda verrà svuotata
-    if init_from:
-        try:
-            if init_version:                                                                        # NUOVO
-                art = dh.get_artifact(init_from, project="floods", entity_id=init_version)          # NUOVO: versione specifica
-            else:                                                                                   # NUOVO
-                art = project_work.get_artifact(init_from)                                          # NUOVO: ultima versione
-            p = art.download(f"/data/{init_from}.pth", overwrite=True)                              # MODIFICATO
-            state_dict = torch.load(p, map_location=device)
-            mancanti, inattesi = model.load_state_dict(state_dict, strict=False)
-            print(f"non caricati: {mancanti}", flush=True)
-            print(f"inattesi: {inattesi}", flush=True)
-            if inattesi or any(k not in ("center_q", "center_k") for k in mancanti):
-                raise ValueError(f"i pesi di {init_from} non corrispondono alla classe {type(model).__name__}")
-            print(f"OK -> pesi iniziali caricati da {init_from} (versione {init_version or 'ultima'})", "\n", flush=True)   # MODIFICATO
-        except Exception as e:
-            print(f"EXC -> init_from: {e}", flush=True)
-            raise
-
-    # resume: riprende questo stesso job (pesi, centri e coda dal checkpoint)
-    if resume:
-        try:
-            w_path = project_work.get_artifact(f"moco_2D_weights_{job_name}").download("/data", overwrite=True)
-            model.load_state_dict(torch.load(w_path, map_location=device))
-            queue_restored = True
-            print("OK -> pesi MoCo caricati", flush=True)
-        except Exception as e:
-            print(f"EXC -> resume: pesi MoCo non caricati: {e}", flush=True)
-            raise
-
-        try:
-            m_path = project_work.get_artifact(f"moco_2D_metrics_{job_name}").download("/data", overwrite=True)
-            prev_df = pd.read_csv(m_path)
-            results = {'lr': prev_df['lr'].tolist(), 'train_loss': prev_df['train_loss'].tolist()}
-            start_epoch = len(prev_df) + 1
-            valid_losses = prev_df['train_loss'].iloc[1:]
-            best_loss = valid_losses.min() if len(valid_losses) > 0 else float('inf')
-            print(f"OK -> metriche MoCo caricate: {len(prev_df)} epoche, best_loss={best_loss}", flush=True)
-        except Exception as e:
-            print(f"EXC -> resume: metriche MoCo non caricate: {e}", flush=True)
-            raise
 
     optimizer = torch.optim.SGD(model.parameters(), lr, momentum=momentum, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler()

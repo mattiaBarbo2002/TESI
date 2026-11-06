@@ -1039,6 +1039,158 @@ class MoCo2encoders_ms(nn.Module):
         self._dequeue_and_enqueue(k)
 
         return loss    
+
+
+
+
+class MoCo2encoders_ms_pre(nn.Module):                                                 
+    """
+    MoCo della v5 (testa a due conv) con Mean-Shifted Contrastive loss applicata a pre_proj
+    (uscita di conv + pooling), senza proiettore.
+    """
+
+    def __init__(
+        self,
+        base_encoder_q,
+        base_encoder_k,
+        dim: int = 128,                 
+        m: float = 0.999,
+        T: float = 0.07,
+        K: int = 4096,
+        hidden_channels_dim: int = 128,
+        pool_grid: int = 4,
+        center_m: float = 0.99,
+    ) -> None:
+
+        super().__init__()
+
+        self.K = K
+        self.m = m
+        self.T = T
+        self.pool_grid = pool_grid
+        self.simple_proj = False
+        self.center_m = center_m
+
+        self.encoder_q = base_encoder_q
+        self.encoder_k = base_encoder_k
+        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            param_q.requires_grad = False
+            param_k.requires_grad = False
+
+        encoder_q_dim = self.encoder_q.output_dim
+        encoder_k_dim = self.encoder_k.output_dim
+
+        self.pool_q = nn.AdaptiveAvgPool2d(pool_grid)
+        self.pool_k = nn.AdaptiveAvgPool2d(pool_grid)
+
+        self.conv_q = nn.Sequential(
+            nn.Conv2d(encoder_q_dim, hidden_channels_dim//2, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(hidden_channels_dim//2),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(hidden_channels_dim),
+            nn.ReLU(),
+        )
+        self.conv_k = nn.Sequential(
+            nn.Conv2d(encoder_k_dim, hidden_channels_dim//2, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(hidden_channels_dim//2),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels_dim//2, hidden_channels_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(hidden_channels_dim),
+            nn.ReLU(),
+        )
+
+        # proiettori: non usati nella loss, tenuti solo per poter caricare i pesi della v5   
+        proj_in = hidden_channels_dim * pool_grid * pool_grid
+        self.proj_q = nn.Sequential(nn.Linear(proj_in, dim), nn.ReLU(), nn.Linear(dim, dim))
+        self.proj_k = nn.Sequential(nn.Linear(proj_in, dim), nn.ReLU(), nn.Linear(dim, dim))
+        for p in list(self.proj_q.parameters()) + list(self.proj_k.parameters()):         
+            p.requires_grad = False
+
+        for param_q, param_k in zip(self.conv_q.parameters(), self.conv_k.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+
+        self.feat_dim = proj_in                                                          
+
+        # coda e centri nello spazio di pre_proj                                        
+        self.register_buffer("queue2", nn.functional.normalize(torch.randn(self.feat_dim, K), dim=0))
+        self.register_buffer("queue2_ptr", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("center_q", torch.zeros(self.feat_dim))
+        self.register_buffer("center_k", torch.zeros(self.feat_dim))
+
+    # pre_proj normalizzato, senza spostamento (serve per calcolare i centri)            
+    def features_q(self, im_q):
+        return nn.functional.normalize(self.pool_q(self.conv_q(self.encoder_q(im_q))).flatten(1), dim=1)
+
+    def features_k(self, im_k):
+        return nn.functional.normalize(self.pool_k(self.conv_k(self.encoder_k(im_k))).flatten(1), dim=1)
+
+    @staticmethod
+    def mean_shift(v, center):
+        return nn.functional.normalize(v - center, dim=1)
+
+    @torch.no_grad()
+    def set_centers(self, center_q, center_k) -> None:
+        self.center_q.copy_(center_q)
+        self.center_k.copy_(center_k)
+
+    @torch.no_grad()
+    def reset_queue(self) -> None:
+        self.queue2.copy_(nn.functional.normalize(torch.randn_like(self.queue2), dim=0))
+        self.queue2_ptr.zero_()
+
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self) -> None:                                       
+        for param_q, param_k in zip(self.conv_q.parameters(), self.conv_k.parameters()):
+            param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys) -> None:
+        batch_size = keys.shape[0]
+        ptr = int(self.queue2_ptr)
+        assert self.K % batch_size == 0
+        self.queue2[:, ptr:ptr + batch_size] = keys.T
+        self.queue2_ptr[0] = (ptr + batch_size) % self.K
+
+    @torch.no_grad()
+    def _batch_shuffle(self, x):
+        idx_shuffle = torch.randperm(x.shape[0], device=x.device)
+        return x[idx_shuffle], torch.argsort(idx_shuffle)
+
+    def contrastive_loss(self, im_q, im_k):
+
+        # ottico: pre_proj normalizzato e spostato rispetto al centro                      
+        with torch.no_grad():
+            z_q = self.encoder_q(im_q)
+        q = nn.functional.normalize(self.pool_q(self.conv_q(z_q)).flatten(1), dim=1)
+        with torch.no_grad():                                                   
+            if self.training and self.center_m < 1.0:
+                self.center_q.mul_(self.center_m).add_(q.detach().mean(0), alpha=1 - self.center_m)
+
+        q = self.mean_shift(q, self.center_q)
+
+        # sar: idem, senza gradiente                                                        
+        with torch.no_grad():
+            im_k_, idx_unshuffle = self._batch_shuffle(im_k)
+            k = nn.functional.normalize(self.pool_k(self.conv_k(self.encoder_k(im_k_))).flatten(1), dim=1)
+            if self.training and self.center_m < 1.0:                           
+                self.center_k.mul_(self.center_m).add_(k.mean(0), alpha=1 - self.center_m)
+            k = self.mean_shift(k, self.center_k)
+            k = k[idx_unshuffle]
+
+        l_pos = (q * k).sum(dim=1, keepdim=True)
+        l_neg = q @ self.queue2.clone().detach()
+        logits = torch.cat([l_pos, l_neg], dim=1) / self.T
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+        return nn.functional.cross_entropy(logits, labels), q, k
+
+    def forward(self, im_q, im_k):
+        with torch.no_grad():
+            self._momentum_update_key_encoder()
+        loss, q, k = self.contrastive_loss(im_q, im_k)
+        self._dequeue_and_enqueue(k)
+        return loss
     
 
 

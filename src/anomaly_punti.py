@@ -38,6 +38,7 @@ from floodlib.loader import MoCo2encodersLoader
 from floodlib.builder import MoCo2encoders_2d
 from floodlib.builder import MoCo2encoders_attn
 from floodlib.builder import MoCo2encoders_Bot
+from floodlib.builder import MoCo2encoders_ms
 
 from floodlib.mocoDense import MoCo2encoders_dense 
 
@@ -1021,6 +1022,7 @@ def ad_ocsvm3(
     n_series_thr: int = 500,                        # usato solo con fit_on_train=False
     moco_attn: bool = False,
     moco_bot: bool = False,
+    moco_ms: bool = False,
 
     do_encoder: bool = True,                        # latente autoencoder + pooling di moco
     do_pre_proj: bool = True,                       # dopo conv + pooling, prima del proiettore
@@ -1035,6 +1037,8 @@ def ad_ocsvm3(
     whitening: str = "pca",                         # "pca" | "ledoitwolf"
     fit_on_train: bool = True,                      # True: fit su tutte le serie di train di moco
     max_fit_series: int = 0,                        # 0 = tutte; altrimenti campione casuale (ocsvm lento con molte serie)
+
+    weights_version: str = "",
 ):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1216,6 +1220,15 @@ def ad_ocsvm3(
 
         # caricamento pesi moco
         try:
+
+            def scarica_pesi(nome_artifact):
+                if weights_version:
+                    art = dh.get_artifact(nome_artifact, project="floods", entity_id=weights_version)
+                else:
+                    art = project_work.get_artifact(nome_artifact)
+                print(f"pesi: {nome_artifact} (versione {weights_version or 'ultima'})", flush=True)
+                return art.download("/data/moco_weights.pth", overwrite=True)
+            
             if moco_attn:
                 encoderSAR = Singlemodal_CAE_attn(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
                 encoderOPT = Singlemodal_CAE_attn(input_dim=n_channels2, output_dim=16, n_images=n_images2, n_head=8, d_k=8, ltae=True, spac_net=False).to(device)
@@ -1230,7 +1243,7 @@ def ad_ocsvm3(
                     simple_proj=False,
                 ).to(device)
 
-                w_path = project_work.get_artifact(f"moco_attn_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+                w_path = scarica_pesi(f"moco_attn_weights_{moco_version}")              
 
             else:
                 encoderSAR = Singlemodal_CAE_2d(input_dim=n_channels1, output_dim=16, n_images=n_images1, n_head=8, d_k=8, ltae=False).to(device)
@@ -1245,10 +1258,21 @@ def ad_ocsvm3(
                             hidden_channels_dim=hidden_channels_dim,
                             pool_grid=pool_grid,
                             simple_proj=simple_proj,
-                        ).to(device)
+                    ).to(device)
                     
-                    w_path = project_work.get_artifact(f"moco_bot_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+                    w_path = scarica_pesi(f"moco_bot_weights_{moco_version}")               
 
+                elif moco_ms:
+                    model = MoCo2encoders_ms(
+                        base_encoder_q=encoderOPT.encoder,
+                        base_encoder_k=encoderSAR.encoder,
+                        dim=moco_dim, K=moco_k, m=moco_m, T=moco_t,
+                        hidden_channels_dim=hidden_channels_dim,
+                        pool_grid=pool_grid,
+                    ).to(device)
+
+                    w_path = scarica_pesi(f"moco_2D_weights_{moco_version}") 
+                
                 else:
                     model = MoCo2encoders_2d(
                         base_encoder_q=encoderOPT.encoder,
@@ -1260,7 +1284,7 @@ def ad_ocsvm3(
                         pool_grid=pool_grid,
                     ).to(device)
 
-                    w_path = project_work.get_artifact(f"moco_2D_weights_{moco_version}").download("/data/moco_weights.pth", overwrite=True)
+                    w_path = scarica_pesi(f"moco_2D_weights_{moco_version}")
 
             checkpoint = torch.load(w_path, map_location=device)
             state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
@@ -1310,8 +1334,12 @@ def ad_ocsvm3(
                     fq["proj_raw"], fk["proj_raw"] = pq, pk
 
                     # post_proj: proiettore + normalizzazione (uguale a contrastive_loss)
-                    fq["post_proj"] = nn.functional.normalize(pq, dim=1)
-                    fk["post_proj"] = nn.functional.normalize(pk, dim=1)
+                    if moco_ms:
+                        fq["post_proj"] = model.mean_shift(nn.functional.normalize(pq, dim=1), model.center_q)
+                        fk["post_proj"] = model.mean_shift(nn.functional.normalize(pk, dim=1), model.center_k)
+                    else:
+                        fq["post_proj"] = nn.functional.normalize(pq, dim=1)
+                        fk["post_proj"] = nn.functional.normalize(pk, dim=1)
 
                     for punto in punti:
                         out[punto][0].append(fq[punto].float().flatten(1).cpu())
@@ -1475,7 +1503,8 @@ def ad_ocsvm3(
             "job_name": job_name, "metodo": "ocsvm", "dataset_anomalies": dataset_anomalies,
             "moco_version": moco_version, "min_flood_area": min_flood_area, "standardize": standardize,
             "feature_point": punto, "pca_components": pca_punto[punto], "n_componenti": n_componenti,
-            "whitening": whitening, "shrinkage": shrinkage, "fit_on_train": fit_on_train,                   
+            "whitening": whitening, "shrinkage": shrinkage, "fit_on_train": fit_on_train,           
+            "weights_version": weights_version or "ultima",            
             "ocsvm": {"nu": ocsvm_nu, "gamma": gamma, "dim": int(z_fit.shape[1]), "frac_outside_fit": frac_outside_fit},
             "n_fit": len(normal_fit_ids), "n_thr": len(normal_thr_ids), "n_normali": len(normal_test_ids), "n_anomale": len(anom_ids),
             "auroc": float(auroc),
@@ -1489,7 +1518,8 @@ def ad_ocsvm3(
     # riepilogo di tutti i punti (serve anche per old_vectors)
     with open(os.path.join(out_root, "summary.json"), "w") as f:
         json.dump({"job_name": job_name, "moco_version": moco_version, "dataset_anomalies": dataset_anomalies,
-                   "fit_on_train": fit_on_train, "whitening": whitening,                                     
+                   "fit_on_train": fit_on_train, "whitening": whitening,
+                   "weights_version": weights_version or "ultima",                            
                    "punti": riepilogo}, f, indent=2)
 
     print("===== RIEPILOGO =====", flush=True)
