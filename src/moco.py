@@ -1985,8 +1985,8 @@ def train_moco_ms(
     weights_encoder_opt: str = "autoencoder_2D_OPT_weights_convLstm_v1",
     hidden_channels_dim: int = 128,
     pool_grid: int = 4,
-    init_from: str = "moco_2D_weights_net_v5",      # pesi di partenza (es. v5); "" = da zero
-    n_center: int = 2000,                           # serie usate per calcolare i centri
+    init_from: str = "",      
+    n_center: int = 1,                           # serie usate per calcolare i centri
     resume: bool = False,
     lr_min: float = 0.0001,
     cosine: bool = True,

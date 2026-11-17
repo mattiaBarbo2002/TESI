@@ -20,6 +20,8 @@ import io
 import csv
 from glob import glob
 from digitalhub_runtime_python import handler
+from scipy.stats import spearmanr
+import pandas as pd
 
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE
 from floodlib.multimodal_3Dconv_attention import Singlemodal_CAE_2d
@@ -1583,3 +1585,35 @@ def FloodsImage(
     print("passaporto")
 
     return("TERMINATO")
+
+
+
+@handler()
+def salva_flood_area(dataset_anomalies: str = "Floods_Anomalies_v2_crop_norm_full"):
+    project_data = dh.get_project("datasets")
+    project_work = dh.get_project("floods")
+
+    print(f"Download: {dataset_anomalies}", flush=True)
+    path = project_data.get_artifact(dataset_anomalies).download(f"/data/{dataset_anomalies}", overwrite=True)
+    mask_dir = os.path.join(path, "MASK")
+    if not os.path.isdir(mask_dir):
+        raise ValueError(f"cartella MASK non trovata in {dataset_anomalies}: il dataset è stato creato con include_mask=False?")
+
+    righe = []
+    for part in sorted(n for n in os.listdir(mask_dir) if n.startswith("part") and n.endswith(".zip")):
+        with zipfile.ZipFile(os.path.join(mask_dir, part)) as z:
+            for name in z.namelist():
+                if name.endswith(".npy"):
+                    m = np.load(io.BytesIO(z.read(name)))
+                    righe.append({"ID": name[:-4],
+                                  "flood_area": 100.0 * float((m == 2).mean()),      # % di pixel alluvionati
+                                  "water_area": 100.0 * float((m == 1).mean())})     # % di acqua permanente
+        print(f"OK -> {part}: {len(righe)} serie finora", flush=True)
+
+    df = pd.DataFrame(righe)
+    df.to_csv("/data/flood_area.csv", index=False)
+    print(df.describe().round(2).to_string(), flush=True)
+    #print(f"pre_proj vs acqua permanente: {spearmanr(anom.p_pre, anom.water_area).correlation:+.3f}")
+    project_work.log_artifact(name=f"flood_area_{dataset_anomalies}", source="/data/flood_area.csv", kind="artifact")
+    return f"TERMINATO -> {len(df)} serie"
+
