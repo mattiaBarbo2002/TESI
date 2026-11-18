@@ -1617,3 +1617,62 @@ def salva_flood_area(dataset_anomalies: str = "Floods_Anomalies_v2_crop_norm_ful
     project_work.log_artifact(name=f"flood_area_{dataset_anomalies}", source="/data/flood_area.csv", kind="artifact")
     return f"TERMINATO -> {len(df)} serie"
 
+
+@handler()
+def flood_pct_csv(
+    anomalies_artifact: str = "Floods_Anomalies_v2_crop_norm_full",   # lo stesso artifact usato per estrarre gli embedding
+    output_name: str = "flood_pct_Floods_Anomalies_v2",
+    griglia: int = 4,               # percentuale anche per cella di una griglia griglia x griglia (0 = no)
+):
+    """
+    Legge MASK/partNN.zip dell'artifact crop_norm ({ID}.npy, (H, W) uint8: 0 = niente, 1 = acqua permanente,
+    2 = flood) e scrive un CSV con una riga per serie:
+      ID, flood_pct, acqua_pct, [flood_cRC per ogni cella della griglia]
+    Le percentuali sono sul ritaglio 256x256 (stesso ritaglio delle immagini da cui vengono gli embedding).
+    """
+    import io
+    griglia = int(griglia)
+    project_data = dh.get_project("datasets")
+    project_work = dh.get_project("floods")
+
+    print(f"Download: {anomalies_artifact}", flush=True)
+    root = project_data.get_artifact(anomalies_artifact).download("/data/anom_crop_norm", overwrite=True)
+    print("OK -> Download terminato", flush=True)
+
+    # la cartella MASK puo' essere a profondita' diverse a seconda di come e' stato scaricato l'artifact
+    mask_dirs = [os.path.join(r, d) for r, ds, _ in os.walk(root) for d in ds if d == "MASK"]
+    if not mask_dirs:
+        raise ValueError(f"nessuna cartella MASK in {root}: l'artifact e' stato creato con include_mask=True?")
+    mask_dir = mask_dirs[0]
+    parti = sorted(os.path.join(mask_dir, f) for f in os.listdir(mask_dir) if f.endswith(".zip"))
+    print(f"OK -> {len(parti)} parti in {mask_dir}", flush=True)
+
+    righe = []
+    for parte in parti:
+        with zipfile.ZipFile(parte) as z:
+            for nome in z.namelist():
+                if not nome.endswith(".npy"):
+                    continue
+                ID = os.path.basename(nome)[:-4]
+                mask = np.load(io.BytesIO(z.read(nome)))
+                riga = {"ID": ID,
+                        "flood_pct": 100.0 * float((mask == 2).mean()),
+                        "acqua_pct": 100.0 * float((mask == 1).mean())}
+                if griglia > 0:                                   # stessa suddivisione dell'adaptive pooling (H divisibile)
+                    H, W = mask.shape
+                    for r in range(griglia):
+                        for c in range(griglia):
+                            blocco = mask[r * H // griglia:(r + 1) * H // griglia, c * W // griglia:(c + 1) * W // griglia]
+                            riga[f"flood_c{r}{c}"] = 100.0 * float((blocco == 2).mean())
+                righe.append(riga)
+        print(f"OK -> {os.path.basename(parte)}: {len(righe)} serie finora", flush=True)
+
+    shutil.rmtree(root, ignore_errors=True)                       # libera subito il disco (SAR/OPT non servono)
+
+    df = pd.DataFrame(righe).sort_values("ID")
+    out = f"/data/{output_name}.csv"
+    df.to_csv(out, index=False, float_format="%.4f")
+    print(f"OK -> {len(df)} serie | flood_pct: mediana {df.flood_pct.median():.2f}%, "
+          f"> 0: {(df.flood_pct > 0).mean():.0%} delle serie", flush=True)
+    project_work.log_artifact(name=output_name, source=out, kind="artifact")
+    return f"TERMINATO -> {output_name} ({len(df)} serie)"

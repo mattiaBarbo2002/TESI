@@ -3242,11 +3242,11 @@ def ad_ocsvm6(
 @handler()
 def ad_knn(
     job_name: str = "knn_test",
-    vectors_from: str = "",                         # job_name di ad_ocsvm3 da cui prendere gli embedding
-    punti: str = "encoder,pre_proj",                # punti da valutare, separati da virgola
-    distanze: str = "coseno,lw",                    # "coseno" (vettori normalizzati) | "lw" (euclidea dopo sbiancamento Ledoit-Wolf)
-    ks: str = "1,5,20",                             # numeri di vicini, separati da virgola
-    blocco: int = 1000,                             # serie di test elaborate per volta sulla gpu
+    vectors_from: str = "",                         
+    punti: str = "encoder, pre_proj",                
+    distanze: str = "coseno, lw",                    
+    ks: str = "1,5,20",                            
+    blocco: int = 1000,                             
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device, "\n", flush=True)
@@ -3304,7 +3304,7 @@ def ad_knn(
                 d = 1 - T @ F.T
             else:
                 d = torch.cdist(T, F)
-            out.append(d.topk(k_max, dim=1, largest=False).values.cpu().numpy())   # già ordinate dalla più piccola
+            out.append(d.topk(k_max, dim=1, largest=False).values.cpu().numpy())   
         return np.concatenate(out)
 
     out_root = f"/data/anomaly_results_knn_{job_name}"
@@ -3320,7 +3320,7 @@ def ad_knn(
 
         for modo in lista_distanze:
             f, shrinkage = prepara(w, modo)
-            F = torch.from_numpy(f["fit"]).to(device)                       # serie di fit sulla gpu, una volta sola
+            F = torch.from_numpy(f["fit"]).to(device)                       
 
             d_thr = vicini(f["thr"], F, modo)
             d_norm = vicini(f["normal"], F, modo)
@@ -3349,7 +3349,7 @@ def ad_knn(
                 # soglie dalle normali di soglia, come in ad_ocsvm3 (qui: anomalia = score sopra la soglia)
                 rules = {}
                 for fa in false_allarms:
-                    thr = float(np.quantile(s_thr, 1 - fa))                   # anomalia = score sopra la soglia
+                    thr = float(np.quantile(s_thr, 1 - fa))                   
                     tp = int((s_anom > thr).sum()); fn = len(s_anom) - tp
                     fp = int((s_norm > thr).sum()); tn = len(s_norm) - fp
                     prec = tp / (tp + fp) if tp + fp else 0.0
@@ -4018,3 +4018,302 @@ def diagnostica_vettori(
 # NOTA: per avere il colore per % di area allagata e la correlazione score/alluvione,
 # in estrai_vettori / ad_ocsvm6 aggiungi a np.savez_compressed:
 #     anom_flood=np.array([flood_area.get(ID, np.nan) for ID in anom_ids]),
+
+
+
+
+# ============================================================================
+# ANALISI SPETTRALE DEGLI EMBEDDING (tutte le serie di fit, tutte le componenti)
+#   1) PCA del concatenato [ottico | SAR]: varianza, quota ottica e AUROC per componente
+#   2) componenti minori: AUROC scartando le M componenti piu' grandi (OPT, SAR, OPT+SAR)
+#   3) kNN lw: completa con scomposizione ottica / SAR / incrociata, a blocchi, singole modalita'
+# Output: artifact spettrale_<job_name> (zip con CSV e PNG)
+# ============================================================================
+import io, os, json, shutil, zipfile
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.stats import rankdata
+from sklearn.covariance import ledoit_wolf_shrinkage
+from sklearn.metrics import roc_auc_score
+
+
+def _auroc(sn, sa):
+    return roc_auc_score(np.r_[np.zeros(len(sn)), np.ones(len(sa))], np.r_[sn, sa])
+
+
+def _auroc_colonne(Pn, Pa):
+    """AUROC (ripiegato attorno a 0.5) di ogni colonna, con i ranghi: tutte le colonne in una volta."""
+    r = rankdata(np.r_[Pn, Pa], axis=0)
+    n_n, n_a = len(Pn), len(Pa)
+    a = (r[n_n:].sum(0) - n_a * (n_a + 1) / 2) / (n_n * n_a)
+    return np.maximum(a, 1 - a)
+
+
+def _spettro(Xf, max_dim_shrink, shrink_fallback):
+    """Standardizzazione sulle serie di fit + SVD completa (tutte le componenti stimabili)."""
+    mu, sd = Xf.mean(0), Xf.std(0) + 1e-8
+    Z = (Xf - mu) / sd
+    c = Z.mean(0)
+    _, S, Vt = np.linalg.svd(Z - c, full_matrices=False)          # Vt: (r, D), r = min(n_fit, D)
+    lam = (S.astype(np.float64) ** 2) / len(Z)                     # varianza di ogni componente
+    if Z.shape[1] <= max_dim_shrink:
+        alpha = float(ledoit_wolf_shrinkage(Z.astype(np.float64)))
+    else:
+        alpha = shrink_fallback                                    # D x D troppo pesante: shrinkage fisso
+    return {"mu": mu, "sd": sd, "c": c, "Vt": Vt, "lam": lam, "alpha": alpha,
+            "completo": Vt.shape[0] == Z.shape[1]}                 # completo = tutte le D direzioni stimate
+
+
+def _coordinate(sp, X):
+    return (((X - sp["mu"]) / sp["sd"]) - sp["c"]) @ sp["Vt"].T     # (N, r)
+
+
+def _curva_minori(sp, Xn, Xa, tagli):
+    """Score = sum_{j >= M} coord_j^2 / lam_j (lam con shrinkage): distanza di Mahalanobis dalla media
+    delle normali usando solo le componenti dalla M+1 in poi. Ritorna {M: AUROC}."""
+    lam_s = (1 - sp["alpha"]) * sp["lam"] + sp["alpha"] * sp["lam"].mean()
+    code = {}
+    for nome, X in (("n", Xn), ("a", Xa)):
+        contr = _coordinate(sp, X) ** 2 / lam_s
+        code[nome] = np.cumsum(contr[:, ::-1], axis=1)[:, ::-1]    # code[:, M] = somma dalla componente M in poi
+    return {M: _auroc(code["n"][:, M], code["a"][:, M]) for M in tagli if M < len(lam_s)}
+
+
+def _lw_da_spettro(sp):
+    """Sbiancamento W e precisione P della covarianza Ledoit-Wolf, riusando la SVD (nessuna eigh in piu')."""
+    lam = (1 - sp["alpha"]) * sp["lam"] + sp["alpha"] * sp["lam"].mean()
+    V = sp["Vt"].T.astype(np.float64)
+    return V / np.sqrt(lam), (V / lam) @ V.T
+
+
+def _knn_lw(Xt, Xf, sp, W, P=None, Dq=None, k=5, blocco=500):
+    """score = d^2 medio dai K vicini (Mahalanobis lw); con P e Dq scompone in ottica + SAR + incrociata."""
+    Zt = (((Xt - sp["mu"]) / sp["sd"]) - sp["c"]).astype(np.float64)
+    Zf = (((Xf - sp["mu"]) / sp["sd"]) - sp["c"]).astype(np.float64)
+    Yf = Zf @ W; nYf = (Yf ** 2).sum(1)
+    score, opt, sar, inc = [], [], [], []
+    for i in range(0, len(Zt), blocco):
+        Zb = Zt[i:i + blocco]; Yb = Zb @ W
+        d = np.clip((Yb ** 2).sum(1)[:, None] + nYf[None] - 2 * Yb @ Yf.T, 0, None)
+        vic = np.argpartition(d, k - 1, axis=1)[:, :k]
+        score.append(np.take_along_axis(d, vic, 1).mean(1))
+        if P is not None:
+            Delta = Zb[:, None, :] - Zf[vic]
+            Do, Ds = Delta[..., :Dq], Delta[..., Dq:]
+            opt.append(((Do @ P[:Dq, :Dq]) * Do).sum(-1).mean(1))
+            sar.append(((Ds @ P[Dq:, Dq:]) * Ds).sum(-1).mean(1))
+            inc.append(2 * ((Ds @ P[Dq:, :Dq]) * Do).sum(-1).mean(1))
+    score = np.concatenate(score)
+    if P is None:
+        return score
+    return score, (np.concatenate(opt), np.concatenate(sar), np.concatenate(inc))
+
+
+def _figura_pca(pca_df, titolo, path):
+    x = pca_df["componente"].values
+    fig, axs = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+    axs[0].plot(x, pca_df["var_spiegata"]); axs[0].set_yscale("log"); axs[0].set_ylabel("varianza spiegata")
+    axs[1].bar(x, pca_df["quota_ottico"], width=1, color="tab:green"); axs[1].axhline(.5, color="k", ls="--", lw=.6)
+    axs[1].set_ylim(0, 1); axs[1].set_ylabel("quota OTTICO")
+    axs[2].bar(x, pca_df["auroc"], width=1, color="tab:red"); axs[2].axhline(.6, color="k", ls="--", lw=.6)
+    axs[2].set_ylim(.5, max(.75, pca_df["auroc"].max() + .02)); axs[2].set_ylabel("AUROC componente")
+    axs[2].set_xlabel("componente (1 = piu' varianza)")
+    for ax in axs:
+        ax.set_xscale("log")
+    axs[0].set_title(titolo, fontsize=10)
+    fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
+
+
+
+
+
+
+@handler()
+def analisi_spettrale(
+    job_name: str = "spettrale_test",
+    vectors_from: str = "",                 # job_name separati da virgola (artifact anomaly_results_ocsvm_<job>)
+    punti: str = "encoder,pre_proj",
+    k: int = 5,                             # vicini per il kNN lw
+    tagli: str = "0,1,2,5,10,20,50,100,200,500,1000,2000,4000,8000",   # M = componenti grandi scartate
+    max_dim_lw: int = 8192,                 # oltre queste dimensioni (concatenate) la lw viene saltata
+    shrink_fallback: float = 0.01,          # shrinkage usato se le dimensioni superano max_dim_lw
+    flood_csv_artifact: str = "",           # facoltativo: CSV ID,flood_pct (handler flood_pct_csv)
+    min_flood_anom: float = 0.0,            # con il CSV: anomale con % <= di questo escluse
+    griglia_pre_proj: int = 4,              
+    canali_pre_proj: int = 128, 
+):
+    k, max_dim_lw = int(k), int(max_dim_lw)
+    shrink_fallback, min_flood_anom = float(shrink_fallback), float(min_flood_anom)
+    lista_tagli = [int(t) for t in str(tagli).split(",") if t.strip()]
+    lista_punti = [p.strip() for p in punti.split(",") if p.strip()]
+    project_work = dh.get_project("floods")
+
+    out_root = f"/data/spettrale_{job_name}"
+    shutil.rmtree(out_root, ignore_errors=True); os.makedirs(out_root)
+
+    flood = None
+    if flood_csv_artifact:
+        p = project_work.get_artifact(flood_csv_artifact).download("/data/flood_pct.csv", overwrite=True)
+        flood = pd.read_csv(p, dtype={"ID": str}).set_index("ID")["flood_pct"]
+        print(f"OK -> CSV percentuali: {len(flood)} serie", flush=True)
+
+    riassunto, curve_minori = {}, {}
+    for job in [j.strip() for j in vectors_from.split(",") if j.strip()]:
+        src = project_work.get_artifact(f"anomaly_results_ocsvm_{job}").download(f"/data/vec_{job}.zip", overwrite=True)
+        with zipfile.ZipFile(src) as z:
+            presenti = {pt: z.read(f"{pt}/embeddings.npz") for pt in lista_punti if f"{pt}/embeddings.npz" in z.namelist()}
+        os.remove(src)
+        for pt in lista_punti:
+            if pt not in presenti:
+                print(f"manca {pt} in {job}", flush=True)
+
+        for pt, raw in presenti.items():
+            nome = f"{job}/{pt}"
+            tag = nome.replace("/", "__")
+            E = np.load(io.BytesIO(raw))
+            if pt == "pre_proj" and griglia_pre_proj > 0:
+                # vettori (canali * g * g) -> griglia griglia_pre_proj, media su blocchi: uguale a estrarre con
+                # AdaptiveAvgPool2d(griglia_pre_proj) se il pooling e' una media e g e' multiplo della griglia
+                E = {key: E[key] for key in E.files}
+                g_orig = int(round(np.sqrt(E["fit_q"].shape[1] / canali_pre_proj)))
+                if canali_pre_proj * g_orig ** 2 != E["fit_q"].shape[1] or g_orig % griglia_pre_proj:
+                    raise ValueError(f"{nome}: {E['fit_q'].shape[1]} dimensioni non riportabili a griglia "
+                                     f"{griglia_pre_proj} con {canali_pre_proj} canali")
+                if g_orig != griglia_pre_proj:
+                    fb = g_orig // griglia_pre_proj
+                    for key in ("fit_q", "fit_k", "normal_q", "normal_k", "anom_q", "anom_k"):
+                        X_ = E[key]
+                        E[key] = X_.reshape(len(X_), canali_pre_proj, griglia_pre_proj, fb, griglia_pre_proj, fb) \
+                                   .mean(axis=(3, 5)).reshape(len(X_), -1)
+                    print(f"{nome}: griglia {g_orig}x{g_orig} -> {griglia_pre_proj}x{griglia_pre_proj}", flush=True)
+            Dq = E["fit_q"].shape[1]
+            cat = lambda g: np.concatenate([E[f"{g}_q"], E[f"{g}_k"]], axis=1).astype(np.float32)
+            Xf, Xn, Xa = cat("fit"), cat("normal"), cat("anom")
+            if flood is not None:
+                f = flood.reindex([str(i) for i in E["anom_ids"]]).values
+                ok = np.isfinite(f) & (f > min_flood_anom)
+                print(f"{nome}: anomale {len(Xa)} -> {ok.sum()} dopo il filtro (% > {min_flood_anom})", flush=True)
+                Xa = Xa[ok]
+            del E, raw
+            D = Xf.shape[1]
+            print(f"===== {nome} | fit {len(Xf)} | normali {len(Xn)} | anomale {len(Xa)} | dim {Dq}+{D - Dq} =====", flush=True)
+            riga = {"serie fit": len(Xf), "normali": len(Xn), "anomale": len(Xa), "dim OPT": Dq, "dim SAR": D - Dq}
+
+            # ---------------- spettri: concatenato e singole modalita'
+            sp = {}
+            for blocco, sl in (("OPT+SAR", slice(None)), ("OPT", slice(0, Dq)), ("SAR", slice(Dq, None))):
+                sp[blocco] = _spettro(Xf[:, sl], max_dim_lw, shrink_fallback)
+                s = sp[blocco]
+                print(f"  SVD {blocco}: {len(s['lam'])} componenti"
+                      + ("" if s["completo"] else f" (su {Xf[:, sl].shape[1]} dimensioni: piu' dimensioni che serie)")
+                      + f" | shrinkage {s['alpha']:.4f}", flush=True)
+                riga[f"componenti {blocco}"] = len(s["lam"])
+                riga[f"shrinkage {blocco}"] = s["alpha"]
+
+            # ---------------- 1) PCA del concatenato
+            s = sp["OPT+SAR"]
+            Pn, Pa = _coordinate(s, Xn), _coordinate(s, Xa)
+            auroc_pc = _auroc_colonne(Pn, Pa)
+            del Pn, Pa
+            var = s["lam"] / s["lam"].sum()
+            quota = (s["Vt"][:, :Dq].astype(np.float64) ** 2).sum(1)
+            pca_df = pd.DataFrame({"componente": np.arange(1, len(var) + 1), "var_spiegata": var,
+                                   "quota_ottico": quota, "auroc": auroc_pc})
+            pca_df.to_csv(f"{out_root}/pca_{tag}.csv", index=False)
+            _figura_pca(pca_df, nome, f"{out_root}/pca_{tag}.png")
+            n = len(var); dieci = max(1, n // 10)
+            top = np.argsort(auroc_pc)[::-1][:10]
+            riga.update({
+                "PCA AUROC max componente": auroc_pc.max(),
+                "PCA posizione componente migliore": int(np.argmax(auroc_pc) + 1),
+                "PCA posizione mediana top-10": float(np.median(top + 1)),
+                "PCA AUROC medio primo 10%": auroc_pc[:dieci].mean(),
+                "PCA AUROC medio ultimo 10%": auroc_pc[-dieci:].mean(),
+                "PCA quota OTTICO primo 10%": quota[:dieci].mean(),
+                "PCA quota OTTICO top-10": quota[top].mean(),
+            })
+
+            # ---------------- 2) componenti minori
+            curve_minori[nome] = {}
+            for blocco, sl in (("OPT", slice(0, Dq)), ("SAR", slice(Dq, None)), ("OPT+SAR", slice(None))):
+                c = _curva_minori(sp[blocco], Xn[:, sl], Xa[:, sl], lista_tagli)
+                curve_minori[nome][blocco] = c
+                Mb = max(c, key=c.get)
+                riga.update({f"minori {blocco} AUROC M=0": c[0], f"minori {blocco} M migliore": Mb,
+                             f"minori {blocco} AUROC M migliore": c[Mb]})
+                print(f"  minori {blocco}: M=0 {c[0]:.3f} | migliore M={Mb} {c[Mb]:.3f}", flush=True)
+            pd.DataFrame(curve_minori[nome]).rename_axis("M").to_csv(f"{out_root}/minori_{tag}.csv")
+
+            # ---------------- 3) kNN lw
+            if D > max_dim_lw or not sp["OPT+SAR"]["completo"]:
+                motivo = f"{D} > max_dim_lw" if D > max_dim_lw else "piu' dimensioni che serie di fit"
+                print(f"  lw saltata ({motivo})", flush=True)
+            else:
+                W, P = _lw_da_spettro(sp["OPT+SAR"])
+                sn, (on, sn_, inc_n) = _knn_lw(Xn, Xf, sp["OPT+SAR"], W, P, Dq, k)
+                sa, (oa, sa_, inc_a) = _knn_lw(Xa, Xf, sp["OPT+SAR"], W, P, Dq, k)
+                del P
+                sing, Y = {}, {}
+                for blocco, sl in (("OPT", slice(0, Dq)), ("SAR", slice(Dq, None))):
+                    Wb, _ = _lw_da_spettro(sp[blocco])
+                    sing[blocco] = _auroc(_knn_lw(Xn[:, sl], Xf[:, sl], sp[blocco], Wb, k=k),
+                                          _knn_lw(Xa[:, sl], Xf[:, sl], sp[blocco], Wb, k=k))
+                    trasf = lambda X, s=sp[blocco], Wb=Wb, sl=sl: ((((X[:, sl] - s["mu"]) / s["sd"]) - s["c"]) @ Wb).astype(np.float32)
+                    Y[blocco] = trasf
+                bl = lambda X: np.concatenate([Y["OPT"](X), Y["SAR"](X)], axis=1)
+                ident = {"mu": 0.0, "sd": 1.0, "c": 0.0}
+                Bf = bl(Xf); I = np.eye(Bf.shape[1])
+                sing["a blocchi"] = _auroc(_knn_lw(bl(Xn), Bf, ident, I, k=k), _knn_lw(bl(Xa), Bf, ident, I, k=k))
+                del Bf, I
+                completa = _auroc(sn, sa)
+                riga.update({
+                    "lw AUROC completa": completa,
+                    "lw AUROC parte OPT": _auroc(on, oa), "lw AUROC parte SAR": _auroc(sn_, sa_),
+                    "lw AUROC parte incrociata": _auroc(inc_n, inc_a),
+                    "lw AUROC solo OPT": sing["OPT"], "lw AUROC solo SAR": sing["SAR"],
+                    "lw AUROC a blocchi": sing["a blocchi"],
+                    "lw quota OPT normali": (on / sn).mean(), "lw quota OPT anomale": (oa / sa).mean(),
+                    "lw quota SAR normali": (sn_ / sn).mean(), "lw quota SAR anomale": (sa_ / sa).mean(),
+                    "lw quota incrociata normali": (inc_n / sn).mean(), "lw quota incrociata anomale": (inc_a / sa).mean(),
+                    "lw guadagno vicini congiunti": sing["a blocchi"] - max(sing["OPT"], sing["SAR"]),
+                    "lw guadagno correlazione": completa - sing["a blocchi"],
+                })
+                print(f"  lw: completa {completa:.3f} | a blocchi {sing['a blocchi']:.3f} | "
+                      f"solo OPT {sing['OPT']:.3f} | solo SAR {sing['SAR']:.3f}", flush=True)
+                fig, ax = plt.subplots(figsize=(6, 5))
+                ax.scatter(on, sn_, s=5, alpha=.4, label="normali")
+                ax.scatter(oa, sa_, s=5, alpha=.4, color="tab:red", label="anomale")
+                ax.set_xlabel("parte OTTICA (lw)"); ax.set_ylabel("parte SAR (lw)"); ax.set_title(nome, fontsize=10)
+                ax.legend(markerscale=3); fig.tight_layout(); fig.savefig(f"{out_root}/lw_scatter_{tag}.png", dpi=110); plt.close(fig)
+            riassunto[nome] = riga
+            del sp, Xf, Xn, Xa
+
+    if not riassunto:
+        raise ValueError("nessun embedding trovato")
+
+    tab = pd.DataFrame(riassunto)
+    tab.to_csv(f"{out_root}/tabella.csv")
+    with pd.option_context("display.width", 250, "display.max_columns", 50, "display.max_rows", 200):
+        print("\n===== TABELLA =====\n", tab.round(3).to_string(), flush=True)
+
+    fig, axs = plt.subplots(1, 3, figsize=(17, 4.5), sharey=True)
+    for ax, blocco in zip(axs, ("OPT", "SAR", "OPT+SAR")):
+        for nome, cur in curve_minori.items():
+            c = cur[blocco]; ax.plot(list(c), list(c.values()), marker="o", label=nome)
+        ax.set_xscale("symlog", linthresh=1); ax.grid(alpha=.3)
+        ax.set_xlabel("M = componenti piu' grandi scartate"); ax.set_title(blocco)
+    axs[0].set_ylabel("AUROC"); axs[-1].legend(fontsize=7)
+    fig.tight_layout(); fig.savefig(f"{out_root}/minori_confronto.png", dpi=110); plt.close(fig)
+
+    with open(f"{out_root}/parametri.json", "w") as f:
+        json.dump({"vectors_from": vectors_from, "punti": punti, "k": k, "tagli": lista_tagli,
+                   "max_dim_lw": max_dim_lw, "flood_csv_artifact": flood_csv_artifact,
+                   "min_flood_anom": min_flood_anom, "griglia_pre_proj": griglia_pre_proj,
+                   "canali_pre_proj": canali_pre_proj}, f, indent=2)
+    shutil.make_archive(out_root, "zip", out_root)
+    project_work.log_artifact(name=f"spettrale_{job_name}", source=f"{out_root}.zip", kind="artifact")
+    shutil.rmtree(out_root, ignore_errors=True); os.remove(f"{out_root}.zip")
+    return f"TERMINATO -> spettrale_{job_name}"
